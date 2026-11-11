@@ -14,13 +14,11 @@ import type {
 } from "../../shared/contracts";
 import type { ProjectRepository } from "../database/projectRepository";
 import { runBackgroundTask } from "../libraryHealth";
-import type { LibrarySettings } from "../librarySettings";
 import {
   createReferenceGrid,
   extractMetricsFrameGrid
 } from "../scriptProjects/localScriptMedia";
 
-import { ComfyVlmClient } from "./comfyVlmClient";
 import {
   extractJsonObject,
   readCachedPrompt,
@@ -42,24 +40,7 @@ import {
   sampleMetricsTimestamps,
   type ShotVideoEvaluationInput
 } from "./videoMetrics";
-import {
-  QWEN3_VL_HERETIC_MODEL_SOURCE,
-  QWEN3_VL_MODEL_SOURCE
-} from "./vlmModelFiles";
-
-/**
- * The local replacement for the cloud VLM endpoints, backed by the selected
- * Qwen3-VL model in ComfyUI:
- *
- *   GET  /assets/<id>/prompt   → captionAsset      (image: style.txt,
- *                                                   video: ingestion video.txt)
- *   POST /chat/auto-prompt     → autoPrompt
- *   POST /assets/<id>/auto_prompt → saveAutoPrompt
- *   POST /chat/enhance-prompt  → enhancePrompt
- *
- * Response shapes match the cloud ones exactly, so the renderer only needs a
- * `window.mago` branch in its api functions.
- */
+import type { VisionGenerator, VisionRequest } from "./visionGenerator";
 
 /** Reference images are downscaled to this before they reach the VLM, matching
  *  AUTO_PROMPT_IMAGE_MAX_DIMENSION in the renderer. */
@@ -80,12 +61,7 @@ const METRICS_FRAMES_PER_GRID = 4;
 const storedDescription = (asset: LocalAsset): string | null =>
   typeof asset.data.description === "string" ? asset.data.description : null;
 
-type GenerateRequest = {
-  userPrompt: string;
-  images?: Buffer[];
-  maxTokens: number;
-  temperature?: number;
-};
+type GenerateRequest = Omit<VisionRequest, "systemPrompt">;
 
 export class VlmService {
   /** In-flight captions per asset, so two hooks asking at once share one run. */
@@ -99,46 +75,19 @@ export class VlmService {
   >();
 
   /**
-   * Serialises every generation. ComfyUI has one queue shared with image and
-   * video renders, so letting several captions in at once would push a render
-   * the user just started behind minutes of captioning.
+   * Serialise generation so background captions do not fill the provider's
+   * queue ahead of interactive renders.
    */
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly repository: ProjectRepository,
-    private readonly settings: LibrarySettings
+    private readonly generateVision: VisionGenerator,
+    private readonly probeVision: () => Promise<VlmModelStatus>
   ) {}
 
-  /**
-   * Cheap /object_info probe — deliberately not queued behind generations, and
-   * deliberately not folded into `comfy.check()`, which every local render
-   * pre-flight calls.
-   */
-  async status(): Promise<VlmModelStatus> {
-    try {
-      const endpoint = await this.settings.getComfyEndpoint();
-      const backend = await this.settings.getVlmBackend();
-      const models = await new ComfyVlmClient(endpoint, backend).probeModels();
-      const installMessage =
-        backend === "qwen3-vl-4b-heretic-int8"
-          ? `Download ${models.missing.join(" and ")} from ${QWEN3_VL_HERETIC_MODEL_SOURCE} into ComfyUI/models/text_encoders/`
-          : `Download ${models.missing.join(" and ")} from ${QWEN3_VL_MODEL_SOURCE} into ComfyUI/models/LLM/GGUF/`;
-      return {
-        backend,
-        ready: models.installed,
-        missingModels: [...models.missing],
-        message: models.installed ? null : installMessage
-      };
-    } catch (error) {
-      // Missing node, or ComfyUI went away between the endpoint check and here.
-      return {
-        backend: await this.settings.getVlmBackend(),
-        ready: false,
-        missingModels: [],
-        message: this.message(error)
-      };
-    }
+  status(): Promise<VlmModelStatus> {
+    return this.probeVision();
   }
 
   async captionAsset(assetId: string): Promise<LocalAssetPromptResult> {
@@ -165,7 +114,8 @@ export class VlmService {
       maxTokens: DESCRIPTION_MAX_TOKENS,
       temperature: 0.1
     });
-    if (!description) throw new Error("Qwen3-VL returned an empty description");
+    if (!description)
+      throw new Error("Vision model returned an empty description");
     return description;
   }
 
@@ -195,7 +145,7 @@ export class VlmService {
         )
       );
     }
-    const text = await this.generate({
+    const { text, model } = await this.complete({
       userPrompt: buildVideoMetricsPrompt(
         input.prompt,
         timestamps,
@@ -207,7 +157,7 @@ export class VlmService {
     });
     return {
       ...parseVideoMetrics(text),
-      model: await this.settings.getVlmBackend(),
+      model,
       frame_count: timestamps.length,
       source_analysis: null,
       ref_assets_loaded: input.referencePaths.length
@@ -323,7 +273,8 @@ export class VlmService {
       maxTokens: DESCRIPTION_MAX_TOKENS,
       temperature: 0.1
     });
-    if (!description) throw new Error("Qwen3-VL returned an empty description");
+    if (!description)
+      throw new Error("Vision model returned an empty description");
     // Whatever landed first wins: a user edit made while Qwen was running is
     // kept, and that is what the caller gets back.
     const updated = await this.repository.setAssetDescriptionIfAbsent(
@@ -427,17 +378,17 @@ export class VlmService {
     return { parsed: parse(retryText), text: retryText };
   }
 
-  /** One VLM job in ComfyUI's queue at a time — see `queue`. */
   private async generate(request: GenerateRequest): Promise<string> {
+    return (await this.complete(request)).text;
+  }
+
+  private complete(request: GenerateRequest) {
     const task = this.queue.then(async () => {
-      const [endpoint, backend] = await Promise.all([
-        this.settings.getComfyEndpoint(),
-        this.settings.getVlmBackend()
-      ]);
-      const client = new ComfyVlmClient(endpoint, backend);
-      return (
-        await client.generate({ systemPrompt: SYSTEM_PROMPT, ...request })
-      ).trim();
+      const { text, model } = await this.generateVision({
+        systemPrompt: SYSTEM_PROMPT,
+        ...request
+      });
+      return { text: text.trim(), model };
     });
     // Keep the chain alive after a failed job.
     this.queue = task.then(
@@ -479,6 +430,8 @@ export class VlmService {
   }
 
   private message(error: unknown): string {
-    return error instanceof Error ? error.message : "Qwen3-VL is unavailable";
+    return error instanceof Error
+      ? error.message
+      : "Vision model is unavailable";
   }
 }

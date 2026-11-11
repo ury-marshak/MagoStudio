@@ -60,6 +60,10 @@ import {
   resumeStartupTimeout,
   startupComplete
 } from "./startupDiagnostics";
+import {
+  generateComfyVision,
+  probeComfyVision
+} from "./vlm/comfyVisionProvider";
 import { LocalI2vPromptAdapter } from "./vlm/localI2vPromptAdapter";
 import { VlmService } from "./vlm/vlmService";
 
@@ -76,7 +80,11 @@ const scriptProjectSnapshotRepository = new ScriptProjectSnapshotRepository(
   databaseManager,
   () => librarySettings.getLibraryRoot()
 );
-const vlmService = new VlmService(projectRepository, librarySettings);
+const vlmService = new VlmService(
+  projectRepository,
+  generateComfyVision(librarySettings),
+  () => probeComfyVision(librarySettings)
+);
 // Every image that lands in the library gets a description, the way
 // The backend describes every upload and render.
 const describeImageLater = (assetId: string) =>
