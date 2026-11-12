@@ -1,4 +1,10 @@
-import { comfySettings, magoState, version, vlmStatus } from "./app";
+import {
+  comfySettings,
+  externalProviders,
+  magoState,
+  version,
+  vlmStatus
+} from "./app";
 import {
   assetLibraryItems,
   assetPrompt,
@@ -71,5 +77,6 @@ export const queryKeys = {
   magoState,
   version,
   vlmStatus,
-  comfySettings
+  comfySettings,
+  externalProviders
 } as const;

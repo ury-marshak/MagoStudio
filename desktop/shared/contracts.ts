@@ -13,6 +13,18 @@ import type { TextModelRequest, TextModelResponse } from "./textModelRequest";
  */
 export type MagoAppMode = "cloud" | "offline" | "unchosen";
 
+export type ExternalModelCapability = "text" | "vision";
+
+export interface FalProviderConfig {
+  keychainAccount: string;
+}
+
+export interface ExternalModelConfig {
+  baseUrl: string;
+  model: string;
+  keychainAccount: string;
+}
+
 export interface LibraryInfo {
   rootPath: string;
   databasePath: string;
@@ -175,11 +187,10 @@ export interface SbsVideoExportProgress {
   percentage: number;
 }
 
-/** Whether the selected local Qwen3-VL captioning path can run. */
+/** Readiness of the selected desktop captioning provider. */
 export interface VlmModelStatus {
-  /** The configured local model path this status describes. */
-  backend: LocalVlmBackend;
-  /** The required core/custom nodes and selected model files were found. */
+  backend: LocalVlmBackend | "external";
+  /** Required local components or the external model were found. */
   ready: boolean;
   /** Basenames the user still has to place in the selected backend's ComfyUI
    *  model folder. Empty when the problem is something else. */
@@ -862,8 +873,22 @@ export interface MagoDesktopApi {
       settings?: Record<string, unknown>;
     }) => Promise<ComfyModelStatus>;
   };
+  externalProviders: {
+    get: (capability: ExternalModelCapability) => Promise<ExternalModelConfig | null>;
+    save: (
+      capability: ExternalModelCapability,
+      config: ExternalModelConfig | null
+    ) => Promise<ExternalModelConfig | null>;
+    check: (capability: ExternalModelCapability) => Promise<void>;
+    fal: {
+      get: () => Promise<FalProviderConfig | null>;
+      save: (config: FalProviderConfig | null) => Promise<FalProviderConfig | null>;
+      check: () => Promise<void>;
+    };
+  };
   vlm: {
     status: () => Promise<VlmModelStatus>;
+    hasExternalText: () => Promise<boolean>;
     /** Return the asset's caption, generating and persisting it if absent. */
     captionAsset: (assetId: string) => Promise<LocalAssetPromptResult>;
     autoPrompt: (input: LocalAutoPromptInput) => Promise<LocalAutoPromptResult>;
@@ -873,7 +898,7 @@ export interface MagoDesktopApi {
     enhancePrompt: (
       input: LocalEnhancePromptInput
     ) => Promise<LocalEnhancePromptResult>;
-    /** MiniMax reference-prompt adaptation on the local script text model. */
+    /** MiniMax reference-prompt adaptation using desktop-managed assets. */
     adaptI2vPrompt: (
       input: LocalAdaptI2vPromptInput
     ) => Promise<LocalAdaptI2vPromptResult>;
@@ -1078,7 +1103,11 @@ export const IPC_CHANNELS = {
   comfyRestartStatus: "comfy:restart-status",
   comfyRestart: "comfy:restart",
   comfyModelStatus: "comfy:model-status",
+  externalProvidersGet: "external-providers:get",
+  externalProvidersSave: "external-providers:save",
+  externalProvidersCheck: "external-providers:check",
   vlmStatus: "vlm:status",
+  vlmHasExternalText: "vlm:has-external-text",
   vlmCaptionAsset: "vlm:caption-asset",
   vlmAutoPrompt: "vlm:auto-prompt",
   vlmSaveAutoPrompt: "vlm:save-auto-prompt",

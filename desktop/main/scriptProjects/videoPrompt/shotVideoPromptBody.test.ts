@@ -246,7 +246,7 @@ describe("createQwenVideoPromptCall", () => {
   it("fails after the repair so the composer falls back to its skeleton", async () => {
     const run = vi.fn().mockResolvedValue("nope");
     await expect(createQwenVideoPromptCall(run)(["PART"])).rejects.toThrow(
-      "Invalid video prompt from the local text model"
+      "Invalid video prompt from the text model"
     );
   });
 });

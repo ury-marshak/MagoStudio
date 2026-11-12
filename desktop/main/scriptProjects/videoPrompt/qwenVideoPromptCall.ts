@@ -76,7 +76,5 @@ export const createQwenVideoPromptCall =
       )
     );
     if (second) return second;
-    throw new Error(
-      `Invalid video prompt from the local text model: ${repeated}`
-    );
+    throw new Error(`Invalid video prompt from the text model: ${repeated}`);
   };

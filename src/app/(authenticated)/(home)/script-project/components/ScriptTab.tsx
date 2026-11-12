@@ -40,9 +40,9 @@ export const ScriptTab: React.FC<Props> = ({
   const { t } = useTranslation();
   const textModel = useTextModelRoute();
   const [chatDraft, setChatDraft] = useState("");
-  const textAccess = useScriptTextAccess();
   const { data: project } = useProject(projectId);
   const isLocalProject = project?.origin === "local";
+  const textAccess = useScriptTextAccess(isLocalProject);
 
   const {
     agentScriptDraft,

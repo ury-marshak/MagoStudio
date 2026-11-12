@@ -39,7 +39,10 @@ export const runCloudTextModel = async (
   request: TextModelRequest,
   signal: AbortSignal
 ): Promise<Record<string, unknown> | null> => {
-  const settings = await getLocalDesktopApi().comfy.get();
+  const desktop = getLocalDesktopApi();
+  if (await desktop.vlm.hasExternalText())
+    throw new Error("External text configuration changed");
+  const settings = await desktop.comfy.get();
   const route = resolveTextModelRoute({
     provider: settings.textModelProvider,
     isCloudAccountActive: isCloudAccountActive()

@@ -14,3 +14,9 @@ export const vlmStatus = {
 export const comfySettings = {
   all: ["comfy-settings"] as const
 };
+
+export const externalProviders = {
+  configuredText: ["external-text-configured"] as const,
+  capability: (capability: "text" | "vision" | "fal") =>
+    ["external-provider-settings", capability] as const
+};

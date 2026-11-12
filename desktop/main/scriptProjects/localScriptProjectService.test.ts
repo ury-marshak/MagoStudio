@@ -202,54 +202,83 @@ describe("local sequential shot planning", () => {
 });
 
 describe("local casting plan failure state", () => {
-  it("fails rather than pauses a plan when Qwen returns malformed output", async () => {
-    const runCasting = vi
-      .spyOn(ComfyScriptProjectClient.prototype, "runCasting")
-      .mockResolvedValue('{"title":"cut off"');
-    let storedPlan: Record<string, unknown> | null = null;
-    const projects = {
-      get: async () => ({
-        id: "project-1",
-        origin: "local",
-        type: "script_to_shots"
-      })
-    };
-    const snapshots = {
-      get: async () => ({ scriptVersions: { versions: [] } }),
-      put: async () => {},
-      getPlan: async () => storedPlan,
-      putPlan: async (
-        _projectId: string,
-        _planId: string,
-        plan: Record<string, unknown>
-      ) => {
-        storedPlan = structuredClone(plan);
-      }
-    };
-    const service = new LocalScriptProjectService(
-      projects as never,
-      snapshots as never,
-      async () => "http://127.0.0.1:8188"
-    );
+  it.each([
+    {
+      route: "local",
+      status: "FAILED",
+      message: "Invalid response from model"
+    },
+    {
+      route: "external",
+      status: "PAUSED",
+      message: "External provider returned HTTP 429"
+    }
+  ])(
+    "records a $route casting failure as $status",
+    async ({ route, status, message }) => {
+      const runCasting = vi
+        .spyOn(ComfyScriptProjectClient.prototype, "runCasting")
+        .mockResolvedValue('{"title":"cut off"');
+      const external = vi.fn().mockRejectedValue(new Error(message));
+      const cloud = vi.fn(async () => null);
+      const comfy = vi.fn(async () => "http://127.0.0.1:8188");
+      let storedPlan: Record<string, unknown> | null = null;
+      const projects = {
+        get: async () => ({
+          id: "project-1",
+          origin: "local",
+          type: "script_to_shots"
+        })
+      };
+      const snapshots = {
+        get: async () => ({ scriptVersions: { versions: [] } }),
+        put: async () => {},
+        getPlan: async () => storedPlan,
+        putPlan: async (
+          _projectId: string,
+          _planId: string,
+          plan: Record<string, unknown>
+        ) => {
+          storedPlan = structuredClone(plan);
+        }
+      };
+      const service = new LocalScriptProjectService(
+        projects as never,
+        snapshots as never,
+        comfy,
+        undefined,
+        undefined,
+        cloud,
+        undefined,
+        async () => (route === "external" ? external : null)
+      );
 
-    await service.cast({
-      projectId: "project-1",
-      script: "INT. ROOM - DAY\nA person enters.",
-      maxShots: 10,
-      isAtomicShotsRequested: false
-    });
-
-    await vi.waitFor(() => {
-      expect(storedPlan).toMatchObject({
-        status: "FAILED",
-        error: { message: "Invalid response from model" }
+      await service.cast({
+        projectId: "project-1",
+        script: "INT. ROOM - DAY\nA person enters.",
+        maxShots: 10,
+        isAtomicShotsRequested: false
       });
-    });
-    // The answer is asked for once more with the reason before the run fails.
-    expect(runCasting).toHaveBeenCalledTimes(2);
-    expect(runCasting.mock.calls[0]![0]).toContain("SEPARATE STYLE");
-    expect(runCasting.mock.calls[1]![0]).toContain("RETRY REQUIREMENT");
-  });
+
+      await vi.waitFor(() => {
+        expect(storedPlan).toMatchObject({
+          status,
+          error: { message }
+        });
+      });
+      if (route === "external") {
+        expect(external).toHaveBeenCalledTimes(1);
+        expect(cloud).not.toHaveBeenCalled();
+        expect(comfy).not.toHaveBeenCalled();
+        expect(runCasting).not.toHaveBeenCalled();
+        return;
+      }
+      // The answer is asked for once more with the reason before the run fails.
+      expect(runCasting).toHaveBeenCalledTimes(2);
+      expect(runCasting.mock.calls[0]![0]).toContain("SEPARATE STYLE");
+      expect(runCasting.mock.calls[1]![0]).toContain("RETRY REQUIREMENT");
+    }
+  );
 });
 
 describe("local cut export planning", () => {
@@ -656,182 +685,210 @@ describe("local casting through the backend pipeline", () => {
     ).rejects.toThrow("max_shots must be between 1 and 200");
   });
 
-  it("casts, runs the atomic pass and materialises packed shots", async () => {
-    const answers = [
-      {
-        title: "The Vault",
-        sequences: [],
-        sequence_video_prompts: [
-          {
-            id: 1,
-            video_prompt: "Amara cracks the safe.",
-            needs_previous_frame: false,
-            dialogue: [
-              { speaker: "AMARA", line: "Almost there.", language: "English" }
-            ]
-          }
-        ],
-        characters: [
-          {
-            name: "Amara",
-            description: "A safecracker.",
-            sequence_ids: [1],
-            alt: "default",
-            t2i_prompt: "Amara turnaround."
-          }
-        ],
-        environments: [
-          {
-            name: "Vault",
-            description: "A steel vault.",
-            sequence_ids: [1],
-            alt: "default",
-            t2i_prompt: "Vault plate."
-          }
-        ],
-        props: []
-      },
-      {
-        sequence_shots: [
-          {
-            sequence_id: 1,
-            shots: [
-              {
-                action: "Amara kneels at the safe",
-                video_prompt: "Amara kneels.",
-                characters: ["amara"],
-                environments: ["vault"],
-                props: [],
-                needs_previous_frame: false,
-                beat_type: "physical_beat",
-                duration_short_s: 2.5,
-                duration_long_s: 4,
-                camera: { framing: "wide", movement: "", lens: "" }
-              },
-              {
-                action: "She whispers",
-                video_prompt: "Close on Amara.",
-                characters: ["amara"],
-                environments: ["vault"],
-                props: [],
-                needs_previous_frame: true,
-                dialogue: [
-                  {
-                    speaker: "AMARA",
-                    line: "Almost there.",
-                    language: "English"
-                  }
-                ],
-                beat_type: "contained_reaction",
-                duration_short_s: 2,
-                duration_long_s: 3.25,
-                camera: { framing: "close-up", movement: "", lens: "" }
-              }
-            ]
-          }
-        ]
-      }
-    ];
-    const runCasting = vi
-      .spyOn(ComfyScriptProjectClient.prototype, "runCasting")
-      .mockImplementation(async () => JSON.stringify(answers.shift()));
-    let snapshot: Record<string, unknown> | null = null;
-    const plans = new Map<string, Record<string, unknown>>();
-    const renamed: string[] = [];
-    const service = new LocalScriptProjectService(
-      {
-        get: async () => ({
-          id: "p",
-          origin: "local",
-          type: "script_to_shots"
-        }),
-        renameUntitledFromCasting: async (_id: string, title: string) => {
-          renamed.push(title);
-        }
-      } as never,
-      {
-        get: async () =>
-          snapshot && { ...snapshot, planDetails: Object.fromEntries(plans) },
-        put: async (value: Record<string, unknown>) => {
-          snapshot = { ...(snapshot ?? {}), ...value };
+  it.each(["local", "external"] as const)(
+    "casts, runs the atomic pass and materialises packed shots with %s text",
+    async (route) => {
+      const answers = [
+        {
+          title: "The Vault",
+          sequences: [],
+          sequence_video_prompts: [
+            {
+              id: 1,
+              video_prompt: "Amara cracks the safe.",
+              needs_previous_frame: false,
+              dialogue: [
+                { speaker: "AMARA", line: "Almost there.", language: "English" }
+              ]
+            }
+          ],
+          characters: [
+            {
+              name: "Amara",
+              description: "A safecracker.",
+              sequence_ids: [1],
+              alt: "default",
+              t2i_prompt: "Amara turnaround."
+            }
+          ],
+          environments: [
+            {
+              name: "Vault",
+              description: "A steel vault.",
+              sequence_ids: [1],
+              alt: "default",
+              t2i_prompt: "Vault plate."
+            }
+          ],
+          props: []
         },
-        getPlan: async (id: string) => plans.get(id) ?? null,
-        putPlan: async (
-          _project: string,
-          id: string,
-          plan: Record<string, unknown>
-        ) => {
-          plans.set(id, structuredClone(plan));
+        {
+          sequence_shots: [
+            {
+              sequence_id: 1,
+              shots: [
+                {
+                  action: "Amara kneels at the safe",
+                  video_prompt: "Amara kneels.",
+                  characters: ["amara"],
+                  environments: ["vault"],
+                  props: [],
+                  needs_previous_frame: false,
+                  beat_type: "physical_beat",
+                  duration_short_s: 2.5,
+                  duration_long_s: 4,
+                  camera: { framing: "wide", movement: "", lens: "" }
+                },
+                {
+                  action: "She whispers",
+                  video_prompt: "Close on Amara.",
+                  characters: ["amara"],
+                  environments: ["vault"],
+                  props: [],
+                  needs_previous_frame: true,
+                  dialogue: [
+                    {
+                      speaker: "AMARA",
+                      line: "Almost there.",
+                      language: "English"
+                    }
+                  ],
+                  beat_type: "contained_reaction",
+                  duration_short_s: 2,
+                  duration_long_s: 3.25,
+                  camera: { framing: "close-up", movement: "", lens: "" }
+                }
+              ]
+            }
+          ]
         }
-      } as never,
-      async () => "http://127.0.0.1:8188"
-    );
+      ];
+      const runCasting = vi
+        .spyOn(ComfyScriptProjectClient.prototype, "runCasting")
+        .mockImplementation(async () => JSON.stringify(answers.shift()));
+      const external = vi.fn(async (_request: { userPrompt: string }) => ({
+        text: JSON.stringify(answers.shift()),
+        model: "test/casting-model"
+      }));
+      const cloud = vi.fn(async () => null);
+      const comfy = vi.fn(async () => "http://127.0.0.1:8188");
+      let snapshot: Record<string, unknown> | null = null;
+      const plans = new Map<string, Record<string, unknown>>();
+      const renamed: string[] = [];
+      const service = new LocalScriptProjectService(
+        {
+          get: async () => ({
+            id: "p",
+            origin: "local",
+            type: "script_to_shots"
+          }),
+          renameUntitledFromCasting: async (_id: string, title: string) => {
+            renamed.push(title);
+          }
+        } as never,
+        {
+          get: async () =>
+            snapshot && { ...snapshot, planDetails: Object.fromEntries(plans) },
+          put: async (value: Record<string, unknown>) => {
+            snapshot = { ...(snapshot ?? {}), ...value };
+          },
+          getPlan: async (id: string) => plans.get(id) ?? null,
+          putPlan: async (
+            _project: string,
+            id: string,
+            plan: Record<string, unknown>
+          ) => {
+            plans.set(id, structuredClone(plan));
+          }
+        } as never,
+        comfy,
+        undefined,
+        undefined,
+        cloud,
+        undefined,
+        async () => (route === "external" ? external : null)
+      );
 
-    const { plan_id: planId, version } = await service.cast({
-      projectId: "p",
-      script:
-        "INT. VAULT - NIGHT\n\nAmara kneels at the safe.\n\nAMARA\nAlmost there.",
-      maxShots: 30,
-      isAtomicShotsRequested: true
-    });
-    await vi.waitFor(() => expect(plans.get(planId)?.status).toBe("COMPLETED"));
+      const { plan_id: planId, version } = await service.cast({
+        projectId: "p",
+        script:
+          "INT. VAULT - NIGHT\n\nAmara kneels at the safe.\n\nAMARA\nAlmost there.",
+        maxShots: 30,
+        isAtomicShotsRequested: true
+      });
+      await vi.waitFor(() =>
+        expect(plans.get(planId)?.status).toBe("COMPLETED")
+      );
 
-    expect(version).toBe(1);
-    expect(runCasting).toHaveBeenCalledTimes(2);
-    expect(runCasting.mock.calls[1]![0]).toContain(
-      "You are breaking already-identified sequences down into shots"
-    );
-    expect(runCasting.mock.calls[1]![0]).not.toContain("SEQUENCE MODE");
-    expect(renamed).toEqual(["The Vault"]);
-    const state = snapshot!.state as Record<string, unknown>;
-    const shots = state.shots as Array<Record<string, unknown>>;
-    expect(shots).toHaveLength(1);
-    expect(shots[0]).toEqual(
-      expect.objectContaining({
-        key: "rseq_1_1",
-        dropped: false,
-        tags: { characters: ["amara"], environments: ["vault"], props: [] },
-        missing_references: [
-          { token: "amara", reason: "no image" },
-          { token: "vault", reason: "no image" }
-        ]
-      })
-    );
-    expect(shots[0]!.video_prompt).toContain("[Shot 2]");
-    expect(
-      (state.keys as Array<Record<string, unknown>>).map((key) => key.token)
-    ).toEqual(["amara", "vault"]);
-    // Read back the way the renderer reads it: the status and summary come
-    // from the version's plan, as GET /projects/:id/script reports them.
-    const read = await service.getSnapshot("p");
-    const versions = (read!.scriptVersions as Record<string, unknown>)
-      .versions as Array<Record<string, unknown>>;
-    expect(
-      (read!.scriptVersions as Record<string, unknown>).active_version
-    ).toBe(1);
-    expect(versions).toEqual([
-      expect.objectContaining({
-        version: 1,
-        plan_id: planId,
-        render_sequences: true,
-        status: "COMPLETED",
-        summary: expect.objectContaining({ shots_added: ["rseq_1_1"] })
-      })
-    ]);
-    const steps = plans.get(planId)!.steps as Array<Record<string, unknown>>;
-    expect(steps.map((step) => step.tool_name)).toEqual([
-      "submit_script_casting",
-      "poll_script_casting",
-      "materialise_project_state"
-    ]);
-    expect(steps[0]!.tool_args).toEqual(
-      expect.objectContaining({
-        atomic_shots: true,
-        sequence_mode: true,
-        include_dialogue: true
-      })
-    );
-  });
+      expect(version).toBe(1);
+      const prompts =
+        route === "external"
+          ? external.mock.calls.map(([request]) => request.userPrompt)
+          : runCasting.mock.calls.map(([prompt]) => prompt);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain(
+        "You are breaking already-identified sequences down into shots"
+      );
+      expect(prompts[1]).not.toContain("SEQUENCE MODE");
+      if (route === "external") {
+        expect(cloud).not.toHaveBeenCalled();
+        expect(comfy).not.toHaveBeenCalled();
+        expect(runCasting).not.toHaveBeenCalled();
+      }
+      expect(renamed).toEqual(["The Vault"]);
+      const state = snapshot!.state as Record<string, unknown>;
+      const shots = state.shots as Array<Record<string, unknown>>;
+      expect(shots).toHaveLength(1);
+      expect(shots[0]).toEqual(
+        expect.objectContaining({
+          key: "rseq_1_1",
+          dropped: false,
+          tags: { characters: ["amara"], environments: ["vault"], props: [] },
+          missing_references: [
+            { token: "amara", reason: "no image" },
+            { token: "vault", reason: "no image" }
+          ]
+        })
+      );
+      expect(shots[0]!.video_prompt).toContain("[Shot 2]");
+      expect(
+        (state.keys as Array<Record<string, unknown>>).map((key) => key.token)
+      ).toEqual(["amara", "vault"]);
+      // Read back the way the renderer reads it: the status and summary come
+      // from the version's plan, as GET /projects/:id/script reports them.
+      const read = await service.getSnapshot("p");
+      const versions = (read!.scriptVersions as Record<string, unknown>)
+        .versions as Array<Record<string, unknown>>;
+      expect(
+        (read!.scriptVersions as Record<string, unknown>).active_version
+      ).toBe(1);
+      expect(versions).toEqual([
+        expect.objectContaining({
+          version: 1,
+          plan_id: planId,
+          render_sequences: true,
+          status: "COMPLETED",
+          summary: expect.objectContaining({ shots_added: ["rseq_1_1"] })
+        })
+      ]);
+      const steps = plans.get(planId)!.steps as Array<Record<string, unknown>>;
+      expect(steps.map((step) => step.tool_name)).toEqual([
+        "submit_script_casting",
+        "poll_script_casting",
+        "materialise_project_state"
+      ]);
+      expect(steps[1]!.result).toMatchObject({ text_model_route: route });
+      if (route === "external")
+        expect(steps[1]!.result).toMatchObject({ model: "test/casting-model" });
+      expect(steps[0]!.tool_args).toEqual(
+        expect.objectContaining({
+          atomic_shots: true,
+          sequence_mode: true,
+          include_dialogue: true
+        })
+      );
+    }
+  );
 });
 
 describe("local script-project media lookup", () => {
@@ -965,7 +1022,12 @@ describe("local sheet runs", () => {
 });
 
 const createInMemoryScriptProjectStore = (
-  initialState: Record<string, unknown>
+  initialState: Record<string, unknown>,
+  textOptions: {
+    localModel?: ConstructorParameters<typeof LocalScriptProjectService>[3];
+    cloud?: ConstructorParameters<typeof LocalScriptProjectService>[5];
+    external?: ConstructorParameters<typeof LocalScriptProjectService>[7];
+  } = {}
 ) => {
   const stored: {
     state: Record<string, unknown>;
@@ -981,6 +1043,7 @@ const createInMemoryScriptProjectStore = (
     put: async (input: { state?: Record<string, unknown> }) => {
       if (input.state) stored.state = input.state;
     },
+    resolveMediaPath: async (id: string) => `/mock/${id}.png`,
     getPlan: async (id: string) => plans.get(id) ?? null,
     putPlan: async (
       _projectId: string,
@@ -999,7 +1062,12 @@ const createInMemoryScriptProjectStore = (
       })
     } as never,
     snapshots as never,
-    async () => "http://127.0.0.1:8188"
+    async () => "http://127.0.0.1:8188",
+    textOptions.localModel,
+    undefined,
+    textOptions.cloud,
+    undefined,
+    textOptions.external
   );
   return { service, stored, plans };
 };
@@ -1014,6 +1082,112 @@ const stepStatusesFor = (
   ((plan?.steps ?? []) as Array<Record<string, unknown>>)
     .filter(isStepForItem)
     .map((step) => step.status);
+
+describe("external Director shot prompts", () => {
+  it.each(["success", "provider error", "invalid document"])(
+    "routes a rewritten shot through external text with %s",
+    async (outcome) => {
+      const localModel = vi.fn();
+      const cloud = vi.fn();
+      const localPrompt = vi.spyOn(
+        ComfyScriptProjectClient.prototype,
+        "runVideoPrompt"
+      );
+      const render = vi
+        .spyOn(ComfyScriptProjectClient.prototype, "runVideo")
+        .mockRejectedValue(new Error("Mock render stopped"));
+      const external = vi.fn(async (_request: { userPrompt: string }) => {
+        if (outcome === "provider error")
+          throw new Error("External provider returned HTTP 429");
+        return {
+          model: "test/shot-model",
+          text: JSON.stringify({
+            subject_definitions:
+              "{{subject:hero}} is the courier in {{ref:hero}}.",
+            summary: "[reference generation] A courier waits.",
+            retention_analysis:
+              "{{ref:hero}}: weak_reference - the courier's appearance.",
+            detailed_description:
+              outcome === "success"
+                ? "[Shot 1] The courier waits by the door."
+                : "The courier waits.",
+            overall_soundscape: "Room tone.",
+            non_diegetic_music: "N/A"
+          })
+        };
+      });
+      const { service, plans } = createInMemoryScriptProjectStore(
+        {
+          keys: [{ token: "hero", name: "Hero", description: "A courier." }],
+          shots: [
+            {
+              timeline_id: "shot-1",
+              shot_index: 0,
+              sequence_id: 1,
+              key: "1",
+              video_prompt: "The courier waits.",
+              duration_s: 6,
+              tags: { characters: ["hero"] },
+              references: {
+                characters: [{ token: "hero", asset_id: "img-hero" }]
+              },
+              missing_references: []
+            }
+          ]
+        },
+        { localModel, cloud, external: async () => external }
+      );
+      const result = await service.generateShots({
+        projectId: "project-1",
+        isDryRun: false,
+        videoSettings: { prompt_rewrite: "mago" }
+      });
+      const planId = String(result.plan_id);
+      await vi.waitFor(() => expect(plans.get(planId)?.status).toBe("PAUSED"));
+      const steps = plans.get(planId)?.steps as Array<Record<string, unknown>>;
+      const prompt = steps.find(
+        (step) => step.tool_name === "poll_shot_video_prompt"
+      );
+      expect(external.mock.calls[0]?.[0].userPrompt).toContain(
+        "RESPONSE FORMAT:"
+      );
+      expect(localModel).not.toHaveBeenCalled();
+      expect(cloud).not.toHaveBeenCalled();
+      expect(localPrompt).not.toHaveBeenCalled();
+
+      if (outcome === "success") {
+        expect(prompt).toMatchObject({
+          status: "COMPLETED",
+          result: {
+            model: "test/shot-model",
+            text_model_route: "external",
+            fallback: false
+          }
+        });
+        expect(render).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            prompt: expect.stringContaining(
+              "[Shot 1] The courier waits by the door."
+            )
+          })
+        );
+        return;
+      }
+      expect(render).not.toHaveBeenCalled();
+      expect(prompt).toMatchObject({
+        status: "FAILED",
+        error: {
+          message: expect.stringContaining(
+            outcome === "provider error" ? "HTTP 429" : "failed validation"
+          )
+        }
+      });
+      expect(external).toHaveBeenCalledTimes(
+        outcome === "provider error" ? 1 : 2
+      );
+    }
+  );
+});
 
 describe("local sheet group creation", () => {
   it("creates the entity added from the Assets tab and renders it", async () => {

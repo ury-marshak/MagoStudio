@@ -99,7 +99,11 @@ const ipcChannels = {
   comfyRestartStatus: "comfy:restart-status",
   comfyRestart: "comfy:restart",
   comfyModelStatus: "comfy:model-status",
+  externalProvidersGet: "external-providers:get",
+  externalProvidersSave: "external-providers:save",
+  externalProvidersCheck: "external-providers:check",
   vlmStatus: "vlm:status",
+  vlmHasExternalText: "vlm:has-external-text",
   vlmCaptionAsset: "vlm:caption-asset",
   vlmAutoPrompt: "vlm:auto-prompt",
   vlmSaveAutoPrompt: "vlm:save-auto-prompt",
@@ -312,8 +316,23 @@ const api: MagoDesktopApi = {
     modelStatus: (input) =>
       ipcRenderer.invoke(ipcChannels.comfyModelStatus, input)
   },
+  externalProviders: {
+    get: (capability) =>
+      ipcRenderer.invoke(ipcChannels.externalProvidersGet, capability),
+    save: (capability, config) =>
+      ipcRenderer.invoke(ipcChannels.externalProvidersSave, capability, config),
+    check: (capability) =>
+      ipcRenderer.invoke(ipcChannels.externalProvidersCheck, capability),
+    fal: {
+      get: () => ipcRenderer.invoke(ipcChannels.externalProvidersGet, "fal"),
+      save: (config) =>
+        ipcRenderer.invoke(ipcChannels.externalProvidersSave, "fal", config),
+      check: () => ipcRenderer.invoke(ipcChannels.externalProvidersCheck, "fal")
+    }
+  },
   vlm: {
     status: () => ipcRenderer.invoke(ipcChannels.vlmStatus),
+    hasExternalText: () => ipcRenderer.invoke(ipcChannels.vlmHasExternalText),
     captionAsset: (assetId) =>
       ipcRenderer.invoke(ipcChannels.vlmCaptionAsset, assetId),
     autoPrompt: (input) => ipcRenderer.invoke(ipcChannels.vlmAutoPrompt, input),

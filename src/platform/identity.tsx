@@ -26,10 +26,8 @@ export type IdentityMode = "cloud" | "offline";
 /**
  * Absent bridge means we are not in the desktop shell at all — unit tests,
  * Storybook, `next dev` in a browser — where the local identity is right.
- * "unchosen" is first launch, which now shows Clerk's own sign-in form as the
- * very first screen, so Clerk has to be the implementation before the user has
- * answered. Skipping that screen persists "offline" and rebuilds the window,
- * and from then on nothing reaches the network.
+ * "unchosen" displays the first-launch choice and needs Clerk for sign-in.
+ * Opening the local editor rebuilds the window with local identity.
  */
 export const readIdentityMode = (): IdentityMode => {
   if (typeof window === "undefined") return "offline";

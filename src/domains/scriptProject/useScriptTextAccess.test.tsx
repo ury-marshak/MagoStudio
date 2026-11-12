@@ -37,6 +37,7 @@ const installBridge = (
       mode: signedIn ? "cloud" : "offline",
       chooseMode: vi.fn().mockResolvedValue(undefined)
     },
+    vlm: { hasExternalText: vi.fn().mockResolvedValue(false) },
     comfy: {
       get: vi.fn().mockResolvedValue({
         textModelProvider: cloudTextSelected ? "cloud" : "local",
@@ -56,11 +57,11 @@ const installBridge = (
   );
   return bridge;
 };
-const renderAccess = () => {
+const renderAccess = (isLocalProject = true) => {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } }
   });
-  return renderHook(() => useScriptTextAccess(), {
+  return renderHook(() => useScriptTextAccess(isLocalProject), {
     wrapper: ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     )
@@ -105,6 +106,28 @@ describe("Script tab text access", () => {
       expect(await result.current.ensureAccess()).toBe(true)
     );
     expect(bridge.comfy.scriptSetupStatus).not.toHaveBeenCalled();
+  });
+
+  it("lets a signed-out local project use external text without probing ComfyUI", async () => {
+    const bridge = installBridge();
+    bridge.vlm.hasExternalText.mockResolvedValue(true);
+    const { result } = renderAccess();
+    await act(async () =>
+      expect(await result.current.ensureAccess()).toBe(true)
+    );
+    expect(bridge.comfy.get).not.toHaveBeenCalled();
+    expect(bridge.comfy.scriptSetupStatus).not.toHaveBeenCalled();
+    expect(result.current.isOpen).toBe(false);
+  });
+
+  it("keeps the existing access gate for a cloud project", async () => {
+    const bridge = installBridge();
+    bridge.vlm.hasExternalText.mockResolvedValue(true);
+    const { result } = renderAccess(false);
+    await act(async () =>
+      expect(await result.current.ensureAccess()).toBe(false)
+    );
+    expect(bridge.vlm.hasExternalText).not.toHaveBeenCalled();
   });
 
   it("allows the web app without desktop probes", async () => {

@@ -1,6 +1,7 @@
 export const LOCAL_SETTINGS_TAB_IDS = {
   account: "account",
   models: "models",
+  providers: "providers",
   general: "general"
 } as const;
 

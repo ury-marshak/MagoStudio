@@ -206,10 +206,31 @@
       "cloudTextNeedsSignIn": "Sign in to Mago to use cloud text generation. Otherwise it falls back to the local text model."
     },
     "tabs": {
+      "providers": "Providers",
       "account": "Account",
       "models": "Models",
       "general": "General",
       "needsAttention": "Needs attention"
+    },
+    "providers": {
+      "fal": "fal.ai",
+      "falHint": "Use a separate Keychain account for the fal API key, such as fal.",
+      "checkKeychain": "Check Keychain",
+      "checkingKeychain": "Checking Keychain…",
+      "checkKeychainPassed": "Keychain entry is readable. fal.ai was not contacted.",
+      "text": "Text provider",
+      "vision": "Vision provider",
+      "baseUrl": "API base URL",
+      "model": "Model ID",
+      "keychainAccount": "Keychain account",
+      "save": "Save",
+      "check": "Check connection",
+      "remove": "Remove",
+      "checking": "Checking connection…",
+      "checkPassed": "Model found. No generation was requested.",
+      "saved": "Settings saved.",
+      "removed": "Provider removed.",
+      "keychainHint": "In macOS Keychain Access, save the API key as a password item named MagoStudio.ExternalProvider. Enter that item's account below. Text and vision can share the same account."
     },
     "statusMark": {
       "checking": "{{label}}: checking",
@@ -5569,7 +5590,7 @@
     }
   },
   "signInGate": {
-    "skip": "Skip"
+    "openLocalEditor": "Open local editor"
   },
   "cloudUnreachable": {
     "retry": "Try again",

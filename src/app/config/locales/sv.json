@@ -206,10 +206,31 @@
       "cloudTextNeedsSignIn": "Logga in på Mago för att använda textgenerering i molnet. Annars används den lokala textmodellen."
     },
     "tabs": {
+      "providers": "Leverantörer",
       "account": "Konto",
       "models": "Modeller",
       "general": "Allmänt",
       "needsAttention": "Behöver åtgärdas"
+    },
+    "providers": {
+      "fal": "fal.ai",
+      "falHint": "Använd ett separat konto i Nyckelhanterare för fal-nyckeln, till exempel fal.",
+      "checkKeychain": "Kontrollera Nyckelhanterare",
+      "checkingKeychain": "Kontrollerar Nyckelhanterare…",
+      "checkKeychainPassed": "Posten i Nyckelhanterare kan läsas. fal.ai kontaktades inte.",
+      "text": "Textleverantör",
+      "vision": "Bildanalysleverantör",
+      "baseUrl": "API-basadress",
+      "model": "Modell-ID",
+      "keychainAccount": "Konto i Nyckelhanterare",
+      "save": "Spara",
+      "check": "Kontrollera anslutningen",
+      "remove": "Ta bort",
+      "checking": "Kontrollerar anslutningen…",
+      "checkPassed": "Modellen hittades. Ingen generering begärdes.",
+      "saved": "Inställningarna har sparats.",
+      "removed": "Leverantören har tagits bort.",
+      "keychainHint": "Spara API-nyckeln som ett lösenordsobjekt med namnet MagoStudio.ExternalProvider i macOS Nyckelhanterare. Ange objektets konto nedan. Text och bildanalys kan dela samma konto."
     },
     "statusMark": {
       "checking": "{{label}}: kontrollerar",
@@ -5573,7 +5594,7 @@
     }
   },
   "signInGate": {
-    "skip": "Hoppa över"
+    "openLocalEditor": "Öppna den lokala redigeraren"
   },
   "cloudUnreachable": {
     "retry": "Försök igen",

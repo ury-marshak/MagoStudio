@@ -11,7 +11,6 @@ import { useLocalSetupWizardFlow } from "./hooks/useLocalSetupWizardFlow";
 import { LocalSetupCollapsedPill } from "./LocalSetupCollapsedPill";
 import { LocalSetupWizard } from "./LocalSetupWizard";
 import {
-  consumeLocalSetupWizardRequest,
   OPEN_LOCAL_SETUP_EVENT,
   readLocalSetupOpenRequest
 } from "./localSetupWizardHandoff";
@@ -19,11 +18,6 @@ import { isStarterInstallRunning } from "./utils/isStarterInstallRunning";
 
 /**
  * Mounts the local setup wizard over a running app rather than in place of it.
- *
- * Skipping sign-in persists offline mode and rebuilds the window, so by the
- * time the wizard appears the app behind it is real and usable. The wrapper
- * takes no pointer events, which is what keeps the rest of the interface
- * clickable while setup is open.
  *
  * The panel sits in the centre of the screen and collapses to a pill in the
  * bottom-right corner.
@@ -45,7 +39,6 @@ export const LocalSetupWizardHost = () => {
   const setIsLocalSetupInProgress = useSetAtom(localSetupInProgressAtom);
 
   useMountEffect(() => {
-    if (consumeLocalSetupWizardRequest()) setIsOpen(true);
     const expandAndApplyOpenRequest = (event: Event) => {
       setIsCollapsed(false);
       const openRequest = readLocalSetupOpenRequest(event);

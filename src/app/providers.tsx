@@ -61,11 +61,8 @@ export default function Providers({
     </QueryClientProvider>
   );
 
-  // Offline mode never mounts ClerkProvider, so clerk-js is never fetched and
-  // the app makes no network request at all. Identity comes from the local
-  // stand-in instead; see src/platform/identity.tsx. First launch is not
-  // offline: the gate shows Clerk's own sign-in form, so clerk-js does load
-  // before the user has chosen.
+  // The local editor uses local identity. External inference is handled
+  // separately by the desktop main process.
   if (identityMode !== "cloud") return content;
 
   return (

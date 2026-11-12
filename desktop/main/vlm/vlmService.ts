@@ -83,7 +83,8 @@ export class VlmService {
   constructor(
     private readonly repository: ProjectRepository,
     private readonly generateVision: VisionGenerator,
-    private readonly probeVision: () => Promise<VlmModelStatus>
+    private readonly probeVision: () => Promise<VlmModelStatus>,
+    private readonly generateEnhancement: VisionGenerator = generateVision
   ) {}
 
   status(): Promise<VlmModelStatus> {
@@ -251,10 +252,13 @@ export class VlmService {
     if (!query) throw new Error("Missing required 'query' field");
     // Text only — the enhancer never had an image, and only the kontext version
     // ever shipped.
-    const text = await this.generate({
-      userPrompt: `${PROMPT_ENHANCER_KONTEXT}\n\nUser prompt: ${query}`,
-      maxTokens: ENHANCE_MAX_TOKENS
-    });
+    const text = await this.generate(
+      {
+        userPrompt: `${PROMPT_ENHANCER_KONTEXT}\n\nUser prompt: ${query}`,
+        maxTokens: ENHANCE_MAX_TOKENS
+      },
+      this.generateEnhancement
+    );
     return { enhanced_prompt: text };
   }
 
@@ -378,13 +382,16 @@ export class VlmService {
     return { parsed: parse(retryText), text: retryText };
   }
 
-  private async generate(request: GenerateRequest): Promise<string> {
-    return (await this.complete(request)).text;
+  private async generate(
+    request: GenerateRequest,
+    generate: VisionGenerator = this.generateVision
+  ): Promise<string> {
+    return (await this.complete(request, generate)).text;
   }
 
-  private complete(request: GenerateRequest) {
+  private complete(request: GenerateRequest, generate = this.generateVision) {
     const task = this.queue.then(async () => {
-      const { text, model } = await this.generateVision({
+      const { text, model } = await generate({
         systemPrompt: SYSTEM_PROMPT,
         ...request
       });

@@ -8,6 +8,8 @@ import {
   uniqueIndex
 } from "drizzle-orm/sqlite-core";
 
+import type { MediaRenderOutput } from "../providers/mediaRenderProvider";
+
 const timestamps = {
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
@@ -325,5 +327,49 @@ export const scriptChatMessages = sqliteTable(
     uniqueIndex("script_chat_messages_pending_per_project")
       .on(table.projectId)
       .where(sql`${table.status} = 'PENDING'`)
+  ]
+);
+
+export const externalRenderJobs = sqliteTable(
+  "external_render_jobs",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    provider: text("provider").notNull(),
+    endpoint: text("endpoint").notNull(),
+    kind: text("kind", { enum: ["image", "video"] }).notNull(),
+    keychainAccount: text("keychain_account").notNull(),
+    status: text("status", {
+      enum: [
+        "SUBMITTING",
+        "SUBMISSION_UNKNOWN",
+        "SUBMITTED",
+        "CANCELLATION_REQUESTED",
+        "OUTPUT_READY",
+        "FAILED",
+        "CANCELLED"
+      ]
+    }).notNull(),
+    requestId: text("request_id"),
+    requestJson: text("request_json", { mode: "json" })
+      .$type<Record<string, unknown>>()
+      .notNull(),
+    inputAssetIds: text("input_asset_ids", { mode: "json" })
+      .$type<string[]>()
+      .notNull(),
+    outputJson: text("output_json", {
+      mode: "json"
+    }).$type<MediaRenderOutput>(),
+    error: text("error"),
+    ...timestamps
+  },
+  (table) => [
+    index("external_render_jobs_status_idx").on(table.status),
+    uniqueIndex("external_render_jobs_provider_request_idx").on(
+      table.provider,
+      table.requestId
+    )
   ]
 );

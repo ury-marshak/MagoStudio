@@ -50,6 +50,13 @@
       "when": 1786180000000,
       "tag": "0006_script_chat_messages",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1786190000000,
+      "tag": "0007_external_render_jobs",
+      "breakpoints": true
     }
   ]
 }

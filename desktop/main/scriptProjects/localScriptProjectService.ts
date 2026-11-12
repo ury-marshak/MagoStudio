@@ -15,6 +15,7 @@ import { ProjectRepository } from "../database/projectRepository";
 import { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import { probeComfyRenderModel } from "../imageRenders/comfyModelValidation";
 import type { ShotVideoEvaluationInput } from "../vlm/videoMetrics";
+import type { VisionGenerator } from "../vlm/visionGenerator";
 
 import {
   applyShotEdit,
@@ -290,6 +291,7 @@ type RunControl = {
   planId: string;
   projectId: string;
   cancelled: boolean;
+  abortController: AbortController;
 };
 
 type LocalPlanOperation = "cast" | "sheets" | "shots" | "cut";
@@ -464,7 +466,8 @@ export class LocalScriptProjectService {
     private readonly runCloudTextModel: RunCloudTextModel = async () => null,
     private readonly evaluateShotVideo?: (
       input: ShotVideoEvaluationInput
-    ) => Promise<JsonRecord>
+    ) => Promise<JsonRecord>,
+    private readonly getExternalTextGenerator?: () => Promise<VisionGenerator | null>
   ) {
     this.shotMetrics = new LocalShotMetrics({
       read: (id) => this.snapshots.getMediaMetrics(id),
@@ -679,7 +682,10 @@ export class LocalScriptProjectService {
     const plan = await this.requireLocallyRunPlan(planId);
     const projectId = String(plan.project_id);
     const running = this.projectRuns.get(projectId);
-    if (running?.control.planId === planId) running.control.cancelled = true;
+    if (running?.control.planId === planId) {
+      running.control.cancelled = true;
+      running.control.abortController.abort();
+    }
     this.removeQueuedRun(projectId, planId);
     const cancelled = structuredClone(plan);
     cancelled.steps = records(cancelled.steps).map((step) =>
@@ -2408,15 +2414,14 @@ export class LocalScriptProjectService {
     const localH3Model = resolveLocalH3Model(
       input.videoSettings?.local_h3_model
     );
-    const scriptTextModel = await this.getScriptTextModel();
+    let legacyPromptClient: ComfyScriptProjectClient | undefined;
+    let legacyPromptModel: string | undefined;
     let plan = planAt(basePlan, "RUNNING");
     await this.snapshots.putPlan(input.projectId, planId, plan);
     let activeStep: JsonRecord | undefined;
     try {
-      const client = new ComfyScriptProjectClient(
-        await this.getComfyEndpoint(),
-        scriptTextModel
-      );
+      const endpoint = await this.getComfyEndpoint();
+      const client = new ComfyScriptProjectClient(endpoint);
       for (const target of [...targetShots].sort(
         (left, right) => Number(left.shot_index) - Number(right.shot_index)
       )) {
@@ -2839,22 +2844,55 @@ export class LocalScriptProjectService {
               ""
             )
           });
-          const cloud = await this.runCloudTextModel(
-            "video-prompt",
-            {
-              ...body,
-              prompt_version: "minimax_h3_ref"
-            },
-            () => control.cancelled
-          );
+          const generateExternal = await this.getExternalTextGenerator?.();
+          this.throwIfCancelled(control);
+          const cloud = generateExternal
+            ? null
+            : await this.runCloudTextModel(
+                "video-prompt",
+                { ...body, prompt_version: "minimax_h3_ref" },
+                () => control.cancelled
+              );
+          const textModelRoute = generateExternal
+            ? "external"
+            : cloud
+              ? "cloud"
+              : "local";
+          if (!generateExternal && !cloud && !legacyPromptClient) {
+            const scriptTextModel = await this.getScriptTextModel();
+            legacyPromptClient = new ComfyScriptProjectClient(
+              endpoint,
+              scriptTextModel
+            );
+            legacyPromptModel = LOCAL_SCRIPT_TEXT_MODEL_FILES[scriptTextModel];
+          }
+          let model = cloud ? "cloud" : legacyPromptModel;
           const composed =
             cloud ??
             (await generateVideoPrompt(
               body,
-              createQwenVideoPromptCall((prompt) =>
-                client.runVideoPrompt(prompt, () => control.cancelled)
-              ),
-              { storedCaption: storedCaptionFor([...stateKeys.values()]) }
+              createQwenVideoPromptCall(async (prompt) => {
+                this.throwIfCancelled(control);
+                if (generateExternal) {
+                  const result = await generateExternal({
+                    systemPrompt: "Return one valid JSON object only.",
+                    userPrompt: prompt,
+                    maxTokens: 8000,
+                    temperature: 0.1,
+                    signal: control.abortController.signal
+                  });
+                  model = result.model;
+                  return result.text;
+                }
+                return legacyPromptClient!.runVideoPrompt(
+                  prompt,
+                  () => control.cancelled
+                );
+              }),
+              {
+                storedCaption: storedCaptionFor([...stateKeys.values()]),
+                allowFallback: !generateExternal
+              }
             ));
           this.throwIfCancelled(control);
           adaptedPrompt = textValue(composed.prompt, "");
@@ -2868,10 +2906,8 @@ export class LocalScriptProjectService {
             {
               adapted_video_prompt: adaptedPrompt,
               prompt_template: composed.prompt_template,
-              model: cloud
-                ? "cloud"
-                : LOCAL_SCRIPT_TEXT_MODEL_FILES[scriptTextModel],
-              text_model_route: cloud ? "cloud" : "local",
+              model,
+              text_model_route: textModelRoute,
               numbered_ref_asset_ids: numberedImageIds,
               numbered_video_asset_ids: continuityVideo
                 ? [continuityVideo.id]
@@ -3148,21 +3184,11 @@ export class LocalScriptProjectService {
     await this.snapshots.putPlan(input.projectId, planId, plan);
     let activeStep: JsonRecord | undefined;
     try {
-      const scriptTextModel = await this.getScriptTextModel();
-      let scriptTextModelFile = LOCAL_SCRIPT_TEXT_MODEL_FILES[scriptTextModel];
       const submit = this.findStep(plan, "submit_script_casting");
       if (!completedStep(submit)) {
         activeStep = submit;
         plan = await this.setStep(input.projectId, planId, submit, "RUNNING");
-        plan = await this.setStep(
-          input.projectId,
-          planId,
-          submit,
-          "COMPLETED",
-          {
-            model: scriptTextModelFile
-          }
-        );
+        plan = await this.setStep(input.projectId, planId, submit, "COMPLETED");
       }
       this.throwIfCancelled(control);
       const poll = this.findStep(plan, "poll_script_casting");
@@ -3171,20 +3197,36 @@ export class LocalScriptProjectService {
         activeStep = poll;
         plan = await this.setStep(input.projectId, planId, poll, "RUNNING");
         const options = resolveCastOptions(input);
-        const cloud = await this.runCloudTextModel(
-          "casting",
-          {
-            script: input.script,
-            shot_limit: options.maxShots,
-            atomic_shots: options.isAtomicShotsRequested,
-            sequence_mode: options.isRenderSequencesRequested,
-            include_dialogue: true,
-            split_alts: !!options.isCharacterDesignVersionsRequested,
-            separate_style: options.isSeparateStyleRequested ?? true,
-            separate_camera: !!options.isSeparateCameraRequested
-          },
-          () => control.cancelled
-        );
+        const generateExternal = await this.getExternalTextGenerator?.();
+        this.throwIfCancelled(control);
+        const cloud = generateExternal
+          ? null
+          : await this.runCloudTextModel(
+              "casting",
+              {
+                script: input.script,
+                shot_limit: options.maxShots,
+                atomic_shots: options.isAtomicShotsRequested,
+                sequence_mode: options.isRenderSequencesRequested,
+                include_dialogue: true,
+                split_alts: !!options.isCharacterDesignVersionsRequested,
+                separate_style: options.isSeparateStyleRequested ?? true,
+                separate_camera: !!options.isSeparateCameraRequested
+              },
+              () => control.cancelled
+            );
+        const textModelRoute = generateExternal
+          ? "external"
+          : cloud
+            ? "cloud"
+            : "local";
+        const scriptTextModel =
+          generateExternal || cloud
+            ? undefined
+            : await this.getScriptTextModel();
+        let scriptTextModelFile = scriptTextModel
+          ? LOCAL_SCRIPT_TEXT_MODEL_FILES[scriptTextModel]
+          : "";
         if (cloud) scriptTextModelFile = textValue(cloud.model, "cloud");
         casting = cloud
           ? record(cloud.casting)
@@ -3192,6 +3234,17 @@ export class LocalScriptProjectService {
               input.script,
               createQwenStructuredCall(async (prompt) => {
                 this.throwIfCancelled(control);
+                if (generateExternal) {
+                  const result = await generateExternal({
+                    systemPrompt: "Return one valid JSON object only.",
+                    userPrompt: prompt,
+                    maxTokens: 16_000,
+                    temperature: 0.1,
+                    signal: control.abortController.signal
+                  });
+                  scriptTextModelFile = result.model;
+                  return result.text;
+                }
                 return new ComfyScriptProjectClient(
                   await this.getComfyEndpoint(),
                   scriptTextModel
@@ -3217,14 +3270,14 @@ export class LocalScriptProjectService {
           "COMPLETED",
           {
             model: scriptTextModelFile,
-            text_model_route: cloud ? "cloud" : "local"
+            text_model_route: textModelRoute
           }
         );
         plan = await this.setStep(input.projectId, planId, poll, "COMPLETED", {
           casting,
           version,
           model: scriptTextModelFile,
-          text_model_route: cloud ? "cloud" : "local"
+          text_model_route: textModelRoute
         });
       }
       const materialise = this.findStep(plan, "materialise_project_state");
@@ -3873,7 +3926,12 @@ export class LocalScriptProjectService {
     planId: string,
     task: (control: RunControl) => Promise<void>
   ): void {
-    const control: RunControl = { planId, projectId, cancelled: false };
+    const control: RunControl = {
+      planId,
+      projectId,
+      cancelled: false,
+      abortController: new AbortController()
+    };
     const promise = task(control).finally(() => {
       if (this.projectRuns.get(projectId)?.control === control) {
         this.projectRuns.delete(projectId);

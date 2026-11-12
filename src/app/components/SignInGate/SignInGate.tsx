@@ -1,26 +1,12 @@
 /* oxlint-disable custom-react/no-use-effect -- Clerk owns the sign-in result, so persisting the chosen mode is external sync */
-import {
-  consumeLocalSetupWizardRequest,
-  requestLocalSetupWizardOnNextLaunch
-} from "@app/components/LocalSetupWizard/localSetupWizardHandoff";
 import { Text } from "@components/Text";
 import { readAppMode, SignIn, SignUp, useAuth } from "@platform/identity";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { Link as AriaLink } from "react-aria-components/Link";
+import { Button } from "react-aria-components/Button";
 import { useTranslation } from "react-i18next";
 
-/**
- * First screen of a fresh install: Clerk's own sign-in, with skipping offered
- * underneath it.
- *
- * Shown only when the stored mode is "unchosen". Skipping is a first-class
- * outcome, not a dead end: it persists offline mode straight away and asks for
- * the local setup wizard, so the window rebuilds into a working app with the
- * wizard over it rather than into the wizard alone. Neither outcome is
- * permanent; the mode can be changed later from settings.
- */
-
+/** First-launch choice between Mago sign-in and the local editor. */
 export const SignInGate = () => {
   const { t } = useTranslation();
   const pathname = usePathname();
@@ -38,15 +24,13 @@ export const SignInGate = () => {
     });
   }, [isSignedIn]);
 
-  const skipToLocalSetup = () => {
+  const openLocalEditor = () => {
     if (hasRequestedModeRef.current) return;
     hasRequestedModeRef.current = true;
     setIsEnteringOfflineApp(true);
-    requestLocalSetupWizardOnNextLaunch();
     void window.mago?.account?.chooseMode("offline").catch(() => {
       hasRequestedModeRef.current = false;
       setIsEnteringOfflineApp(false);
-      consumeLocalSetupWizardRequest();
     });
   };
 
@@ -62,10 +46,10 @@ export const SignInGate = () => {
         )}
       </div>
 
-      <AriaLink
+      <Button
         className="cursor-pointer data-[disabled]:cursor-default"
         isDisabled={isEnteringOfflineApp}
-        onPress={skipToLocalSetup}
+        onPress={openLocalEditor}
       >
         <Text
           component="span"
@@ -73,9 +57,11 @@ export const SignInGate = () => {
           color="glyph-secondary"
           decoration="underline"
         >
-          {t("signInGate.skip", { defaultValue: "Skip" })}
+          {t("signInGate.openLocalEditor", {
+            defaultValue: "Open local editor"
+          })}
         </Text>
-      </AriaLink>
+      </Button>
     </div>
   );
 };

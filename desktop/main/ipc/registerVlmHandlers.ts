@@ -101,11 +101,16 @@ const adaptI2vPromptInput = (value: unknown): LocalAdaptI2vPromptInput => {
 
 export const registerVlmHandlers = (
   service: VlmService,
-  i2vPromptAdapter: LocalI2vPromptAdapter
+  i2vPromptAdapter: LocalI2vPromptAdapter,
+  hasExternalText: () => Promise<boolean>
 ): void => {
   ipcMain.handle(IPC_CHANNELS.vlmStatus, async (event) => {
     requireTrustedSender(event);
     return service.status();
+  });
+  ipcMain.handle(IPC_CHANNELS.vlmHasExternalText, async (event) => {
+    requireTrustedSender(event);
+    return hasExternalText();
   });
   ipcMain.handle(IPC_CHANNELS.vlmCaptionAsset, async (event, assetId) => {
     requireTrustedSender(event);

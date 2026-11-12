@@ -3,40 +3,42 @@ import { useQuery } from "@tanstack/react-query";
 import { isCloudAccountActive } from "@/platform/cloudAccount";
 import { queryKeys } from "@/queryKeys";
 
-import { resolveTextModelRoute } from "../../../desktop/shared/textModelRoute";
+import {
+  resolveTextModelRoute,
+  type TextModelRoute
+} from "../../../desktop/shared/textModelRoute";
 
-export type TextModelRoute = "local" | "cloud";
+export type { TextModelRoute } from "../../../desktop/shared/textModelRoute";
 
-/**
- * Where the prompt-rewrite buttons run their LLM call: the text-model setting,
- * resolved against whether a Mago cloud account is signed in.
- *
- * `isRoutePending` holds until the setting has been read: guessing a route in
- * the meantime would send a user who chose local to Mago cloud (or the
- * reverse), so callers keep the button disabled instead. If the read fails,
- * the setting's default ("cloud") applies, as it does in the main process.
- *
- * `routeLabel` is shown on the button so the route is visible while the local
- * and cloud paths are being compared.
- */
 export const useTextModelRoute = (): {
   route: TextModelRoute;
   routeLabel?: string;
   isRoutePending: boolean;
 } => {
-  // Without the bridge (Storybook, unit tests) there is no setting to wait for;
-  // a disabled query would otherwise report pending forever.
   const hasBridge = typeof window !== "undefined" && !!window.mago;
-  const { data, isPending } = useQuery({
+  const external = useQuery({
+    queryKey: queryKeys.externalProviders.configuredText,
+    queryFn: () => window.mago.vlm.hasExternalText(),
+    enabled: hasBridge,
+    retry: false
+  });
+  const settings = useQuery({
     queryKey: queryKeys.comfySettings.all,
     queryFn: () => window.mago.comfy.get(),
-    enabled: hasBridge,
+    enabled: hasBridge && external.data === false,
     staleTime: Infinity
   });
   const route = resolveTextModelRoute({
-    provider: data?.textModelProvider ?? "cloud",
-    isCloudAccountActive: isCloudAccountActive()
+    provider: settings.data?.textModelProvider ?? "cloud",
+    isCloudAccountActive: isCloudAccountActive(),
+    hasExternalText: external.data
   });
-  if (hasBridge && isPending) return { route, isRoutePending: true };
+  if (
+    hasBridge &&
+    (external.isPending || (external.data === false && settings.isPending))
+  )
+    return { route, isRoutePending: true };
+  if (hasBridge && external.isError)
+    return { route, routeLabel: "(unavailable)", isRoutePending: false };
   return { route, routeLabel: `(${route})`, isRoutePending: false };
 };

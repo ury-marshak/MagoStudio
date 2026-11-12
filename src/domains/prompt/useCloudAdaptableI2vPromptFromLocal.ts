@@ -1,6 +1,8 @@
 import { useCloudSyncProgressToast } from "@domains/cloud/useCloudSyncProgressToast";
 import { VideoEngine } from "@models/video/types";
 
+import { getLocalDesktopApi } from "@/platform/localDesktop";
+
 import { markCloudAssetLinkStale } from "./api/markCloudAssetLinkStale";
 import { useMirrorAdaptPromptReferencesToCloud } from "./data/useMirrorAdaptPromptReferencesToCloud";
 import { usePostAdaptI2vPrompt } from "./data/usePostAdaptI2vPrompt";
@@ -50,6 +52,8 @@ export const useCloudAdaptableI2vPromptFromLocal = ({
       };
 
       try {
+        if (await getLocalDesktopApi().vlm.hasExternalText())
+          throw new Error("External text configuration changed");
         let sourceVideoContext = sourceVideoTrackId
           ? await resolveSourceVideoContext({
               sourceVideoTrackId,

@@ -47,7 +47,7 @@ export const PromptWithAdaptI2vButton: React.FC<
     onChange: props.setValue,
     referenceAssetIds: localReferenceAssetIds,
     engine,
-    route: "local"
+    route: route === "external" ? "external" : "local"
   });
 
   const cloudSourceVideoTrackId = isVideoReferenceEnabled
@@ -61,9 +61,9 @@ export const PromptWithAdaptI2vButton: React.FC<
     cloudEngine: engine
   });
 
-  const active = route === "local" ? local : cloud;
+  const active = route === "cloud" ? cloud : local;
   const hasAnyReference =
-    route === "local"
+    route !== "cloud"
       ? localReferenceAssetIds.length > 0
       : !!cloudSourceVideoTrackId || referenceImageAssetIds.length > 0;
 

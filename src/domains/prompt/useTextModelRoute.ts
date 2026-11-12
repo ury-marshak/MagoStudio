@@ -1,4 +1,6 @@
-export type TextModelRoute = "local" | "cloud";
+import type { TextModelRoute } from "../../../desktop/shared/textModelRoute";
+
+export type { TextModelRoute } from "../../../desktop/shared/textModelRoute";
 
 /**
  * Where the prompt-rewrite buttons run their LLM call. The cloud build has no

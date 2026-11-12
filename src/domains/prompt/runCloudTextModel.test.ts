@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(),
   settings: vi.fn(),
+  hasExternalText: vi.fn(),
   active: vi.fn(),
   preferences: vi.fn()
 }));
@@ -13,7 +14,10 @@ vi.mock("@/lib/backend-api-client", () => ({
   backendApiClient: { get: mocks.get, post: mocks.post }
 }));
 vi.mock("@/platform/localDesktop", () => ({
-  getLocalDesktopApi: () => ({ comfy: { get: mocks.settings } })
+  getLocalDesktopApi: () => ({
+    comfy: { get: mocks.settings },
+    vlm: { hasExternalText: mocks.hasExternalText }
+  })
 }));
 vi.mock("@/platform/cloudAccount", () => ({
   isCloudAccountActive: mocks.active
@@ -35,6 +39,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocks.settings.mockResolvedValue({ textModelProvider: "cloud" });
   mocks.active.mockReturnValue(true);
+  mocks.hasExternalText.mockResolvedValue(false);
   mocks.preferences.mockReturnValue({ "mago-cloud": true });
 });
 afterEach(() => vi.useRealTimers());
@@ -51,6 +56,13 @@ describe("desktop cloud text routing", () => {
       expect(mocks.get).not.toHaveBeenCalled();
     }
   );
+
+  it("blocks a stale cloud dispatch after external text is configured", async () => {
+    mocks.hasExternalText.mockResolvedValue(true);
+    await expect(run()).rejects.toThrow("External text configuration changed");
+    expect(mocks.settings).not.toHaveBeenCalled();
+    expect(mocks.post).not.toHaveBeenCalled();
+  });
 
   it("ignores retired provider switches and polls casting through completion", async () => {
     mocks.preferences.mockReturnValue({ "mago-cloud": false });

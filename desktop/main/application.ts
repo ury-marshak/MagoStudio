@@ -6,7 +6,7 @@ import {
   inWindowNavigationHosts,
   resolveCloudConfig
 } from "../shared/cloudConfig";
-import { IPC_CHANNELS } from "../shared/contracts";
+import { IPC_CHANNELS, type MagoAppMode } from "../shared/contracts";
 
 import { CloudLinkRepository } from "./cloud/cloudLinkRepository";
 import { CloudRenderJobRepository } from "./cloud/cloudRenderJobRepository";
@@ -28,6 +28,7 @@ import { registerAccountHandlers } from "./ipc/registerAccountHandlers";
 import { registerCloudHandlers } from "./ipc/registerCloudHandlers";
 import { registerCloudStorageHandlers } from "./ipc/registerCloudStorageHandlers";
 import { registerComfyHandlers } from "./ipc/registerComfyHandlers";
+import { registerExternalProviderHandlers } from "./ipc/registerExternalProviderHandlers";
 import { registerImageRenderHandlers } from "./ipc/registerImageRenderHandlers";
 import { registerLibraryHandlers } from "./ipc/registerLibraryHandlers";
 import { registerLocalSetupHandlers } from "./ipc/registerLocalSetupHandlers";
@@ -40,6 +41,17 @@ import { runBackgroundTask } from "./libraryHealth";
 import { LibrarySettings } from "./librarySettings";
 import { VideoFrameService } from "./media/videoFrameService";
 import { openStartupLibrary } from "./openStartupLibrary";
+import {
+  createExternalProviderSettings,
+  readExternalProviderKey,
+  resolveProviderStartupMode,
+  type ExternalModelCapability
+} from "./providers/externalProviderSettings";
+import { ExternalRenderJobRepository } from "./providers/externalRenderJobRepository";
+import {
+  generateOpenAiCompatible,
+  probeOpenAiCompatible
+} from "./providers/openAiCompatible";
 import { installOfflineRenderer } from "./renderer/offlineRenderer";
 import {
   ensureRendererCertificate,
@@ -65,6 +77,7 @@ import {
   probeComfyVision
 } from "./vlm/comfyVisionProvider";
 import { LocalI2vPromptAdapter } from "./vlm/localI2vPromptAdapter";
+import type { VisionGenerator } from "./vlm/visionGenerator";
 import { VlmService } from "./vlm/vlmService";
 
 const databaseManager = new DatabaseManager();
@@ -80,11 +93,76 @@ const scriptProjectSnapshotRepository = new ScriptProjectSnapshotRepository(
   databaseManager,
   () => librarySettings.getLibraryRoot()
 );
+const externalProviders = createExternalProviderSettings(() =>
+  app.getPath("userData")
+);
+const getExternalGenerator = async (capability: ExternalModelCapability) => {
+  const config = await externalProviders.get(capability);
+  return config
+    ? generateOpenAiCompatible(
+        config,
+        await readExternalProviderKey(config.keychainAccount)
+      )
+    : null;
+};
+const comfyVision = generateComfyVision(librarySettings);
+const generateVision: VisionGenerator = async (request) => {
+  const generate = (await getExternalGenerator("vision")) ?? comfyVision;
+  return generate(request);
+};
+const generateEnhancement: VisionGenerator = async (request) => {
+  const generate = (await getExternalGenerator("text")) ?? comfyVision;
+  return generate(request);
+};
 const vlmService = new VlmService(
   projectRepository,
-  generateComfyVision(librarySettings),
-  () => probeComfyVision(librarySettings)
+  generateVision,
+  async () => {
+    try {
+      const config = await externalProviders.get("vision");
+      if (!config) return probeComfyVision(librarySettings);
+      await probeOpenAiCompatible(
+        config,
+        await readExternalProviderKey(config.keychainAccount),
+        "vision"
+      );
+      return {
+        backend: "external",
+        ready: true,
+        missingModels: [],
+        message: null
+      };
+    } catch (error) {
+      return {
+        backend: "external",
+        ready: false,
+        missingModels: [],
+        message:
+          error instanceof Error
+            ? error.message
+            : "External vision provider is unavailable"
+      };
+    }
+  },
+  generateEnhancement
 );
+const getComfyScriptClient = async () =>
+  new ComfyScriptProjectClient(
+    await librarySettings.getComfyEndpoint(),
+    await librarySettings.getScriptTextModel()
+  );
+const PROMPT_ADAPTATION_MAX_TOKENS = 4600;
+const SCRIPT_CHAT_MAX_TOKENS = 16_000;
+const runExternalScriptText = async (prompt: string, maxTokens: number) => {
+  const generate = await getExternalGenerator("text");
+  return generate?.({
+    systemPrompt:
+      "Return only valid JSON. The final answer's first character must be { and its last must be }.",
+    userPrompt: prompt,
+    maxTokens,
+    temperature: 0.1
+  });
+};
 // Every image that lands in the library gets a description, the way
 // The backend describes every upload and render.
 const describeImageLater = (assetId: string) =>
@@ -94,11 +172,15 @@ const i2vPromptAdapter = new LocalI2vPromptAdapter({
   describeImage: (assetId) => vlmService.describeImageAsset(assetId),
   captionVideo: async (assetId) =>
     (await vlmService.captionAsset(assetId)).prompt,
-  runTextPrompt: async (prompt) =>
-    new ComfyScriptProjectClient(
-      await librarySettings.getComfyEndpoint(),
-      await librarySettings.getScriptTextModel()
-    ).runPromptAdaptation(prompt)
+  runTextPrompt: async (prompt) => {
+    const external = await runExternalScriptText(
+      prompt,
+      PROMPT_ADAPTATION_MAX_TOKENS
+    );
+    return external
+      ? external.text
+      : (await getComfyScriptClient()).runPromptAdaptation(prompt);
+  }
 });
 const textModelBridge = new TextModelBridge();
 const localScriptProjectService = new LocalScriptProjectService(
@@ -108,18 +190,21 @@ const localScriptProjectService = new LocalScriptProjectService(
   () => librarySettings.getScriptTextModel(),
   (sourcePath, kind) => vlmService.describeEntityImage(sourcePath, kind),
   textModelBridge.run,
-  (input) => vlmService.evaluateShotVideo(input)
+  (input) => vlmService.evaluateShotVideo(input),
+  () => getExternalGenerator("text")
 );
 const localScriptChatService = new LocalScriptChatService(
   new ScriptChatMessageRepository(databaseManager),
   (projectId) => localScriptProjectService.assertLocalProject(projectId),
   async (prompt) => {
+    const external = await runExternalScriptText(
+      prompt,
+      SCRIPT_CHAT_MAX_TOKENS
+    );
+    if (external) return { content: external.text, model: external.model };
     const cloud = await textModelBridge.run("chat", { prompt });
     if (cloud) return { content: String(cloud.content), model: "cloud" };
-    return new ComfyScriptProjectClient(
-      await librarySettings.getComfyEndpoint(),
-      await librarySettings.getScriptTextModel()
-    ).runScriptChat(prompt);
+    return (await getComfyScriptClient()).runScriptChat(prompt);
   }
 );
 const cloudLinkRepository = new CloudLinkRepository(databaseManager);
@@ -205,9 +290,10 @@ app.on("second-instance", () => {
   deepLinkTarget.focus();
 });
 
-const createWindowOnce = async (): Promise<BrowserWindow> => {
-  logStartup("Waiting for renderer origin and settings");
-  const appMode = (await librarySettings.getAppMode()) ?? "unchosen";
+const createWindowOnce = async (
+  appMode: MagoAppMode
+): Promise<BrowserWindow> => {
+  logStartup("Waiting for renderer origin");
   const useOfflineRenderer = usesPackagedRenderer && appMode === "offline";
   if (useOfflineRenderer && !offlineRendererInstalled) {
     installOfflineRenderer(
@@ -334,30 +420,31 @@ const createWindowOnce = async (): Promise<BrowserWindow> => {
 const createWindow = async (): Promise<BrowserWindow> => {
   windowsBeingCreated += 1;
   try {
-    return await createWindowOnce();
-  } catch (error) {
-    if (
-      !usesPackagedRenderer ||
-      (await librarySettings.getAppMode()) === "offline"
-    ) {
-      throw error;
+    const appMode = await resolveProviderStartupMode(
+      await librarySettings.getAppMode(),
+      externalProviders
+    );
+    try {
+      return await createWindowOnce(appMode);
+    } catch (error) {
+      if (!usesPackagedRenderer || appMode === "offline") throw error;
+      logStartup(`Cloud renderer startup failed: ${String(error)}`);
+      pauseStartupTimeout();
+      const { response } = await dialog.showMessageBox({
+        type: "warning",
+        title: "Mago Studio could not open cloud sign-in",
+        message: "You can continue working offline.",
+        detail:
+          "Cloud sign-in could not start. Your local library is available in offline mode. You can try signing in again later.",
+        buttons: ["Work offline", "Show error"],
+        defaultId: 0,
+        cancelId: 1
+      });
+      if (response !== 0) throw error;
+      await librarySettings.setAppMode("offline");
+      resumeStartupTimeout();
+      return await createWindowOnce("offline");
     }
-    logStartup(`Cloud renderer startup failed: ${String(error)}`);
-    pauseStartupTimeout();
-    const { response } = await dialog.showMessageBox({
-      type: "warning",
-      title: "Mago Studio could not open cloud sign-in",
-      message: "You can continue working offline.",
-      detail:
-        "Cloud sign-in could not start. Your local library is available in offline mode. You can try signing in again later.",
-      buttons: ["Work offline", "Show error"],
-      defaultId: 0,
-      cancelId: 1
-    });
-    if (response !== 0) throw error;
-    await librarySettings.setAppMode("offline");
-    resumeStartupTimeout();
-    return await createWindowOnce();
   } finally {
     windowsBeingCreated -= 1;
   }
@@ -369,6 +456,7 @@ void app
     logStartup("Electron ready; registering services");
     registerMediaProtocol(projectRepository, scriptProjectSnapshotRepository);
     registerComfyHandlers(librarySettings);
+    registerExternalProviderHandlers(externalProviders);
     textModelBridge.register();
     registerCloudHandlers({
       links: cloudLinkRepository,
@@ -382,7 +470,11 @@ void app
     registerImageRenderHandlers(imageRenderService, cloudRenderJobRepository);
     registerMediaHandlers(videoFrameService);
     registerCloudStorageHandlers();
-    registerVlmHandlers(vlmService, i2vPromptAdapter);
+    registerVlmHandlers(
+      vlmService,
+      i2vPromptAdapter,
+      async () => !!(await externalProviders.get("text"))
+    );
 
     registerLocalSetupHandlers({ settings: librarySettings });
 
@@ -420,6 +512,9 @@ void app
       app.quit();
       return;
     }
+    await runBackgroundTask("Interrupted external render submission recovery", () =>
+      new ExternalRenderJobRepository(databaseManager).markInterruptedSubmissions()
+    );
     await createWindow();
     void runBackgroundTask("Interrupted render recovery", async () => {
       await imageRenderService.reconcileInterruptedRenders();

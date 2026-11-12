@@ -1416,7 +1416,8 @@ export interface ComposedVideoPrompt {
 /** Run the model over the prepared context. */
 export const renderVideoPrompt = async (
   context: PreparedVideoPrompt,
-  callModel: VideoPromptModelCall
+  callModel: VideoPromptModelCall,
+  allowFallback = true
 ): Promise<ComposedVideoPrompt> => {
   const { labels, taskTypes, retention, skeleton, turns, references } = context;
   const warnings = [...context.warnings];
@@ -1430,7 +1431,8 @@ export const renderVideoPrompt = async (
       generated = normalizeSections(
         toSections(await callModel(modelContents(context, hardFailures)))
       );
-    } catch {
+    } catch (error) {
+      if (!allowFallback) throw error;
       warnings.push(
         "prompt generation failed; returning the deterministic skeleton"
       );
@@ -1451,6 +1453,10 @@ export const renderVideoPrompt = async (
       break;
     }
   }
+  if (fallback && !allowFallback)
+    throw new Error(
+      `Generated video prompt failed validation: ${hardFailures?.join("; ")}`
+    );
   if (attempt === 2)
     warnings.push(
       "generated prompt failed validation twice; returning the deterministic skeleton"
@@ -1520,10 +1526,12 @@ export const generateVideoPrompt = async (
   callModel: VideoPromptModelCall,
   options: {
     engineVersion?: string;
+    allowFallback?: boolean;
     storedCaption?: (assetId: string) => string | null | undefined;
   } = {}
 ): Promise<ComposedVideoPrompt> =>
   renderVideoPrompt(
     prepareVideoPrompt(payload, options.engineVersion, options.storedCaption),
-    callModel
+    callModel,
+    options.allowFallback
   );

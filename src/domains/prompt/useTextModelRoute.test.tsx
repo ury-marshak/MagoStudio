@@ -17,10 +17,14 @@ const wrapper = ({ children }: { children: ReactNode }) => (
   </QueryClientProvider>
 );
 
-const installBridge = (settings: Promise<ComfySettings>) => {
+const installBridge = (settings: Promise<ComfySettings>, external = false) => {
   Object.defineProperty(window, "mago", {
     configurable: true,
-    value: { account: { mode: "cloud" }, comfy: { get: () => settings } }
+    value: {
+      account: { mode: "cloud" },
+      comfy: { get: () => settings },
+      vlm: { hasExternalText: async () => external }
+    }
   });
 };
 
@@ -51,6 +55,18 @@ describe("useTextModelRoute (desktop)", () => {
     await waitFor(() => expect(result.current.isRoutePending).toBe(false));
     expect(result.current.route).toBe("local");
     expect(result.current.routeLabel).toBe("(local)");
+  });
+
+  it("labels the external route without waiting for Comfy settings", async () => {
+    installBridge(new Promise(() => {}), true);
+    const { result } = renderHook(() => useTextModelRoute(), { wrapper });
+    await waitFor(() =>
+      expect(result.current).toEqual({
+        route: "external",
+        routeLabel: "(external)",
+        isRoutePending: false
+      })
+    );
   });
 
   it("does not wait forever when there is no desktop bridge", () => {

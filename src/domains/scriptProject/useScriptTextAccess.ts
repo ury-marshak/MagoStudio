@@ -1,3 +1,4 @@
+import { useToast } from "@store/useToast";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -6,7 +7,8 @@ import { isCloudAccountActive } from "@/platform/cloudAccount";
 import { queryKeys } from "@/queryKeys";
 
 /** An action-time check, scoped to the Script tab rather than global routing. */
-export const useScriptTextAccess = () => {
+export const useScriptTextAccess = (isLocalProject = false) => {
+  const { showErrorToast } = useToast();
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [isOpen, setIsOpen] = useState(false);
@@ -27,6 +29,19 @@ export const useScriptTextAccess = () => {
     checking.current = true;
     setIsChecking(true);
     try {
+      if (isLocalProject) {
+        try {
+          if (await window.mago.vlm.hasExternalText()) return true;
+        } catch (error) {
+          showErrorToast({
+            message:
+              error instanceof Error
+                ? error.message
+                : "Could not read external text settings"
+          });
+          return false;
+        }
+      }
       const settings = await window.mago.comfy.get();
       if (isCloudAccountActive() && settings.textModelProvider !== "local")
         return true;

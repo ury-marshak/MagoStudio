@@ -11,6 +11,7 @@ const pending = vi.hoisted(() => ({
 }));
 
 const cloud = vi.hoisted(() => ({
+  hasExternalText: vi.fn(),
   resolveSourceVideoContext: vi.fn(),
   mirrorReferences: vi.fn(),
   adaptOnCloud: vi.fn(),
@@ -18,6 +19,12 @@ const cloud = vi.hoisted(() => ({
   rewritePrompt: undefined as
     | undefined
     | ((prompt: string | undefined) => Promise<unknown>)
+}));
+
+vi.mock("@/platform/localDesktop", () => ({
+  getLocalDesktopApi: () => ({
+    vlm: { hasExternalText: cloud.hasExternalText }
+  })
 }));
 
 vi.mock("./api/markCloudAssetLinkStale", () => ({
@@ -82,6 +89,18 @@ describe("useCloudAdaptableI2vPromptFromLocal", () => {
     pending.mirroringReferences = false;
     pending.adaptingOnCloud = false;
     vi.clearAllMocks();
+    cloud.hasExternalText.mockResolvedValue(false);
+  });
+
+  it("blocks cloud reference mirroring when external text is configured", async () => {
+    cloud.hasExternalText.mockResolvedValue(true);
+    renderSubject();
+    await expect(cloud.rewritePrompt!("a prompt")).rejects.toThrow(
+      "External text configuration changed"
+    );
+    expect(cloud.resolveSourceVideoContext).not.toHaveBeenCalled();
+    expect(cloud.mirrorReferences).not.toHaveBeenCalled();
+    expect(cloud.adaptOnCloud).not.toHaveBeenCalled();
   });
 
   it.each([

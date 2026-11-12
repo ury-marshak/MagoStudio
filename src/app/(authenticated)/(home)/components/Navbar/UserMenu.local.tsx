@@ -22,6 +22,7 @@ import {
 import { queryKeys } from "@/queryKeys";
 
 import type {
+  ComfySettings,
   ComfyStatus,
   LibraryInfo,
   LocalScriptTextModel,
@@ -34,6 +35,7 @@ import { LocalSettingsAccountTab } from "./LocalSettings/LocalSettingsAccountTab
 import { LocalSettingsAttentionDot } from "./LocalSettings/LocalSettingsAttentionDot";
 import { LocalSettingsGeneralTab } from "./LocalSettings/LocalSettingsGeneralTab";
 import { LocalSettingsModelsTab } from "./LocalSettings/LocalSettingsModelsTab";
+import { LocalSettingsProvidersTab } from "./LocalSettings/LocalSettingsProvidersTab";
 import {
   LOCAL_SETTINGS_TAB_IDS,
   LocalSettingsTabId
@@ -72,10 +74,15 @@ export function UserMenu() {
   );
   const [textModelProvider, setTextModelProvider] =
     useState<LocalTextModelProvider>(DEFAULT_TEXT_MODEL_PROVIDER);
-  const [comfyStatus, setComfyStatus] = useState<ComfyStatus | null>(null);
+  const [checkedEndpoint, setCheckedEndpoint] = useState<ComfyStatus | null>(
+    null
+  );
+  const isModelsTabSelected =
+    selectedSettingsTabId === LOCAL_SETTINGS_TAB_IDS.models;
   const comfyLaunchStatus = useComfyLaunchStatus({
-    isComfyLaunchStatusNeeded: open
+    isComfyLaunchStatusNeeded: open && isModelsTabSelected
   });
+  const comfyStatus = checkedEndpoint ?? comfyLaunchStatus.data;
   const isSavedComfyEndpointUnavailable =
     comfyLaunchStatus.data?.available === false;
 
@@ -88,7 +95,7 @@ export function UserMenu() {
   const [isSignInPending, setIsSignInPending] = useState(false);
 
   const endpointCheckId = useRef(0);
-  const settingsLoaded = useRef(false);
+  const savedComfySettings = useRef<ComfySettings | null>(null);
   const [checkingEndpoint, setCheckingEndpoint] = useState(false);
   const validateEndpoint = async () => {
     const id = ++endpointCheckId.current;
@@ -97,11 +104,11 @@ export function UserMenu() {
       const result = await window.mago.comfy.check(comfyEndpoint);
       if (id === endpointCheckId.current) {
         setComfyEndpoint(result.endpoint);
-        setComfyStatus(result);
+        setCheckedEndpoint(result);
       }
     } catch (error) {
       if (id === endpointCheckId.current)
-        setComfyStatus({
+        setCheckedEndpoint({
           endpoint: comfyEndpoint,
           vlmBackend,
           scriptTextModel,
@@ -132,7 +139,11 @@ export function UserMenu() {
         scriptTextModel,
         vlmBackend
       }),
-    enabled: open && comfyStatus?.available === true && savedEndpointMatches,
+    enabled:
+      open &&
+      isModelsTabSelected &&
+      comfyStatus?.available === true &&
+      savedEndpointMatches,
     retry: false,
     staleTime: 0
   });
@@ -177,31 +188,28 @@ export function UserMenu() {
     : scriptHint;
   const isLocalTextModelMissingFromRespondingComfy =
     !usesCloudText && connectionReady === true && Boolean(missingText);
-  const isModelsTabSelected =
-    selectedSettingsTabId === LOCAL_SETTINGS_TAB_IDS.models;
   const showsModelsTabAttention =
     !isModelsTabSelected && isLocalTextModelMissingFromRespondingComfy;
 
   const openSettings = useCallback(async () => {
-    settingsLoaded.current = false;
+    savedComfySettings.current = null;
     setOpen(true);
     setSettingsLoadError(null);
     setSignInError(null);
     setLibraryError(null);
     setSettingsSaveError(null);
-    setComfyStatus(null);
+    setCheckedEndpoint(null);
     try {
       const [selectedLibrary, comfy] = await Promise.all([
         window.mago.library.get(),
-        window.mago.comfy.check()
+        window.mago.comfy.get()
       ]);
       setLibrary(selectedLibrary);
-      setComfyStatus(comfy);
       setComfyEndpoint(comfy.endpoint);
       setVlmBackend(comfy.vlmBackend);
       setScriptTextModel(comfy.scriptTextModel);
       setTextModelProvider(comfy.textModelProvider);
-      settingsLoaded.current = true;
+      savedComfySettings.current = comfy;
     } catch (caught) {
       setSettingsLoadError(
         caught instanceof Error
@@ -257,7 +265,14 @@ export function UserMenu() {
 
   const saveComfyEndpoint = useCallback(async (): Promise<boolean> => {
     if (isComfyActionPending) return false;
-    if (!settingsLoaded.current) {
+    const saved = savedComfySettings.current;
+    if (
+      !saved ||
+      (saved.endpoint === comfyEndpoint &&
+        saved.vlmBackend === vlmBackend &&
+        saved.scriptTextModel === scriptTextModel &&
+        saved.textModelProvider === textModelProvider)
+    ) {
       setOpen(false);
       return true;
     }
@@ -275,7 +290,8 @@ export function UserMenu() {
       setVlmBackend(status.vlmBackend);
       setScriptTextModel(status.scriptTextModel);
       setTextModelProvider(status.textModelProvider);
-      setComfyStatus(status);
+      setCheckedEndpoint(status);
+      savedComfySettings.current = status;
       setOpen(false);
       // Optimize prompt reads where to run from this cache (useTextModelRoute).
       queryClient.setQueryData(queryKeys.comfySettings.all, {
@@ -393,6 +409,10 @@ export function UserMenu() {
                 badge: showsModelsTabAttention && <LocalSettingsAttentionDot />
               },
               {
+                id: LOCAL_SETTINGS_TAB_IDS.providers,
+                name: t("localSettings.tabs.providers")
+              },
+              {
                 id: LOCAL_SETTINGS_TAB_IDS.general,
                 name: t("localSettings.tabs.general")
               }
@@ -446,6 +466,12 @@ export function UserMenu() {
               textModelReady={providerReady}
               textModelHint={providerHint}
             />
+          </TabPanel>
+          <TabPanel
+            id={LOCAL_SETTINGS_TAB_IDS.providers}
+            className={LOCAL_SETTINGS_TAB_PANEL_CLASS_NAME}
+          >
+            <LocalSettingsProvidersTab />
           </TabPanel>
           <TabPanel
             id={LOCAL_SETTINGS_TAB_IDS.general}
