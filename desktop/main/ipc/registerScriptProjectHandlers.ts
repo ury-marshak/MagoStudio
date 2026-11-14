@@ -1,4 +1,4 @@
-import { ipcMain } from "electron";
+import { ipcMain, type IpcMainInvokeEvent } from "electron";
 
 import {
   IPC_CHANNELS,
@@ -6,7 +6,6 @@ import {
   type LocalScriptProjectSnapshotInput
 } from "../../shared/contracts";
 import { DatabaseManager } from "../database/databaseManager";
-import { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import { LibrarySettings } from "../librarySettings";
 import { LocalScriptChatService } from "../scriptProjects/localScriptChatService";
 import { LocalScriptProjectService } from "../scriptProjects/localScriptProjectService";
@@ -64,120 +63,116 @@ const chatMessageInput = (value: unknown): LocalScriptChatMessageInput => {
 };
 
 export const registerScriptProjectHandlers = ({
-  repository,
   service,
   chat,
   databaseManager,
   settings
 }: {
-  repository: ScriptProjectSnapshotRepository;
   service: LocalScriptProjectService;
   chat: LocalScriptChatService;
   databaseManager: DatabaseManager;
   settings: LibrarySettings;
 }): void => {
-  const ensureDatabase = async (): Promise<void> => {
-    if (databaseManager.isOpen()) return;
-    await databaseManager.open(await settings.getLibraryRoot());
+  // Capture library context before database setup. Every later continuation,
+  // including detached plan work, retains this session rather than the next DB.
+  const handle = (
+    channel: string,
+    handler: (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown
+  ) => {
+    ipcMain.handle(channel, async (event, ...args: unknown[]) => {
+      requireTrustedSender(event);
+      return service.inLibrary(async () => handler(event, ...args));
+    });
   };
 
-  ipcMain.handle(
+  const ensureDatabase = async (): Promise<void> => {
+    const signal = service.capturePlanSession();
+    if (databaseManager.isOpen()) {
+      signal.throwIfAborted();
+      return;
+    }
+    const root = await settings.getLibraryRoot();
+    signal.throwIfAborted();
+    await service.databaseOperation(() => databaseManager.open(root));
+    signal.throwIfAborted();
+  };
+
+  handle(
     IPC_CHANNELS.scriptProjectsCacheMedia,
     async (event, projectId: unknown, sourceUrl: unknown) => {
-      requireTrustedSender(event);
       await ensureDatabase();
-      await repository.cacheScheduledMedia(
+      await service.cacheMedia(
         requireString(projectId, "projectId"),
         requireString(sourceUrl, "sourceUrl")
       );
     }
   );
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsCancelMedia,
-    (event, projectId: unknown, sourceUrl: unknown) => {
-      requireTrustedSender(event);
-      repository.cancelScheduledMedia(
+    async (event, projectId: unknown, sourceUrl: unknown) => {
+      await service.cancelMedia(
         requireString(projectId, "projectId"),
         requireString(sourceUrl, "sourceUrl")
       );
     }
   );
-  ipcMain.handle(
-    IPC_CHANNELS.scriptProjectsPut,
-    async (event, value: unknown) => {
-      requireTrustedSender(event);
-      await ensureDatabase();
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("script project snapshot must be an object");
-      }
-      const input = value as Record<string, unknown>;
-      await repository.put({
-        projectId: requireString(input.projectId, "projectId"),
-        metadataOnly: input.metadataOnly === true,
-        project: optionalRecord(input.project, "project"),
-        state: optionalRecord(input.state, "state"),
-        scriptVersions: optionalRecord(input.scriptVersions, "scriptVersions"),
-        planDetails: optionalRecord(input.planDetails, "planDetails") as
-          | Record<string, Record<string, unknown>>
-          | undefined,
-        cut: optionalRecord(input.cut, "cut")
-      } satisfies LocalScriptProjectSnapshotInput);
+  handle(IPC_CHANNELS.scriptProjectsPut, async (event, value: unknown) => {
+    await ensureDatabase();
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("script project snapshot must be an object");
     }
-  );
+    const input = value as Record<string, unknown>;
+    await service.putSnapshot({
+      projectId: requireString(input.projectId, "projectId"),
+      metadataOnly: input.metadataOnly === true,
+      project: optionalRecord(input.project, "project"),
+      state: optionalRecord(input.state, "state"),
+      scriptVersions: optionalRecord(input.scriptVersions, "scriptVersions"),
+      planDetails: optionalRecord(input.planDetails, "planDetails") as
+        | Record<string, Record<string, unknown>>
+        | undefined,
+      cut: optionalRecord(input.cut, "cut")
+    } satisfies LocalScriptProjectSnapshotInput);
+  });
 
-  ipcMain.handle(
-    IPC_CHANNELS.scriptProjectsGet,
-    async (event, projectId: unknown) => {
-      requireTrustedSender(event);
-      await ensureDatabase();
-      return service.getSnapshot(requireString(projectId, "projectId"));
-    }
-  );
+  handle(IPC_CHANNELS.scriptProjectsGet, async (event, projectId: unknown) => {
+    await ensureDatabase();
+    return service.getSnapshot(requireString(projectId, "projectId"));
+  });
 
-  ipcMain.handle(
-    IPC_CHANNELS.scriptProjectsGetPlan,
-    async (event, planId: unknown) => {
-      requireTrustedSender(event);
-      await ensureDatabase();
-      return service.getPlan(requireString(planId, "planId"));
-    }
-  );
+  handle(IPC_CHANNELS.scriptProjectsGetPlan, async (event, planId: unknown) => {
+    await ensureDatabase();
+    return service.getPlan(requireString(planId, "planId"));
+  });
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsCancelPlan,
     async (event, planId: unknown) => {
-      requireTrustedSender(event);
       await ensureDatabase();
       return service.cancelPlan(requireString(planId, "planId"));
     }
   );
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsResumePlan,
     async (event, planId: unknown) => {
-      requireTrustedSender(event);
       await ensureDatabase();
       return service.resumePlan(requireString(planId, "planId"));
     }
   );
 
-  ipcMain.handle(
-    IPC_CHANNELS.scriptProjectsCast,
-    async (event, value: unknown) => {
-      requireTrustedSender(event);
-      await ensureDatabase();
-      if (!value || typeof value !== "object" || Array.isArray(value))
-        throw new Error("local script casting input must be an object");
-      return service.cast(
-        value as Parameters<LocalScriptProjectService["cast"]>[0]
-      );
-    }
-  );
+  handle(IPC_CHANNELS.scriptProjectsCast, async (event, value: unknown) => {
+    await ensureDatabase();
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("local script casting input must be an object");
+    return service.cast(
+      value as Parameters<LocalScriptProjectService["cast"]>[0]
+    );
+  });
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsFindMedia,
     async (event, value: unknown) => {
-      requireTrustedSender(event);
       await ensureDatabase();
       const query = optionalRecord(value, "media query");
       if (!query) throw new Error("media query must be an object");
@@ -190,10 +185,9 @@ export const registerScriptProjectHandlers = ({
     }
   );
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsGetRenderMetrics,
     async (event, assetId: unknown) => {
-      requireTrustedSender(event);
       const signal = service.captureMetricsSession();
       await ensureDatabase();
       signal.throwIfAborted();
@@ -204,10 +198,9 @@ export const registerScriptProjectHandlers = ({
     }
   );
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsChatMessage,
     async (event, value: unknown) => {
-      requireTrustedSender(event);
       const signal = chat.getSessionSignal();
       signal.throwIfAborted();
       await ensureDatabase();
@@ -216,10 +209,9 @@ export const registerScriptProjectHandlers = ({
     }
   );
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsChatMessages,
     async (event, value: unknown) => {
-      requireTrustedSender(event);
       const signal = chat.getSessionSignal();
       signal.throwIfAborted();
       await ensureDatabase();
@@ -233,10 +225,9 @@ export const registerScriptProjectHandlers = ({
     }
   );
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsCancelChat,
     async (event, value: unknown) => {
-      requireTrustedSender(event);
       const signal = chat.getSessionSignal();
       signal.throwIfAborted();
       await ensureDatabase();
@@ -252,10 +243,9 @@ export const registerScriptProjectHandlers = ({
     }
   );
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsGenerateSheets,
     async (event, value: unknown) => {
-      requireTrustedSender(event);
       await ensureDatabase();
       if (!value || typeof value !== "object" || Array.isArray(value))
         throw new Error("local sheet generation input must be an object");
@@ -265,10 +255,9 @@ export const registerScriptProjectHandlers = ({
     }
   );
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsGenerateShots,
     async (event, value: unknown) => {
-      requireTrustedSender(event);
       await ensureDatabase();
       if (!value || typeof value !== "object" || Array.isArray(value))
         throw new Error("local shot generation input must be an object");
@@ -278,10 +267,9 @@ export const registerScriptProjectHandlers = ({
     }
   );
 
-  ipcMain.handle(
+  handle(
     IPC_CHANNELS.scriptProjectsExportCut,
     async (event, value: unknown) => {
-      requireTrustedSender(event);
       await ensureDatabase();
       if (!value || typeof value !== "object" || Array.isArray(value))
         throw new Error("local cut export input must be an object");
@@ -291,19 +279,15 @@ export const registerScriptProjectHandlers = ({
     }
   );
 
-  ipcMain.handle(
-    IPC_CHANNELS.scriptProjectsUpdate,
-    async (event, value: unknown) => {
-      requireTrustedSender(event);
-      const signal = service.captureDescriptionSession();
-      await ensureDatabase();
-      signal.throwIfAborted();
-      if (!value || typeof value !== "object" || Array.isArray(value))
-        throw new Error("local script update input must be an object");
-      return service.update(
-        value as Parameters<LocalScriptProjectService["update"]>[0],
-        signal
-      );
-    }
-  );
+  handle(IPC_CHANNELS.scriptProjectsUpdate, async (event, value: unknown) => {
+    const signal = service.captureDescriptionSession();
+    await ensureDatabase();
+    signal.throwIfAborted();
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      throw new Error("local script update input must be an object");
+    return service.update(
+      value as Parameters<LocalScriptProjectService["update"]>[0],
+      signal
+    );
+  });
 };

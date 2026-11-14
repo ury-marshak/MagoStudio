@@ -89,16 +89,26 @@ const findRenderClip = (
   return null;
 };
 
-const isPlanCancelled = async (planId: string): Promise<boolean> =>
-  (await getLocalDesktopApi().scriptProjects.getPlan(planId))?.status ===
-  "CANCELLED";
+const isPlanCancelled = async (
+  planId: string,
+  executionSession: string
+): Promise<boolean> => {
+  const plan = await getLocalDesktopApi().scriptProjects.getPlan(planId);
+  return (
+    !plan ||
+    plan.local_execution_session !== executionSession ||
+    !["PENDING", "RUNNING"].includes(String(plan.status))
+  );
+};
 
 const waitForOutput = async (
   clipId: string,
-  planId: string
+  planId: string,
+  executionSession: string
 ): Promise<string> => {
   for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt += 1) {
-    if (await isPlanCancelled(planId)) throw new Error("Local plan cancelled");
+    if (await isPlanCancelled(planId, executionSession))
+      throw new Error("Local plan cancelled or library changed");
     const parsed = parseImg2ImgStatus(
       await cloudApi.get<unknown>(`/assets/img2img/status/${clipId}`)
     );
@@ -115,6 +125,7 @@ const waitForOutput = async (
 type CloudSheetTarget = {
   projectId: string;
   planId: string;
+  executionSession: string;
   cloudProjectId: string;
   cloudTimelineId: string;
   renderModel: SheetRenderModel;
@@ -147,6 +158,8 @@ const renderTarget = async (input: CloudSheetTarget): Promise<void> => {
   const desktop = getLocalDesktopApi();
   const { target } = input;
   const token = textValue(target.token);
+  if (await isPlanCancelled(input.planId, input.executionSession))
+    throw new Error("Local plan cancelled or library changed");
   const masterAssetId = await resolveMasterAssetId(
     input.projectId,
     typeof target.master_token === "string" ? target.master_token : null
@@ -157,6 +170,8 @@ const renderTarget = async (input: CloudSheetTarget): Promise<void> => {
       ? target._local_reference_asset_ids.map(String)
       : [])
   ].filter((id, index, ids) => ids.indexOf(id) === index);
+  if (await isPlanCancelled(input.planId, input.executionSession))
+    throw new Error("Local plan cancelled or library changed");
   const cloudSourceIds = await Promise.all(
     localSourceIds.map((assetId) =>
       ensureCloudImageAsset(cloudApi, assetId, input.cloudProjectId)
@@ -180,6 +195,8 @@ const renderTarget = async (input: CloudSheetTarget): Promise<void> => {
       : target._local_render_prompt,
     textValue(target._local_prompt, textValue(target.prompt, token))
   );
+  if (await isPlanCancelled(input.planId, input.executionSession))
+    throw new Error("Local plan cancelled or library changed");
   const clip =
     input.existingCloudClip ??
     findRenderClip(
@@ -219,13 +236,18 @@ const renderTarget = async (input: CloudSheetTarget): Promise<void> => {
       operation: "start-cloud-sheet-render",
       payload: {
         planId: input.planId,
+        executionSession: input.executionSession,
         token,
         cloudClipId: clip.clipId,
         cloudAssetId: clip.assetId
       }
     })
   );
-  const outputUrl = await waitForOutput(clip.clipId, input.planId);
+  const outputUrl = await waitForOutput(
+    clip.clipId,
+    input.planId,
+    input.executionSession
+  );
   const plannedSpec =
     target._local_spec && typeof target._local_spec === "object"
       ? (target._local_spec as JsonRecord)
@@ -236,6 +258,7 @@ const renderTarget = async (input: CloudSheetTarget): Promise<void> => {
       operation: "add-cloud-sheet-render",
       payload: {
         planId: input.planId,
+        executionSession: input.executionSession,
         token,
         prompt,
         outputUrl,
@@ -275,12 +298,15 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
   const desktop = getLocalDesktopApi();
   let plan = await desktop.scriptProjects.getPlan(planId);
   if (!plan || plan.local_executor !== CLOUD_SHEET_EXECUTOR) return;
+  const executionSession = textValue(plan.local_execution_session);
+  if (!executionSession) return;
   if (
     records(plan.local_targets).some((target) => target.role === "storyboard")
   ) {
     while (plan?.status === "PENDING") {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
       plan = await desktop.scriptProjects.getPlan(planId);
+      if (plan?.local_execution_session !== executionSession) return;
     }
     if (!plan || plan.status !== "RUNNING") return;
   }
@@ -294,7 +320,7 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
     desktop.scriptProjects.update({
       projectId,
       operation: "fail-cloud-sheet-render",
-      payload: { planId, token, message }
+      payload: { planId, executionSession, token, message }
     });
   const firstToken = textValue(records(plan.local_targets)[0]?.token);
 
@@ -397,6 +423,7 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
           await renderTarget({
             projectId,
             planId,
+            executionSession,
             cloudProjectId,
             cloudTimelineId,
             renderModel,
@@ -413,7 +440,8 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
   };
   await runWave(independents);
   if (!failures.length) await runWave(dependents);
-  if (!failures.length || (await isPlanCancelled(planId))) return;
+  if (!failures.length || (await isPlanCancelled(planId, executionSession)))
+    return;
   const [failure] = failures;
   await mutateLocalProject(() =>
     fail(

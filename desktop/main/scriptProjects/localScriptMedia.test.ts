@@ -9,6 +9,8 @@ import ffmpegPath from "ffmpeg-static";
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 
 import {
+  concatenateVideos,
+  extractFirstFrame,
   extractKeyframeGrid,
   extractLastFrame,
   extractMetricsFrameGrid
@@ -200,6 +202,11 @@ it.each([1, 4])(
 
 const cancellableExtractions = [
   {
+    name: "first frame",
+    extract: (input: string, signal: AbortSignal) =>
+      extractFirstFrame(input, signal)
+  },
+  {
     name: "last frame",
     extract: (input: string, signal: AbortSignal) =>
       extractLastFrame(input, signal)
@@ -210,6 +217,45 @@ const cancellableExtractions = [
       extractKeyframeGrid(input, 5, 4, signal)
   }
 ];
+
+it("exports a local cut using bundled FFmpeg", async () => {
+  const bytes = await concatenateVideos([filename, filename]);
+  expect(bytes.length).toBeGreaterThan(0);
+});
+
+it("refuses a pre-aborted cut export without spawning", async () => {
+  await expect(
+    concatenateVideos([filename], AbortSignal.abort())
+  ).rejects.toMatchObject({ name: "AbortError" });
+  expect(spawn).not.toHaveBeenCalled();
+});
+
+it("waits for an aborted cut-export child to close before returning", async () => {
+  const actual =
+    await vi.importActual<typeof import("node:child_process")>(
+      "node:child_process"
+    );
+  const controller = new AbortController();
+  let closed = false;
+  let child!: ReturnType<typeof spawn>;
+  vi.mocked(spawn).mockImplementationOnce(((
+    ...args: Parameters<typeof spawn>
+  ) => {
+    child = actual.spawn(...args);
+    child.once("close", () => {
+      closed = true;
+    });
+    child.once("spawn", () => controller.abort());
+    return child;
+  }) as typeof spawn);
+  await expect(
+    concatenateVideos([filename], controller.signal)
+  ).rejects.toMatchObject({ name: "AbortError" });
+  expect(closed).toBe(true);
+  expect(child.killed).toBe(true);
+  expect(child.signalCode).toBe("SIGKILL");
+  expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+});
 
 it.each(cancellableExtractions)(
   "rejects a pre-aborted $name without spawning",

@@ -540,12 +540,16 @@ void app
       repository: projectRepository,
       beforeLibraryChange: async () => {
         await Promise.all([
+          localScriptProjectService.suspendPlans(),
+          externalRenderJobService.suspend(),
           localScriptChatService.suspend(),
           localScriptProjectService.suspendMetrics(),
           localScriptProjectService.suspendDescriptions()
         ]);
       },
       afterLibraryChange: () => {
+        externalRenderJobService.reset();
+        localScriptProjectService.resetPlans();
         localScriptChatService.reset();
         localScriptProjectService.resetMetrics();
         localScriptProjectService.resetDescriptions();
@@ -559,7 +563,6 @@ void app
       describeImageLater
     );
     registerScriptProjectHandlers({
-      repository: scriptProjectSnapshotRepository,
       service: localScriptProjectService,
       chat: localScriptChatService,
       databaseManager,
@@ -607,6 +610,8 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  localScriptProjectService.stopPlans();
+  externalRenderJobService.stop();
   stopVlmRequests();
   vlmService.stop();
   localScriptChatService.stop();

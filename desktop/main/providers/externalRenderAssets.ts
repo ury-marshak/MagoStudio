@@ -100,6 +100,7 @@ export class ExternalRenderAssets {
     output: MediaRenderOutput,
     signal?: AbortSignal
   ): Promise<(typeof assets.$inferInsert)[]> {
+    signal?.throwIfAborted();
     const root = await this.libraryRoot();
     const files: (typeof assets.$inferInsert)[] = [];
     for (const [index, url] of output.urls.entries()) {
@@ -126,18 +127,21 @@ export class ExternalRenderAssets {
         }
       );
       const fields = local
-        ? await this.mediaFields(job.kind, sourcePath)
+        ? await this.mediaFields(job.kind, sourcePath, signal)
         : await this.downloadFile(job.kind, url, sourcePath, signal);
+      signal?.throwIfAborted();
       const thumbnail = path.join(root, thumbnailRelativePath);
       await mkdir(path.dirname(thumbnail), { recursive: true });
       const preview = await createImageThumbnail(sourcePath, thumbnail)
         .then(() => thumbnailRelativePath)
         .catch(() => undefined);
       const info = local ?? (await stat(sourcePath));
+      signal?.throwIfAborted();
       const hasAudio =
         job.kind === "video"
           ? await doesVideoHaveAudioStream(sourcePath)
           : undefined;
+      signal?.throwIfAborted();
       files.push({
         id,
         name,
@@ -205,7 +209,7 @@ export class ExternalRenderAssets {
           size !== Number(expected))
       )
         throw new Error("Render output download was incomplete");
-      const fields = await this.mediaFields(kind, temporary);
+      const fields = await this.mediaFields(kind, temporary, signal);
       signal.throwIfAborted();
       await publishFile(temporary, destination);
       return fields;
@@ -214,14 +218,20 @@ export class ExternalRenderAssets {
     }
   }
 
-  private async mediaFields(kind: ExternalRenderJob["kind"], source: string) {
+  private async mediaFields(
+    kind: ExternalRenderJob["kind"],
+    source: string,
+    signal?: AbortSignal
+  ) {
+    signal?.throwIfAborted();
     if (kind === "image") {
       const image = nativeImage.createFromPath(source);
       if (image.isEmpty())
         throw new Error("Could not decode the rendered image");
       return image.getSize();
     }
-    const video = await probeRenderedVideoMetadata(source);
+    const video = await probeRenderedVideoMetadata(source, signal);
+    signal?.throwIfAborted();
     if (!video) throw new Error("Could not read the rendered video");
     return toDeliveredVideoAssetFields(video, undefined);
   }

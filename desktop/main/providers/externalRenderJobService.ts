@@ -1,3 +1,5 @@
+import { LibraryWorkSession } from "../libraryWorkSession";
+
 import {
   type ExternalRenderAssets,
   RenderOutputUnavailable
@@ -42,13 +44,40 @@ const remoteRequest = (
 });
 
 export class ExternalRenderJobService {
-  private readonly ingestions = new Map<string, Promise<ExternalRenderJob>>();
+  private readonly work = new LibraryWorkSession(() => ({
+    ingestions: new Map<string, Promise<ExternalRenderJob>>()
+  }));
+  private get ingestions() {
+    return this.work.state.ingestions;
+  }
 
   constructor(
     private readonly jobs: ExternalRenderJobRepository,
     private readonly providers: ReadonlyMap<string, MediaRenderProvider>,
     private readonly assets: ExternalRenderAssets
-  ) {}
+  ) {
+    this.jobs = this.work.guard(jobs);
+    this.assets = this.work.guard(assets);
+    this.get = this.work.bind(this.get.bind(this));
+    this.submit = this.work.bind(this.submit.bind(this));
+    this.refresh = this.work.bind(this.refresh.bind(this));
+    this.ingest = this.work.bind(this.ingest.bind(this));
+    this.cancel = this.work.bind(this.cancel.bind(this));
+  }
+
+  /** Abort local transport/ingestion only, never issue provider cancellation. */
+  stop(): void {
+    this.work.stop();
+  }
+  suspend(): Promise<void> {
+    return this.work.suspend();
+  }
+  reset(): void {
+    this.work.reset();
+  }
+  captureSession(): AbortSignal {
+    return this.work.capture();
+  }
 
   get(id: string): Promise<ExternalRenderJob | null> {
     return this.jobs.get(id);
@@ -58,6 +87,9 @@ export class ExternalRenderJobService {
     input: Submission,
     signal?: AbortSignal
   ): Promise<ExternalRenderJob> {
+    signal = signal
+      ? AbortSignal.any([signal, this.work.capture()])
+      : this.work.capture();
     const submission = structuredClone(input);
     signal?.throwIfAborted();
     const { assetUrlField, assetInputs, ...job } = submission;
@@ -98,6 +130,7 @@ export class ExternalRenderJobService {
       );
     const provider = this.providerFor(submission.provider);
     const prepared = await provider.prepareSubmission(submission.endpoint);
+    signal.throwIfAborted();
     // Resolve every local input before starting any upload. Validation/upload
     // failures leave no uncertain paid generation job behind.
     const resolved = [];
@@ -126,6 +159,7 @@ export class ExternalRenderJobService {
     });
     let requestId: string;
     try {
+      signal.throwIfAborted();
       requestId = await prepared.submit(job.requestJson, signal);
     } catch (error) {
       if (error instanceof RenderSubmissionRejected) {
@@ -150,6 +184,9 @@ export class ExternalRenderJobService {
   }
 
   async refresh(id: string, signal?: AbortSignal): Promise<ExternalRenderJob> {
+    signal = signal
+      ? AbortSignal.any([signal, this.work.capture()])
+      : this.work.capture();
     const job = await this.requireJob(id);
     if (
       !job.requestId ||
@@ -161,6 +198,7 @@ export class ExternalRenderJobService {
       job.kind,
       signal
     );
+    signal.throwIfAborted();
     if (result.status !== "PENDING")
       await this.jobs.settleRemoteJob(id, result);
     return this.requireJob(id);
@@ -168,6 +206,9 @@ export class ExternalRenderJobService {
 
   /** Materialize a finished job in the library. Safe to retry after a restart. */
   async ingest(id: string, signal?: AbortSignal): Promise<ExternalRenderJob> {
+    signal = signal
+      ? AbortSignal.any([signal, this.work.capture()])
+      : this.work.capture();
     const existing = this.ingestions.get(id);
     if (existing) return existing;
     const operation = this.ingestOutput(id, signal);
@@ -175,7 +216,7 @@ export class ExternalRenderJobService {
     try {
       return await operation;
     } finally {
-      this.ingestions.delete(id);
+      if (this.ingestions.get(id) === operation) this.ingestions.delete(id);
     }
   }
 
@@ -193,6 +234,7 @@ export class ExternalRenderJobService {
     try {
       files = await this.assets.download(job, output, signal);
     } catch (error) {
+      signal?.throwIfAborted();
       if (!(error instanceof RenderOutputUnavailable)) throw error;
       const result = await this.providerFor(job.provider).refresh(
         remoteRequest(job, job.requestId),
@@ -213,6 +255,9 @@ export class ExternalRenderJobService {
   }
 
   async cancel(id: string, signal?: AbortSignal): Promise<ExternalRenderJob> {
+    signal = signal
+      ? AbortSignal.any([signal, this.work.capture()])
+      : this.work.capture();
     const job = await this.requireJob(id);
     if (job.status !== "SUBMITTED" || !job.requestId) return job;
     const status = await this.providerFor(job.provider).cancel(

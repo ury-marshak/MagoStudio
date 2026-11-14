@@ -1298,7 +1298,13 @@ describe("local paused plans", () => {
     await service.update({
       projectId: "project-1",
       operation: "fail-cloud-sheet-render",
-      payload: { planId, token: "mara", message: "Offline" }
+      payload: {
+        planId,
+        executionSession: (await service.getPlan(planId))
+          ?.local_execution_session,
+        token: "mara",
+        message: "Offline"
+      }
     });
     await waitForProjectRunToSettle();
   };
@@ -1528,13 +1534,22 @@ describe("local cloud sheet plans", () => {
     await service.update({
       projectId: "project-1",
       operation: "start-cloud-sheet-render",
-      payload: { planId, token: "mara", cloudClipId: "c1", cloudAssetId: "a1" }
+      payload: {
+        planId,
+        executionSession: (await service.getPlan(planId))
+          ?.local_execution_session,
+        token: "mara",
+        cloudClipId: "c1",
+        cloudAssetId: "a1"
+      }
     });
     await service.update({
       projectId: "project-1",
       operation: "add-cloud-sheet-render",
       payload: {
         planId,
+        executionSession: (await service.getPlan(planId))
+          ?.local_execution_session,
         token: "mara",
         prompt: "Mara",
         outputUrl: "https://cdn.example/mara.png",

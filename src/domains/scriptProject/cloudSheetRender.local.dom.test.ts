@@ -71,6 +71,7 @@ const cloudPlan = (
   project_id: "local-1",
   status: "RUNNING",
   local_executor: "mago-cloud-renderer",
+  local_execution_session: "library-session",
   local_request: {
     outputSize: [1024, 1024],
     settings: { render_model: "seedream_5_pro_t2i" }
@@ -127,6 +128,7 @@ describe("executeCloudSheetPlan", () => {
     expect(update.mock.calls[1]![0].payload).toEqual(
       expect.objectContaining({
         planId: "plan-1",
+        executionSession: "library-session",
         token: "mara",
         outputUrl: "https://cdn.example/mara.png",
         renderSpec: { kind: "sheet", token: "mara", prompt: "Mara, turnaround" }
@@ -227,10 +229,42 @@ describe("executeCloudSheetPlan", () => {
       operation: "fail-cloud-sheet-render",
       payload: {
         planId: "plan-1",
+        executionSession: "library-session",
         token: "mara",
         message: "Sign in to Mago Cloud to use this image model"
       }
     });
     expect(post).not.toHaveBeenCalled();
+  });
+  it("does not submit after the library changes while resolving cloud references", async () => {
+    succeed();
+    const plan = cloudPlan([
+      target({ _local_reference_asset_ids: ["reference"] })
+    ]);
+    const update = installBridge(plan);
+    let release!: (id: string) => void;
+    ensureCloudImageAsset.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          release = resolve;
+        })
+    );
+    const running = executeCloudSheetPlan("plan-1");
+    await vi.waitFor(() => expect(ensureCloudImageAsset).toHaveBeenCalled());
+    plan.local_execution_session = "replacement-session";
+    release("cloud-reference");
+    await running;
+    expect(post).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("will not execute a legacy plan without an active execution session", async () => {
+    const plan: Record<string, unknown> = cloudPlan([target()]);
+    delete plan.local_execution_session;
+    const update = installBridge(plan);
+    await executeCloudSheetPlan("plan-1");
+    expect(ensureCloudProject).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
   });
 });

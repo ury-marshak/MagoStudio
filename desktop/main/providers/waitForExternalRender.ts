@@ -11,6 +11,9 @@ export const waitForExternalRender = async (
   signal: AbortSignal,
   onSubmitted: () => Promise<void>
 ) => {
+  // A library stop aborts transport, not the accepted remote generation. Retain
+  // this exact session even if a provider ignores abort until after reset.
+  const lifetime = jobs.captureSession?.();
   const jobId = job.id;
   try {
     signal.throwIfAborted();
@@ -35,7 +38,8 @@ export const waitForExternalRender = async (
       job.error ?? `${job.provider} render ended with status ${job.status}`
     );
   } catch (error) {
-    if (signal.aborted) await jobs.cancel(jobId).catch(() => undefined);
+    if (signal.aborted && !lifetime?.aborted)
+      await jobs.cancel(jobId).catch(() => undefined);
     throw error;
   }
 };

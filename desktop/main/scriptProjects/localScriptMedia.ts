@@ -82,17 +82,23 @@ const outputArgs = [
   "pipe:1"
 ];
 
-export const extractFirstFrame = (filename: string): Promise<Buffer> =>
-  runImagePipe([
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-i",
-    filename,
-    "-map",
-    "0:v:0",
-    ...outputArgs
-  ]);
+export const extractFirstFrame = (
+  filename: string,
+  signal?: AbortSignal
+): Promise<Buffer> =>
+  runImagePipe(
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      filename,
+      "-map",
+      "0:v:0",
+      ...outputArgs
+    ],
+    signal
+  );
 
 /** Script-shot videos run at 24 fps. Include the last decoded frame, not EOF. */
 export const extractMetricsFrameGrid = (
@@ -251,21 +257,24 @@ export const createReferenceGrid = (
 };
 
 export const concatenateVideos = async (
-  filenames: string[]
+  filenames: string[],
+  signal?: AbortSignal
 ): Promise<Buffer> => {
+  signal?.throwIfAborted();
   if (!filenames.length) throw new Error("The local cut has no videos");
   const temporaryRoot = await mkdtemp(path.join(tmpdir(), "mago-studio-cut-"));
   const manifest = path.join(temporaryRoot, "inputs.ffconcat");
   const output = path.join(temporaryRoot, "cut.mp4");
-  const entries = filenames.map((filename) => {
-    const normalized = path.resolve(filename).replaceAll("\\", "/");
-    if (normalized.includes("\n") || normalized.includes("\r")) {
-      throw new Error("A cut input path contains an unsupported newline");
-    }
-    return `file '${normalized.replaceAll("'", "'\\''")}'`;
-  });
-  await writeFile(manifest, ["ffconcat version 1.0", ...entries].join("\n"));
   try {
+    const entries = filenames.map((filename) => {
+      const normalized = path.resolve(filename).replaceAll("\\", "/");
+      if (normalized.includes("\n") || normalized.includes("\r")) {
+        throw new Error("A cut input path contains an unsupported newline");
+      }
+      return `file '${normalized.replaceAll("'", "'\\''")}'`;
+    });
+    await writeFile(manifest, ["ffconcat version 1.0", ...entries].join("\n"));
+    signal?.throwIfAborted();
     await new Promise<void>((resolve, reject) => {
       const child = spawn(
         executablePath(),
@@ -291,20 +300,33 @@ export const concatenateVideos = async (
         { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] }
       );
       let stderr = "";
+      let failure: Error | undefined;
+      const abort = () => {
+        child.kill("SIGKILL");
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
       const timer = setTimeout(() => {
-        child.kill();
-        reject(new Error("FFmpeg timed out exporting the local cut"));
+        failure = new Error("FFmpeg timed out exporting the local cut");
+        child.kill("SIGKILL");
       }, FFMPEG_TIMEOUT_MS);
       child.stderr.on("data", (chunk: Buffer) => {
         stderr = `${stderr}${chunk.toString()}`.slice(-MAX_ERROR_LENGTH);
       });
       child.once("error", (error) => {
-        clearTimeout(timer);
-        reject(error);
+        failure = error;
+        if (!child.pid) {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          reject(error);
+        }
       });
       child.once("close", (code) => {
         clearTimeout(timer);
-        if (code === 0) resolve();
+        signal?.removeEventListener("abort", abort);
+        if (signal?.aborted) reject(signal.reason);
+        else if (failure) reject(failure);
+        else if (code === 0) resolve();
         else
           reject(
             new Error(
@@ -313,6 +335,7 @@ export const concatenateVideos = async (
           );
       });
     });
+    signal?.throwIfAborted();
     return await readFile(output);
   } finally {
     const resolvedTemp = path.resolve(tmpdir());

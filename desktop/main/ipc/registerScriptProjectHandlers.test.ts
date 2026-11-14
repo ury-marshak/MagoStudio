@@ -27,8 +27,14 @@ const setup = (channel: string = IPC_CHANNELS.scriptProjectsCancelChat) => {
   registerScriptProjectHandlers({
     chat: { cancel, post, list, getSessionSignal: () => controller.signal },
     databaseManager,
-    repository: {},
     service: {
+      inLibrary: async (operation: () => Promise<unknown>) => operation(),
+      capturePlanSession: () => {
+        controller.signal.throwIfAborted();
+        return controller.signal;
+      },
+      databaseOperation: async (operation: () => Promise<unknown>) =>
+        operation(),
       getRenderMetrics: metrics,
       captureMetricsSession,
       update,

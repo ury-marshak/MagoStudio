@@ -253,6 +253,8 @@ describe("local Storyboard service", () => {
               operation: "add-cloud-sheet-render",
               payload: {
                 planId: first.plan_id,
+                executionSession: (await service.getPlan(String(first.plan_id)))
+                  ?.local_execution_session,
                 token:
                   stored.planDetails[String(first.plan_id)].local_targets[0]
                     .token,
@@ -404,6 +406,8 @@ describe("local Storyboard service", () => {
         operation: "add-cloud-sheet-render",
         payload: {
           planId: id,
+          executionSession: (await service.getPlan(String(id)))
+            ?.local_execution_session,
           token: stored.planDetails[String(id)].local_targets[0].token,
           outputUrl: "https://example.com/board.png"
         }
@@ -428,6 +432,8 @@ describe("local Storyboard service", () => {
       operation: "fail-cloud-sheet-render",
       payload: {
         planId: third.plan_id,
+        executionSession: (await service.getPlan(String(third.plan_id)))
+          ?.local_execution_session,
         token: stored.planDetails[String(third.plan_id)].local_targets[0].token,
         message: "Provider unavailable"
       }
@@ -476,6 +482,8 @@ describe("local Storyboard service", () => {
       operation: "add-cloud-sheet-render",
       payload: {
         planId: submit.plan_id,
+        executionSession: (await service.getPlan(String(submit.plan_id)))
+          ?.local_execution_session,
         token: target.token,
         outputUrl: "https://example.com/board.png"
       }
@@ -531,6 +539,8 @@ describe("local Storyboard service", () => {
       operation: "add-cloud-sheet-render",
       payload: {
         planId: first.plan_id,
+        executionSession: (await service.getPlan(String(first.plan_id)))
+          ?.local_execution_session,
         token: target.token,
         outputUrl: "https://example.com/board.png"
       }

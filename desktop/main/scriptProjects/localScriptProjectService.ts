@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type {
   LocalScriptProjectMedia,
   LocalScriptProjectSnapshot,
+  LocalScriptProjectSnapshotInput,
   LocalScriptTextModel,
   LocalScriptCastInput,
   LocalScriptCutExportInput,
@@ -32,6 +33,7 @@ import { probeRenderedVideoMetadata } from "../cloud/probeRenderedVideoMetadata"
 import { ProjectRepository } from "../database/projectRepository";
 import { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import { probeComfyRenderModel } from "../imageRenders/comfyModelValidation";
+import { LibraryWorkSession } from "../libraryWorkSession";
 import type { ExternalRenderJobService } from "../providers/externalRenderJobService";
 import {
   SharedInference,
@@ -474,28 +476,46 @@ const recoverableExternalRenderStatuses = new Set([
 ]);
 
 export class LocalScriptProjectService {
-  private readonly projectRuns = new Map<
-    string,
-    { control: RunControl; promise: Promise<void> }
-  >();
+  private readonly planWork = new LibraryWorkSession(() => ({
+    executionSession: randomUUID(),
+    projectRuns: new Map<
+      string,
+      { control: RunControl; promise: Promise<void> }
+    >(),
+    queuedRuns: new Map<
+      string,
+      Array<{ planId: string; task: (control: RunControl) => Promise<void> }>
+    >(),
+    rendererPlanWaiters: new Map<string, () => void>(),
+    storyboardRequests: new Set<string>(),
+    storyboardPreparation: new Map<string, Promise<unknown>>(),
+    projectStateWrites: new Map<string, Promise<unknown>>()
+  }));
+  private get projectRuns() {
+    return this.planWork.state.projectRuns;
+  }
   private readonly pendingDescriptions = new Map<string, Promise<JsonRecord>>();
   private descriptionLifetime = new AbortController();
   private sharedDescriptions = new SharedInference<JsonRecord>();
   private readonly descriptionWrites = new Set<Promise<unknown>>();
   /** Cloud sheet plans are run by the renderer; the project stays busy until
    * it reports the last image, a failure, or the plan is cancelled. */
-  private readonly rendererPlanWaiters = new Map<string, () => void>();
-  /** Local Asset renders requested while the project runs another job. They
-   * reach ComfyUI only when that job ends, so a restart cannot lose them in
-   * ComfyUI's own queue; after a restart `getPlan` pauses them. */
-  private readonly queuedRuns = new Map<
-    string,
-    Array<{ planId: string; task: (control: RunControl) => Promise<void> }>
-  >();
+  private get rendererPlanWaiters() {
+    return this.planWork.state.rendererPlanWaiters;
+  }
+  private get queuedRuns() {
+    return this.planWork.state.queuedRuns;
+  }
   private readonly shotMetrics: LocalShotMetrics;
-  private readonly storyboardRequests = new Set<string>();
-  private readonly storyboardPreparation = new Map<string, Promise<unknown>>();
-  private readonly projectStateWrites = new Map<string, Promise<unknown>>();
+  private get storyboardRequests() {
+    return this.planWork.state.storyboardRequests;
+  }
+  private get storyboardPreparation() {
+    return this.planWork.state.storyboardPreparation;
+  }
+  private get projectStateWrites() {
+    return this.planWork.state.projectStateWrites;
+  }
 
   constructor(
     private readonly projects: ProjectRepository,
@@ -516,6 +536,46 @@ export class LocalScriptProjectService {
       FalGenerationDefaults | undefined
     >
   ) {
+    // All repository boundaries retain the session of their caller, including
+    // detached classification/media continuations. Drain these boundaries, not
+    // provider inference, before DatabaseManager replaces its mutable handle.
+    this.projects = this.planWork.guard(projects);
+    this.snapshots = this.planWork.guard(snapshots);
+    if (externalRenderJobs)
+      this.externalRenderJobs = this.planWork.guard(externalRenderJobs, false);
+    this.getSnapshot = this.planWork.bind(this.getSnapshot.bind(this));
+    this.cast = this.planWork.bind(this.cast.bind(this));
+    this.cancelPlan = this.planWork.bind(this.cancelPlan.bind(this));
+    const getPlan = this.getPlan.bind(this);
+    this.getPlan = this.planWork.bind(
+      async (...args: Parameters<typeof getPlan>) => {
+        const plan = await getPlan(...args);
+        return plan?.local_executor === CLOUD_SHEET_EXECUTOR
+          ? {
+              ...plan,
+              local_execution_session: this.planWork.state.executionSession
+            }
+          : plan;
+      }
+    );
+    this.recoverExternalRenderPlans = this.planWork.bind(
+      this.recoverExternalRenderPlans.bind(this)
+    );
+    this.resumePlan = this.planWork.bind(this.resumePlan.bind(this));
+    this.findMedia = this.planWork.bind(this.findMedia.bind(this));
+    this.getRenderMetrics = this.planWork.bind(
+      this.getRenderMetrics.bind(this)
+    );
+    this.generateSheets = this.planWork.bind(this.generateSheets.bind(this));
+    this.generateShots = this.planWork.bind(this.generateShots.bind(this));
+    this.exportCut = this.planWork.bind(this.exportCut.bind(this));
+    this.update = this.planWork.bind(this.update.bind(this));
+    this.assertLocalProject = this.planWork.bind(
+      this.assertLocalProject.bind(this)
+    );
+    this.putSnapshot = this.planWork.bind(this.putSnapshot.bind(this));
+    this.cacheMedia = this.planWork.bind(this.cacheMedia.bind(this));
+    this.cancelMedia = this.planWork.bind(this.cancelMedia.bind(this));
     this.shotMetrics = new LocalShotMetrics({
       read: (id) => this.snapshots.getMediaMetrics(id),
       write: (id, metrics) => this.snapshots.putMediaMetrics(id, metrics),
@@ -526,6 +586,50 @@ export class LocalScriptProjectService {
         return this.evaluateShotVideo(input, signal);
       }
     });
+  }
+
+  inLibrary<Result>(operation: () => Promise<Result>): Promise<Result> {
+    return this.planWork.run(operation);
+  }
+
+  databaseOperation<Result>(operation: () => Promise<Result>): Promise<Result> {
+    return this.planWork.boundary(operation);
+  }
+
+  async putSnapshot(input: LocalScriptProjectSnapshotInput): Promise<void> {
+    await this.snapshots.put(input);
+  }
+
+  async cacheMedia(projectId: string, sourceUrl: string): Promise<void> {
+    await this.snapshots.cacheScheduledMedia(projectId, sourceUrl);
+  }
+
+  async cancelMedia(projectId: string, sourceUrl: string): Promise<void> {
+    this.snapshots.cancelScheduledMedia(projectId, sourceUrl);
+  }
+
+  capturePlanSession(): AbortSignal {
+    return this.planWork.capture();
+  }
+
+  stopPlans(): void {
+    this.planWork.stop();
+    this.queuedRuns.clear();
+    for (const { control } of this.projectRuns.values()) {
+      control.cancelled = true;
+      control.abortController.abort();
+    }
+    for (const release of this.rendererPlanWaiters.values()) release();
+    this.rendererPlanWaiters.clear();
+  }
+
+  async suspendPlans(): Promise<void> {
+    this.stopPlans();
+    await this.planWork.suspend();
+  }
+
+  resetPlans(): void {
+    this.planWork.reset();
   }
 
   captureDescriptionSession(): AbortSignal {
@@ -2843,6 +2947,7 @@ export class LocalScriptProjectService {
       if (!client) return;
       void (async () => {
         for (const target of targetKeys) {
+          this.planWork.capture();
           if (
             target.kind !== "character" ||
             resolveBodyPlan(target.body_plan) ||
@@ -2855,9 +2960,19 @@ export class LocalScriptProjectService {
           ]
             .filter(Boolean)
             .join(" ");
-          const bodyPlan = await classifyBodyPlan(appearance, async (prompt) =>
-            stripQwenReasoning(await client.runVideoPrompt(prompt))
+          const bodyPlan = await classifyBodyPlan(
+            appearance,
+            async (prompt) => {
+              this.planWork.capture();
+              const response = await client.runVideoPrompt(
+                prompt,
+                () => this.planWork.signal.aborted
+              );
+              this.planWork.capture();
+              return stripQwenReasoning(response);
+            }
           );
+          this.planWork.capture();
           if (!bodyPlan) continue;
           const fresh = await this.requireSnapshot(input.projectId);
           const state = structuredClone(fresh.state!);
@@ -3063,7 +3178,8 @@ export class LocalScriptProjectService {
             const grid = await this.snapshots.storeGeneratedMedia(
               input.projectId,
               await createReferenceGrid(
-                await Promise.all(slot.map(resolveReferencePath))
+                await Promise.all(slot.map(resolveReferencePath)),
+                control.abortController.signal
               ),
               "png"
             );
@@ -3786,7 +3902,11 @@ export class LocalScriptProjectService {
             throw new Error("The saved fal video is unavailable");
           media = { ...asset, path: sourcePath };
         }
-        const posterBytes = await extractFirstFrame(media.path);
+        const posterBytes = await extractFirstFrame(
+          media.path,
+          control.abortController.signal
+        );
+        this.throwIfCancelled(control);
         const poster = await this.snapshots.storeGeneratedMedia(
           input.projectId,
           posterBytes,
@@ -3992,7 +4112,10 @@ export class LocalScriptProjectService {
     const step = this.findStep(plan, "run_summary");
     try {
       plan = await this.setStep(input.projectId, planId, step, "RUNNING");
-      const bytes = await concatenateVideos(paths);
+      const bytes = await concatenateVideos(
+        paths,
+        control.abortController.signal
+      );
       this.throwIfCancelled(control);
       const media = await this.snapshots.storeGeneratedMedia(
         input.projectId,
@@ -4405,8 +4528,16 @@ export class LocalScriptProjectService {
 
   private async requireCloudSheetPlan(
     projectId: string,
-    planId: string
+    planId: string,
+    executionSession: unknown
   ): Promise<JsonRecord> {
+    if (
+      executionSession !== this.planWork.state.executionSession ||
+      !this.rendererPlanWaiters.has(planId)
+    )
+      throw new Error(
+        "Cloud sheet callback belongs to an expired library execution"
+      );
     const plan = await this.requirePlan(planId);
     if (
       plan.project_id !== projectId ||
@@ -4424,7 +4555,11 @@ export class LocalScriptProjectService {
   ): Promise<JsonRecord> {
     const planId = textValue(payload.planId, "");
     const token = textValue(payload.token, "");
-    let plan = await this.requireCloudSheetPlan(projectId, planId);
+    let plan = await this.requireCloudSheetPlan(
+      projectId,
+      planId,
+      payload.executionSession
+    );
     const submit = this.findStep(
       plan,
       "submit_img2img_batch",
@@ -4465,7 +4600,11 @@ export class LocalScriptProjectService {
   ): Promise<JsonRecord> {
     const planId = textValue(payload.planId, "");
     const token = textValue(payload.token, "");
-    const plan = await this.requireCloudSheetPlan(projectId, planId);
+    const plan = await this.requireCloudSheetPlan(
+      projectId,
+      planId,
+      payload.executionSession
+    );
     const outputUrl = textValue(payload.outputUrl, "");
     if (!outputUrl.startsWith("https://"))
       throw new Error("Cloud sheet output must use HTTPS");
@@ -4567,7 +4706,11 @@ export class LocalScriptProjectService {
       payload.message,
       "Mago Cloud sheet rendering failed"
     );
-    const plan = await this.requireCloudSheetPlan(projectId, planId);
+    const plan = await this.requireCloudSheetPlan(
+      projectId,
+      planId,
+      payload.executionSession
+    );
     const poll = this.findStep(plan, "poll_img2img_batch", undefined, token);
     const step = completedStep(
       this.findStep(plan, "submit_img2img_batch", undefined, token)
@@ -4745,7 +4888,10 @@ export class LocalScriptProjectService {
       this.projectStateWrites.get(projectId) ?? Promise.resolve();
     const result = previous
       .catch(() => undefined)
-      .then(write)
+      .then(() => {
+        this.planWork.capture();
+        return write();
+      })
       .finally(() => {
         if (this.projectStateWrites.get(projectId) === result)
           this.projectStateWrites.delete(projectId);
@@ -4755,6 +4901,7 @@ export class LocalScriptProjectService {
   }
 
   private throwIfCancelled(control: RunControl): void {
+    this.planWork.capture();
     if (control.cancelled) throw new Error("Local plan cancelled");
   }
 
@@ -4791,20 +4938,33 @@ export class LocalScriptProjectService {
     planId: string,
     task: (control: RunControl) => Promise<void>
   ): void {
+    const lifetime = this.planWork.capture();
     const control: RunControl = {
       planId,
       projectId,
       cancelled: false,
       abortController: new AbortController()
     };
-    const promise = task(control).finally(() => {
-      if (this.projectRuns.get(projectId)?.control === control) {
-        this.projectRuns.delete(projectId);
-        this.startNextQueuedRun(projectId);
+    const stop = () => {
+      control.cancelled = true;
+      control.abortController.abort();
+    };
+    lifetime.addEventListener("abort", stop, { once: true });
+    const promise = this.planWork.run(async () => {
+      try {
+        await task(control);
+      } finally {
+        lifetime.removeEventListener("abort", stop);
+        if (this.projectRuns.get(projectId)?.control === control) {
+          this.projectRuns.delete(projectId);
+          if (!lifetime.aborted) this.startNextQueuedRun(projectId);
+        }
       }
     });
     this.projectRuns.set(projectId, { control, promise });
-    void promise;
+    void promise.catch((error) => {
+      if (!lifetime.aborted) console.warn("Local Director run failed", error);
+    });
   }
 
   private startOrQueueRun(
@@ -4812,6 +4972,7 @@ export class LocalScriptProjectService {
     planId: string,
     task: (control: RunControl) => Promise<void>
   ): void {
+    this.planWork.capture();
     if (!this.projectRuns.has(projectId)) {
       this.startRun(projectId, planId, task);
       return;
@@ -4823,6 +4984,7 @@ export class LocalScriptProjectService {
   }
 
   private startNextQueuedRun(projectId: string): void {
+    if (this.planWork.signal.aborted) return;
     const [next, ...rest] = this.queuedRuns.get(projectId) ?? [];
     if (rest.length) this.queuedRuns.set(projectId, rest);
     else this.queuedRuns.delete(projectId);

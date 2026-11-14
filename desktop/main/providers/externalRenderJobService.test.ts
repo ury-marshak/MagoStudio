@@ -325,7 +325,7 @@ it("dispatches a different provider through the same persistence path", async ()
   });
   expect(submit).toHaveBeenCalledExactlyOnceWith(
     alternateInput.requestJson,
-    undefined
+    expect.any(AbortSignal)
   );
 
   const falOnly = new ExternalRenderJobService(
@@ -349,7 +349,7 @@ it("dispatches a different provider through the same persistence path", async ()
       keychainAccount: "alternate-key"
     },
     "image",
-    undefined
+    expect.any(AbortSignal)
   );
   expect(falConfig).not.toHaveBeenCalled();
   expect(fetchMock).not.toHaveBeenCalled();
