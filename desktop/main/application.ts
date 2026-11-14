@@ -220,18 +220,21 @@ const localScriptProjectService = new LocalScriptProjectService(
   scriptProjectSnapshotRepository,
   () => librarySettings.getComfyEndpoint(),
   () => librarySettings.getScriptTextModel(),
-  (sourcePath, kind) => vlmService.describeEntityImage(sourcePath, kind),
+  (sourcePath, kind, signal) =>
+    vlmService.describeEntityImage(sourcePath, kind, undefined, signal),
   textModelBridge.run,
-  (input) => vlmService.evaluateShotVideo(input),
+  (input, signal) => vlmService.evaluateShotVideo(input, signal),
   () => getExternalGenerator("text"),
   externalRenderJobService,
-  async (sourcePath, kind) => {
+  async (sourcePath, kind, signal) => {
+    signal?.throwIfAborted();
     const generate = await getExternalGenerator("vision");
+    signal?.throwIfAborted();
     if (!generate)
       throw new Error(
         "Configure an external vision provider to describe fal images"
       );
-    return vlmService.describeEntityImage(sourcePath, kind, generate);
+    return vlmService.describeEntityImage(sourcePath, kind, generate, signal);
   },
   async () => (await externalProviders.getFal())?.generationSettings
 );
@@ -535,8 +538,18 @@ void app
       settings: librarySettings,
       databaseManager,
       repository: projectRepository,
-      beforeLibraryChange: () => localScriptChatService.suspend(),
-      afterLibraryChange: () => localScriptChatService.reset()
+      beforeLibraryChange: async () => {
+        await Promise.all([
+          localScriptChatService.suspend(),
+          localScriptProjectService.suspendMetrics(),
+          localScriptProjectService.suspendDescriptions()
+        ]);
+      },
+      afterLibraryChange: () => {
+        localScriptChatService.reset();
+        localScriptProjectService.resetMetrics();
+        localScriptProjectService.resetDescriptions();
+      }
     });
     registerProjectHandlers(
       projectRepository,
@@ -597,6 +610,8 @@ app.on("before-quit", () => {
   stopVlmRequests();
   vlmService.stop();
   localScriptChatService.stop();
+  localScriptProjectService.stopMetrics();
+  localScriptProjectService.stopDescriptions();
   void rendererOriginPromise?.then((origin) => origin.close());
   imageRenderService.stop();
   closeAllComfyProgressMonitors();

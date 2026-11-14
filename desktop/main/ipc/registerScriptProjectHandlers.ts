@@ -194,8 +194,13 @@ export const registerScriptProjectHandlers = ({
     IPC_CHANNELS.scriptProjectsGetRenderMetrics,
     async (event, assetId: unknown) => {
       requireTrustedSender(event);
+      const signal = service.captureMetricsSession();
       await ensureDatabase();
-      return service.getRenderMetrics(requireString(assetId, "assetId"));
+      signal.throwIfAborted();
+      return service.getRenderMetrics(
+        requireString(assetId, "assetId"),
+        signal
+      );
     }
   );
 
@@ -290,11 +295,14 @@ export const registerScriptProjectHandlers = ({
     IPC_CHANNELS.scriptProjectsUpdate,
     async (event, value: unknown) => {
       requireTrustedSender(event);
+      const signal = service.captureDescriptionSession();
       await ensureDatabase();
+      signal.throwIfAborted();
       if (!value || typeof value !== "object" || Array.isArray(value))
         throw new Error("local script update input must be an object");
       return service.update(
-        value as Parameters<LocalScriptProjectService["update"]>[0]
+        value as Parameters<LocalScriptProjectService["update"]>[0],
+        signal
       );
     }
   );

@@ -412,7 +412,8 @@ describe("local script-sheet image descriptions", () => {
 
     expect(describeImage).toHaveBeenCalledWith(
       "C:/renders/image-1.png",
-      "character"
+      "character",
+      expect.any(AbortSignal)
     );
     expect((state.keys as Array<Record<string, unknown>>)[0]).toMatchObject({
       description: "actual visible pilot caption",

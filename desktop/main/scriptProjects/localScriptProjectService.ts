@@ -33,6 +33,10 @@ import { ProjectRepository } from "../database/projectRepository";
 import { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import { probeComfyRenderModel } from "../imageRenders/comfyModelValidation";
 import type { ExternalRenderJobService } from "../providers/externalRenderJobService";
+import {
+  SharedInference,
+  waitForInference
+} from "../providers/sharedInference";
 import type { ShotVideoEvaluationInput } from "../vlm/videoMetrics";
 import type { VisionGenerator } from "../vlm/visionGenerator";
 
@@ -186,7 +190,8 @@ export const resolveCastOptions = (
 
 type DescribeEntityImage = (
   sourcePath: string,
-  kind: string
+  kind: string,
+  signal?: AbortSignal
 ) => Promise<string>;
 
 const record = (value: unknown): JsonRecord | null =>
@@ -474,6 +479,9 @@ export class LocalScriptProjectService {
     { control: RunControl; promise: Promise<void> }
   >();
   private readonly pendingDescriptions = new Map<string, Promise<JsonRecord>>();
+  private descriptionLifetime = new AbortController();
+  private sharedDescriptions = new SharedInference<JsonRecord>();
+  private readonly descriptionWrites = new Set<Promise<unknown>>();
   /** Cloud sheet plans are run by the renderer; the project stays busy until
    * it reports the last image, a failure, or the plan is cancelled. */
   private readonly rendererPlanWaiters = new Map<string, () => void>();
@@ -498,7 +506,8 @@ export class LocalScriptProjectService {
     private readonly describeEntityImage?: DescribeEntityImage,
     private readonly runCloudTextModel: RunCloudTextModel = async () => null,
     private readonly evaluateShotVideo?: (
-      input: ShotVideoEvaluationInput
+      input: ShotVideoEvaluationInput,
+      signal?: AbortSignal
     ) => Promise<JsonRecord>,
     private readonly getExternalTextGenerator?: () => Promise<VisionGenerator | null>,
     private readonly externalRenderJobs?: ExternalRenderJobService,
@@ -510,29 +519,76 @@ export class LocalScriptProjectService {
     this.shotMetrics = new LocalShotMetrics({
       read: (id) => this.snapshots.getMediaMetrics(id),
       write: (id, metrics) => this.snapshots.putMediaMetrics(id, metrics),
-      resolveInput: (id) => this.shotMetricsInput(id),
-      evaluate: (input) => {
+      resolveInput: (id, signal) => this.shotMetricsInput(id, signal),
+      evaluate: (input, signal) => {
         if (!this.evaluateShotVideo)
           throw new Error("Local video evaluator is unavailable");
-        return this.evaluateShotVideo(input);
+        return this.evaluateShotVideo(input, signal);
       }
     });
   }
 
-  async getRenderMetrics(assetId: string): Promise<JsonRecord> {
+  captureDescriptionSession(): AbortSignal {
+    this.descriptionLifetime.signal.throwIfAborted();
+    return this.descriptionLifetime.signal;
+  }
+
+  stopDescriptions(): void {
+    this.descriptionLifetime.abort();
+    this.pendingDescriptions.clear();
+    this.sharedDescriptions = new SharedInference<JsonRecord>();
+  }
+
+  async suspendDescriptions(): Promise<void> {
+    this.stopDescriptions();
+    await Promise.allSettled(this.descriptionWrites);
+  }
+
+  resetDescriptions(): void {
+    if (!this.descriptionLifetime.signal.aborted)
+      throw new Error("Suspend descriptions before reset");
+    this.descriptionLifetime = new AbortController();
+  }
+
+  /** Metrics-only teardown; other Director work still needs session ownership. */
+  suspendMetrics(): Promise<void> {
+    return this.shotMetrics.suspend();
+  }
+
+  resetMetrics(): void {
+    this.shotMetrics.reset();
+  }
+
+  stopMetrics(): void {
+    this.shotMetrics.stop();
+  }
+
+  captureMetricsSession(): AbortSignal {
+    return this.shotMetrics.captureSession();
+  }
+
+  async getRenderMetrics(
+    assetId: string,
+    signal = this.captureMetricsSession()
+  ): Promise<JsonRecord> {
+    signal.throwIfAborted();
     const media = await this.findMedia({ assetId });
     if (media?.kind !== "shot-version")
       throw new Error("Local shot version not found");
-    return this.shotMetrics.get(assetId);
+    return this.shotMetrics.get(assetId, signal);
   }
 
   private async shotMetricsInput(
-    assetId: string
+    assetId: string,
+    signal: AbortSignal
   ): Promise<ShotVideoEvaluationInput> {
+    signal.throwIfAborted();
     const media = await this.findMedia({ assetId });
     if (media?.kind !== "shot-version")
       throw new Error("Local shot version not found");
+    signal.throwIfAborted();
     const snapshot = await this.requireSnapshot(media.projectId);
+    signal.throwIfAborted();
     const version = records(snapshot.cut?.shots)
       .flatMap((shot) => records(shot.versions))
       .find((candidate) => candidate.asset_id === assetId);
@@ -554,12 +610,15 @@ export class LocalScriptProjectService {
       ? strings(stored.reference_asset_ids)
       : Object.values(record(spec?.references) ?? {}).flatMap(strings);
     const sourcePath = await this.snapshots.resolveMediaPath(assetId);
+    signal.throwIfAborted();
     if (!sourcePath) throw new Error("Local video is unavailable");
     const referencePaths: string[] = [];
     for (const id of new Set(references)) {
+      signal.throwIfAborted();
       const path =
         (await this.snapshots.resolveMediaPath(id)) ??
         (await this.projects.resolveMediaPath("asset", id));
+      signal.throwIfAborted();
       if (!path) throw new Error(`Evaluation reference ${id} is unavailable`);
       referencePaths.push(path);
     }
@@ -1142,26 +1201,35 @@ export class LocalScriptProjectService {
     return { ...answer, plan_id: planId };
   }
 
-  async update(input: {
-    projectId: string;
-    operation:
-      | "edit-sheet"
-      | "add-sheet-image"
-      | "describe-sheet"
-      | "pin-sheet"
-      | "add-shot"
-      | "edit-shot"
-      | "pin-shot"
-      | "edit-image-description"
-      | "start-cloud-sheet-render"
-      | "add-cloud-sheet-render"
-      | "fail-cloud-sheet-render"
-      | "storyboard"
-      | "storyboard-generate"
-      | "storyboard-update";
-    payload: JsonRecord;
-  }): Promise<JsonRecord> {
+  async update(
+    input: {
+      projectId: string;
+      operation:
+        | "edit-sheet"
+        | "add-sheet-image"
+        | "describe-sheet"
+        | "pin-sheet"
+        | "add-shot"
+        | "edit-shot"
+        | "pin-shot"
+        | "edit-image-description"
+        | "start-cloud-sheet-render"
+        | "add-cloud-sheet-render"
+        | "fail-cloud-sheet-render"
+        | "storyboard"
+        | "storyboard-generate"
+        | "storyboard-update";
+      payload: JsonRecord;
+    },
+    caller = this.captureDescriptionSession()
+  ): Promise<JsonRecord> {
+    const descriptionSignal = AbortSignal.any([
+      caller,
+      this.captureDescriptionSession()
+    ]);
+    descriptionSignal.throwIfAborted();
     await this.assertLocalProject(input.projectId);
+    descriptionSignal.throwIfAborted();
     if (input.operation === "storyboard-generate")
       return this.generateStoryboard(input.projectId, input.payload);
     if (
@@ -1183,7 +1251,8 @@ export class LocalScriptProjectService {
           ? input.payload.assetId
           : undefined,
         input.payload.shouldOverwrite === true,
-        true
+        true,
+        descriptionSignal
       );
     }
     const snapshot = await this.requireSnapshot(input.projectId);
@@ -1250,9 +1319,11 @@ export class LocalScriptProjectService {
       const sourcePath = assetId
         ? await this.projects.resolveMediaPath("asset", assetId)
         : null;
+      descriptionSignal.throwIfAborted();
       if (!assetId || !sourcePath)
         throw new Error("Local uploaded image not found");
       const latestSnapshot = await this.requireSnapshot(input.projectId);
+      descriptionSignal.throwIfAborted();
       const state = structuredClone(latestSnapshot.state!);
       const key = records(state.keys).find(
         (candidate) => candidate.token === input.payload.token
@@ -1278,19 +1349,23 @@ export class LocalScriptProjectService {
       key.selected_asset_id = assetId;
       key.effective_asset_id = assetId;
       key.effective_source = "upload";
-      await this.snapshots.put({
-        projectId: input.projectId,
-        state: this.refreshReferences(state)
-      });
+      await this.writeDescriptionState(
+        input.projectId,
+        this.refreshReferences(state),
+        descriptionSignal
+      );
       try {
         return await this.requestSheetDescription(
           input.projectId,
           String(key.token),
           assetId,
           false,
-          false
+          false,
+          descriptionSignal
         );
-      } catch {
+      } catch (error) {
+        descriptionSignal.throwIfAborted();
+        if (error instanceof Error && error.name === "AbortError") throw error;
         return key;
       }
     }
@@ -1490,18 +1565,22 @@ export class LocalScriptProjectService {
   private async tryDescribeEntityImage(
     sourcePath: string,
     kind: string,
-    externalOnly: boolean
+    externalOnly: boolean,
+    signal: AbortSignal
   ): Promise<string | null> {
+    signal.throwIfAborted();
     const describe = externalOnly
       ? this.describeExternalEntityImage
       : this.describeEntityImage;
     if (!describe) return null;
     try {
-      const description = (await describe(sourcePath, kind)).trim();
-      return description || null;
-    } catch {
-      // A caption improves a later MiniMax prompt, but must never turn an
-      // otherwise successful image render/upload into a failure.
+      const description = await describe(sourcePath, kind, signal);
+      signal.throwIfAborted();
+      return description.trim() || null;
+    } catch (error) {
+      signal.throwIfAborted();
+      if (error instanceof Error && error.name === "AbortError") throw error;
+      // Optional captions may fail, but cancellation is never a successful fallback.
       return null;
     }
   }
@@ -1509,99 +1588,156 @@ export class LocalScriptProjectService {
   private async describeSheetVersion(
     projectId: string,
     token: string,
-    requestedAssetId?: string,
-    overwrite = false,
-    required = false
+    assetId: string,
+    overwrite: boolean,
+    signal: AbortSignal
   ): Promise<JsonRecord> {
+    signal.throwIfAborted();
     const snapshot = await this.requireSnapshot(projectId);
+    signal.throwIfAborted();
     const key = records(snapshot.state?.keys).find(
       (candidate) => candidate.token === token
     );
     if (!key) throw new Error("Local reference-sheet entity not found");
-    const assetId = requestedAssetId ?? textValue(key.effective_asset_id, "");
     const image = records(key.images).find(
       (candidate) => candidate.asset_id === assetId
     );
     if (!image) throw new Error("This entity has no image to describe yet");
     if (hasOwnSheetDescription(key, image) && !overwrite) return key;
 
-    const sourcePath =
-      (await this.snapshots.resolveMediaPath(assetId)) ??
-      (await this.projects.resolveMediaPath("asset", assetId));
+    let sourcePath = await this.snapshots.resolveMediaPath(assetId);
+    signal.throwIfAborted();
+    if (!sourcePath) {
+      sourcePath = await this.projects.resolveMediaPath("asset", assetId);
+      signal.throwIfAborted();
+    }
     const description = sourcePath
       ? await this.tryDescribeEntityImage(
           sourcePath,
           textValue(key.kind, ""),
-          record(image.render_settings)?.provider === "fal"
+          record(image.render_settings)?.provider === "fal",
+          signal
         )
       : null;
-    if (!description) {
-      if (required) throw new Error("Could not describe this image");
-      return key;
-    }
+    signal.throwIfAborted();
+    if (!description) return key;
 
-    // Re-read after the VLM call. A user edit that landed while it was running
-    // wins unless this was an explicit overwrite request.
-    const latest = await this.requireSnapshot(projectId);
-    const state = structuredClone(latest.state!);
-    const latestKey = records(state.keys).find(
-      (candidate) => candidate.token === token
-    );
-    const latestImage = records(latestKey?.images).find(
-      (candidate) => candidate.asset_id === assetId
-    );
-    if (!latestKey || !latestImage)
-      throw new Error("Local reference-sheet image not found");
-    if (hasOwnSheetDescription(latestKey, latestImage) && !overwrite)
-      return latestKey;
-    latestImage.description = description;
-    latestImage.has_description = true;
-    latestImage.description_source = "vlm";
-    const refreshed = this.refreshReferences(state);
-    await this.snapshots.put({ projectId, state: refreshed });
-    return (
-      records(refreshed.keys).find((candidate) => candidate.token === token) ??
-      latestKey
-    );
+    // Serialize the final re-read/write with other project-state writers. Do not
+    // hold this queue during inference; a user edit wins unless overwrite was explicit.
+    return this.withProjectStateWrite(projectId, async () => {
+      signal.throwIfAborted();
+      const latest = await this.requireSnapshot(projectId);
+      signal.throwIfAborted();
+      const state = structuredClone(latest.state!);
+      const latestKey = records(state.keys).find(
+        (candidate) => candidate.token === token
+      );
+      const latestImage = records(latestKey?.images).find(
+        (candidate) => candidate.asset_id === assetId
+      );
+      if (!latestKey || !latestImage)
+        throw new Error("Local reference-sheet image not found");
+      if (hasOwnSheetDescription(latestKey, latestImage) && !overwrite)
+        return latestKey;
+      latestImage.description = description;
+      latestImage.has_description = true;
+      latestImage.description_source = "vlm";
+      const refreshed = this.refreshReferences(state);
+      await this.writeDescriptionState(projectId, refreshed, signal);
+      return (
+        records(refreshed.keys).find(
+          (candidate) => candidate.token === token
+        ) ?? latestKey
+      );
+    });
   }
 
-  private requestSheetDescription(
+  private async writeDescriptionState(
+    projectId: string,
+    state: JsonRecord,
+    signal: AbortSignal
+  ): Promise<void> {
+    signal.throwIfAborted();
+    const write = this.snapshots.put({ projectId, state });
+    this.descriptionWrites.add(write);
+    try {
+      await write;
+      signal.throwIfAborted();
+    } finally {
+      this.descriptionWrites.delete(write);
+    }
+  }
+
+  private async requestSheetDescription(
     projectId: string,
     token: string,
-    assetId: string | undefined,
+    requestedAssetId: string | undefined,
     overwrite: boolean,
-    required: boolean
+    required: boolean,
+    caller = this.captureDescriptionSession()
   ): Promise<JsonRecord> {
-    const id = assetId ?? "effective";
-    const pendingKey = `${projectId}:${token}:${id}`;
-    const previous = this.pendingDescriptions.get(pendingKey);
-    const run = (async () => {
-      if (previous) {
-        const result = await previous;
-        if (!overwrite && !required) return result;
-      }
-      return this.describeSheetVersion(
-        projectId,
-        token,
-        assetId,
-        overwrite,
-        required
-      );
-    })();
-    this.pendingDescriptions.set(pendingKey, run);
-    const cleanup = () => {
-      if (this.pendingDescriptions.get(pendingKey) === run) {
-        this.pendingDescriptions.delete(pendingKey);
-      }
-    };
-    void run.then(cleanup, cleanup);
-    return run;
+    const lifetime = this.captureDescriptionSession();
+    const signal = AbortSignal.any([caller, lifetime]);
+    signal.throwIfAborted();
+    const snapshot = await this.requireSnapshot(projectId);
+    signal.throwIfAborted();
+    const key = records(snapshot.state?.keys).find(
+      (candidate) => candidate.token === token
+    );
+    if (!key) throw new Error("Local reference-sheet entity not found");
+    const assetId = requestedAssetId ?? textValue(key.effective_asset_id, "");
+    const pendingKey = JSON.stringify([projectId, token, assetId]);
+    const result = await this.sharedDescriptions.run(
+      JSON.stringify([projectId, token, assetId, overwrite]),
+      async (ownedSignal) => {
+        const operationSignal = AbortSignal.any([ownedSignal, lifetime]);
+        operationSignal.throwIfAborted();
+        const previous = this.pendingDescriptions.get(pendingKey);
+        const run = (async () => {
+          if (previous)
+            await waitForInference(
+              previous.catch(() => undefined),
+              operationSignal
+            );
+          operationSignal.throwIfAborted();
+          // Release the serialization slot on abort even if the provider ignores
+          // its signal. The detached operation still checks ownership before writes.
+          return waitForInference(
+            this.describeSheetVersion(
+              projectId,
+              token,
+              assetId,
+              overwrite,
+              operationSignal
+            ),
+            operationSignal
+          );
+        })();
+        this.pendingDescriptions.set(pendingKey, run);
+        const cleanup = () => {
+          if (this.pendingDescriptions.get(pendingKey) === run)
+            this.pendingDescriptions.delete(pendingKey);
+        };
+        void run.then(cleanup, cleanup);
+        return run;
+      },
+      signal
+    );
+    signal.throwIfAborted();
+    const image = records(result.images).find(
+      (candidate) => candidate.asset_id === assetId
+    );
+    if (required && (!image || !hasOwnSheetDescription(result, image)))
+      throw new Error("Could not describe this image");
+    return result;
   }
 
   private async ensureReferenceDescriptions(
     projectId: string,
-    references: JsonRecord[]
+    references: JsonRecord[],
+    signal: AbortSignal
   ): Promise<void> {
+    signal.throwIfAborted();
     for (const reference of references) {
       const token = textValue(reference.token, "");
       const assetId = textValue(reference.asset_id, "");
@@ -1612,10 +1748,13 @@ export class LocalScriptProjectService {
           token,
           assetId,
           false,
-          false
+          false,
+          signal
         );
-      } catch {
-        // Keep the casting description as the degraded fallback.
+      } catch (error) {
+        signal.throwIfAborted();
+        if (error instanceof Error && error.name === "AbortError") throw error;
+        // Keep the casting description as the degraded fallback, never on abort.
       }
     }
   }
@@ -2304,6 +2443,10 @@ export class LocalScriptProjectService {
     basePlan: JsonRecord,
     control: RunControl
   ): Promise<void> {
+    const descriptionSignal = AbortSignal.any([
+      this.captureDescriptionSession(),
+      control.abortController.signal
+    ]);
     const planId = String(basePlan.id);
     let plan = planAt(basePlan, "RUNNING");
     await this.snapshots.putPlan(input.projectId, planId, plan);
@@ -2675,13 +2818,23 @@ export class LocalScriptProjectService {
                 token,
                 assetId,
                 false,
-                false
+                false,
+                descriptionSignal
               )
             );
           }
         }
       }
-      await Promise.allSettled(captionRequests);
+      const captions = await Promise.allSettled(captionRequests);
+      descriptionSignal.throwIfAborted();
+      for (const caption of captions) {
+        if (
+          caption.status === "rejected" &&
+          caption.reason instanceof Error &&
+          caption.reason.name === "AbortError"
+        )
+          throw caption.reason;
+      }
       await this.snapshots.putPlan(
         input.projectId,
         planId,
@@ -2717,7 +2870,7 @@ export class LocalScriptProjectService {
         }
       })().catch(() => undefined);
     } catch (error) {
-      if (control.cancelled) return;
+      if (control.cancelled || descriptionSignal.aborted) return;
       const message =
         error instanceof Error ? error.message : "Local sheet rendering failed";
       if (activeStep)
@@ -2743,6 +2896,10 @@ export class LocalScriptProjectService {
     basePlan: JsonRecord,
     control: RunControl
   ): Promise<void> {
+    const descriptionSignal = AbortSignal.any([
+      this.captureDescriptionSession(),
+      control.abortController.signal
+    ]);
     const planId = String(basePlan.id);
     const localH3Steps = resolveLocalH3Steps(
       input.videoSettings?.local_h3_steps
@@ -2795,7 +2952,8 @@ export class LocalScriptProjectService {
         if (!isFalRender) {
           await this.ensureReferenceDescriptions(
             input.projectId,
-            referenceItems
+            referenceItems,
+            descriptionSignal
           );
           snapshot = await this.requireSnapshot(input.projectId);
         }
@@ -3801,7 +3959,7 @@ export class LocalScriptProjectService {
         planAt(plan, "COMPLETED")
       );
     } catch (error) {
-      if (control.cancelled) return;
+      if (control.cancelled || descriptionSignal.aborted) return;
       const message =
         error instanceof Error ? error.message : "Local shot rendering failed";
       if (activeStep)
