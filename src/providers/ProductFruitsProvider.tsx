@@ -2,6 +2,8 @@ import { useUser } from "@platform/identity";
 import React from "react";
 import { ProductFruits } from "react-product-fruits";
 
+import { isCloudAccountActive } from "@/platform/cloudAccount";
+
 const WORKSPACE_CODE = process.env.NEXT_PUBLIC_PRODUCT_FRUITS_WORKSPACE_CODE;
 
 export const ProductFruitsProvider: React.FC = () => {
@@ -13,7 +15,7 @@ export const ProductFruitsProvider: React.FC = () => {
     : undefined;
   const userEmail = user?.emailAddresses[0].emailAddress;
 
-  if (!user || !WORKSPACE_CODE) {
+  if (!isCloudAccountActive() || !user || !WORKSPACE_CODE) {
     return null;
   }
 

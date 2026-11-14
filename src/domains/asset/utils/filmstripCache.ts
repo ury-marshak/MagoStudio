@@ -1,3 +1,5 @@
+import { fetchRendererMedia } from "@/platform/rendererMediaAccess";
+
 import { cacheGet, cacheSet } from "./cacheStorage";
 
 function getFilmstripCacheKey(assetId: string, width: number): string {
@@ -36,7 +38,7 @@ export async function saveFilmstripToCache(
 ): Promise<void> {
   try {
     const key = getFilmstripCacheKey(assetId, width);
-    const response = await fetch(dataUrl);
+    const response = await fetchRendererMedia(dataUrl);
     const blob = await response.blob();
     await cacheSet("filmstrip", key, blob);
   } catch (error) {

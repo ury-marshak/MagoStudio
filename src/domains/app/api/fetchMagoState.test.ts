@@ -59,3 +59,23 @@ describe("fetchMagoState", () => {
     await rejection;
   });
 });
+
+it.each(["offline", "unchosen", undefined, "CLOUD"])(
+  "refuses direct maintenance traffic in account-free mode %s",
+  async (mode) => {
+    vi.stubGlobal("window", { mago: { account: { mode } } });
+    const fetchTrap = vi.fn();
+    vi.stubGlobal("fetch", fetchTrap);
+    await expect(fetchMagoState()).rejects.toThrow("explicit cloud account");
+    expect(fetchTrap).not.toHaveBeenCalled();
+  }
+);
+
+it("preserves direct maintenance requests in explicit cloud mode", async () => {
+  vi.stubGlobal("window", { mago: { account: { mode: "cloud" } } });
+  const state = { "release-ongoing": false, version: "fixture" };
+  const fetchTrap = respondWith({ ok: true, json: async () => state });
+  vi.stubGlobal("fetch", fetchTrap);
+  expect(await fetchMagoState()).toEqual(state);
+  expect(fetchTrap).toHaveBeenCalledOnce();
+});

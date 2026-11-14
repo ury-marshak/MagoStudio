@@ -1,11 +1,12 @@
-/* oxlint-disable custom-react/no-use-effect -- legitimate useEffect for external sync */
-
 import * as amplitude from "@amplitude/analytics-browser";
+/* oxlint-disable custom-react/no-use-effect -- legitimate useEffect for external sync */
 import { trackingUtils } from "@hooks/tracking/trackingUtils";
 import { useUserLocalStorage } from "@hooks/userLocalStorage/useUserLocalStorage";
 import { useUser } from "@platform/identity";
 import { setHasAccountCookie } from "@utils/hasAccountCookie";
 import { useEffect } from "react";
+
+import { isCloudAccountActive } from "@/platform/cloudAccount";
 
 const NEW_USER_THRESHOLD_MS = 300_000;
 
@@ -14,6 +15,7 @@ export function useTrackSignUp() {
   const [isTracked, setIsTracked] = useUserLocalStorage("signUpTracked", false);
 
   useEffect(() => {
+    if (!isCloudAccountActive()) return;
     setHasAccountCookie();
 
     if (!isLoaded) return;

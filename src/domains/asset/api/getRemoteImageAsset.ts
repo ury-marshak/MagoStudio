@@ -1,8 +1,8 @@
 import { backendApiClient } from "@/lib/backend-api-client";
+import { readableDesktopStorageUrl } from "@/platform/rendererMediaAccess";
 
 import { cacheGet } from "../utils/cacheStorage";
 import { downloadImageBlob } from "../utils/downloadImageBlob";
-import { toDesktopCloudStorageUrl } from "../utils/toDesktopCloudStorageUrl";
 
 import { ImageAssetResponse } from "./interface";
 
@@ -18,7 +18,7 @@ export const getRemoteImageAsset = async (
   const responseUrl = response.data.original_url || response.data.s3_url;
   if (!responseUrl) return { ...response.data, urlToUse: responseUrl };
 
-  const readableResponseUrl = toDesktopCloudStorageUrl(responseUrl);
+  const readableResponseUrl = readableDesktopStorageUrl(responseUrl);
   try {
     const blob = await downloadImageBlob(responseUrl, assetId);
     return { ...response.data, urlToUse: URL.createObjectURL(blob) };

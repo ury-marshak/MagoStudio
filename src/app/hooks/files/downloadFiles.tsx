@@ -1,8 +1,11 @@
-import { toDesktopCloudStorageUrl } from "@domains/asset/utils/toDesktopCloudStorageUrl";
 import { Layer } from "@schemas/layer";
 import { AxiosError } from "axios";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import {
+  fetchRendererMedia,
+  readableDesktopStorageUrl
+} from "@/platform/rendererMediaAccess";
 
 const HTTP_STATUS_NOT_FOUND = 404;
 
@@ -37,7 +40,9 @@ const downloadLayerBlob = async (
   kind: LayerDownloadKind
 ): Promise<Blob> => {
   const signedUrl = await getLayerDownloadSignedUrl({ layerId, kind });
-  const response = await fetch(toDesktopCloudStorageUrl(signedUrl));
+  const response = await fetchRendererMedia(
+    readableDesktopStorageUrl(signedUrl)
+  );
   if (response.status === HTTP_STATUS_NOT_FOUND) {
     throw new Error("File not found");
   }

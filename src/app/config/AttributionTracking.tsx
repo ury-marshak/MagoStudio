@@ -3,6 +3,8 @@ import { useMountEffect } from "@hooks/useMountEffect";
 import { useSession, useUser } from "@platform/identity";
 import { useEffect, useRef } from "react";
 
+import { isCloudAccountActive } from "@/platform/cloudAccount";
+
 import { buildAttributionPatch } from "./utils/buildAttributionPatch";
 import { buildUtmMetadata } from "./utils/buildUtmMetadata";
 import { enrichUnsafeMetadata } from "./utils/enrichUnsafeMetadata";
@@ -16,6 +18,7 @@ export function AttributionTracking(): null {
   const hasFlushed = useRef(false);
 
   useMountEffect(() => {
+    if (!isCloudAccountActive()) return;
     const utm = buildUtmMetadata(window.location.search);
     if (!utm) {
       return;
@@ -28,7 +31,12 @@ export function AttributionTracking(): null {
   });
 
   useEffect(() => {
-    if (typeof window === "undefined" || !isLoaded || !user) {
+    if (
+      !isCloudAccountActive() ||
+      typeof window === "undefined" ||
+      !isLoaded ||
+      !user
+    ) {
       return;
     }
 
@@ -47,6 +55,7 @@ export function AttributionTracking(): null {
       const storedCountry = user.unsafeMetadata?.country as string | undefined;
       const sessions = storedCountry ? [] : await user.getSessions();
 
+      if (!isCloudAccountActive()) return;
       const patch = buildAttributionPatch({
         pendingUtm,
         sessions,

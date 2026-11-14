@@ -1,8 +1,10 @@
 import { Widget } from "@typeform/embed-react";
+
+import { isCloudAccountActive } from "@/platform/cloudAccount";
 const TYPEFORM_FORM_ID = process.env.NEXT_PUBLIC_TYPEFORM_FORM_ID;
 
 export function PricingContactForm() {
-  if (!TYPEFORM_FORM_ID) return null;
+  if (!isCloudAccountActive() || !TYPEFORM_FORM_ID) return null;
 
   return (
     <div

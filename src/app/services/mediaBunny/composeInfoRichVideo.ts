@@ -5,6 +5,9 @@ import type {
   AudioSampleSink
 } from "mediabunny";
 
+import { readableRendererMediaUrl } from "@/platform/rendererMediaAccess";
+
+import { loadExportLatoFonts } from "./exportFonts";
 import { getKonva, getMediabunny } from "./lazyLoad";
 import { InfoRichVideoOptions } from "./types";
 
@@ -109,44 +112,13 @@ function drawImageContain(
   );
 }
 
-async function ensureLatoFont(): Promise<void> {
-  try {
-    if (typeof FontFace !== "undefined" && document.fonts) {
-      const latoRegular = new FontFace(
-        "Lato",
-        "url(https://fonts.gstatic.com/s/lato/v24/S6uyw4BMUTPHjx4wXiWtFCc.woff2)",
-        { weight: "400", style: "normal" }
-      );
-      const latoBold = new FontFace(
-        "Lato",
-        "url(https://fonts.gstatic.com/s/lato/v24/S6u9w4BMUTPHh6UVSwiPGQ3q5d0.woff2)",
-        { weight: "700", style: "normal" }
-      );
-
-      const [regular, bold] = await Promise.all([
-        latoRegular.load(),
-        latoBold.load()
-      ]);
-      document.fonts.add(regular);
-      document.fonts.add(bold);
-
-      await document.fonts.ready;
-    }
-  } catch (error) {
-    console.warn(
-      "Could not load Lato font, falling back to system font:",
-      error
-    );
-  }
-}
-
 async function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.onload = () => resolve(img);
     img.onerror = () => reject(new Error(`Failed to load image: ${url}`));
-    img.src = url;
+    img.src = readableRendererMediaUrl(url);
   });
 }
 
@@ -385,7 +357,7 @@ export async function composeInfoRichVideo(
     ] = await Promise.all([getMediabunny(), getKonva()]);
 
     const renderVideo = new Input({
-      source: new UrlSource(renderVideoUrl),
+      source: new UrlSource(readableRendererMediaUrl(renderVideoUrl)),
       formats: ALL_FORMATS
     });
 
@@ -423,7 +395,7 @@ export async function composeInfoRichVideo(
     const videoDrawHeight = videoHeight * videoScale;
     const videoContentStartY = Math.round((canvasHeight - videoDrawHeight) / 2);
 
-    await ensureLatoFont();
+    await loadExportLatoFonts(["400", "700"]);
 
     let imageRefImg: HTMLImageElement | null = null;
     if (imageRefUrl) {

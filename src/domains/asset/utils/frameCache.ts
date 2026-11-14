@@ -1,3 +1,5 @@
+import { fetchRendererMedia } from "@/platform/rendererMediaAccess";
+
 import { cacheGet, cacheSet } from "./cacheStorage";
 
 function getFrameCacheKey(
@@ -44,7 +46,7 @@ export async function saveFrameToCache(
 ): Promise<void> {
   try {
     const key = getFrameCacheKey(assetId, frameNumber, fps);
-    const response = await fetch(dataUrl);
+    const response = await fetchRendererMedia(dataUrl);
     const blob = await response.blob();
     await cacheSet("frame", key, blob);
   } catch (error) {

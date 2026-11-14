@@ -18,11 +18,13 @@ export const installOfflineRenderer = (
   config: CloudConfig
 ): void => {
   const origin = `https://${config.rendererHost}`;
-  const policy = buildContentSecurityPolicy(config);
+  const policy = buildContentSecurityPolicy(config, false);
   session.protocol.handle("https", async (request) => {
     const url = new URL(request.url);
     if (url.origin !== origin) {
-      return net.fetch(request, { bypassCustomProtocolHandlers: true });
+      // This handler is installed only for the account-free bundled renderer.
+      // Historical media/SDK URLs must not be forwarded via Electron net.fetch.
+      return new Response("Cloud account required", { status: 403 });
     }
     if (request.method !== "GET" && request.method !== "HEAD") {
       return new Response("Method not allowed", { status: 405 });

@@ -1,9 +1,11 @@
 import { ImageAssetResponse } from "@domains/asset/interface";
 
+import { fetchRendererMedia } from "@/platform/rendererMediaAccess";
+
 export const createFileFromImageData = async (
   imageData: ImageAssetResponse
 ): Promise<File> => {
-  const response = await fetch(imageData.urlToUse);
+  const response = await fetchRendererMedia(imageData.urlToUse);
   const blob = await response.blob();
 
   const file = new File([blob], imageData.asset.name, {

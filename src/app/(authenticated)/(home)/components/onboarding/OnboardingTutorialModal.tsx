@@ -13,6 +13,8 @@ import { Button } from "react-aria-components/Button";
 import { useHotkeys } from "react-hotkeys-hook";
 import { useTranslation } from "react-i18next";
 
+import { isCloudAccountActive, openExternalUrl } from "@/platform/cloudAccount";
+
 const thumbnailSrc = `https://img.youtube.com/vi/${ONBOARDING_TUTORIAL_VIDEO_ID}/maxresdefault.jpg`;
 const embedSrc = `https://www.youtube.com/embed/${ONBOARDING_TUTORIAL_VIDEO_ID}?autoplay=1&rel=0`;
 
@@ -24,7 +26,16 @@ export const OnboardingTutorialModal: React.FC = () => {
   const searchParams = useSearchParams();
   const [hasStarted, setHasStarted] = useState(false);
 
-  const handleStart = () => setHasStarted(true);
+  const allowEmbed = isCloudAccountActive();
+  const handleStart = () => {
+    if (!isCloudAccountActive()) {
+      openExternalUrl(
+        `https://www.youtube.com/watch?v=${ONBOARDING_TUTORIAL_VIDEO_ID}`
+      );
+      return;
+    }
+    setHasStarted(true);
+  };
 
   const handleClose = () => {
     setProgress((prev) => ({ ...prev, step: "complete" }));
@@ -55,7 +66,7 @@ export const OnboardingTutorialModal: React.FC = () => {
         {t("titles.onboarding_tutorial.label")}
       </Text>
       <div className="min-h-0 w-full flex-1 overflow-hidden rounded-[20px] bg-surface-bg-300">
-        {hasStarted ? (
+        {hasStarted && allowEmbed ? (
           <iframe
             className="size-full"
             src={embedSrc}
@@ -70,7 +81,7 @@ export const OnboardingTutorialModal: React.FC = () => {
             className="group relative block size-full"
           >
             <img
-              src={thumbnailSrc}
+              src={allowEmbed ? thumbnailSrc : undefined}
               alt=""
               draggable={false}
               className="pointer-events-none absolute inset-0 size-full object-contain"

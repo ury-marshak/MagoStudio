@@ -1,3 +1,5 @@
+import { readableRendererMediaUrl } from "@/platform/rendererMediaAccess";
+
 import { getMediabunny } from "./lazyLoad";
 import { FilmstripOptions } from "./types";
 
@@ -24,7 +26,7 @@ export async function extractFrameFromVideo({
     const input = new Input({
       source:
         typeof videoSource === "string"
-          ? new UrlSource(videoSource)
+          ? new UrlSource(readableRendererMediaUrl(videoSource))
           : new BlobSource(videoSource),
       formats: ALL_FORMATS
     });
@@ -96,7 +98,7 @@ export async function generateFilmstrip(
     const input = new Input({
       source:
         typeof videoSource === "string"
-          ? new UrlSource(videoSource)
+          ? new UrlSource(readableRendererMediaUrl(videoSource))
           : new BlobSource(videoSource),
       formats: ALL_FORMATS
     });

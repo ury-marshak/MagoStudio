@@ -5,6 +5,9 @@ import type {
   AudioSampleSink
 } from "mediabunny";
 
+import { readableRendererMediaUrl } from "@/platform/rendererMediaAccess";
+
+import { loadExportLatoFonts } from "./exportFonts";
 import { getKonva, getMediabunny } from "./lazyLoad";
 import { SbsVideoOptions } from "./types";
 
@@ -131,30 +134,6 @@ async function loadMagoLogo(): Promise<HTMLImageElement> {
   });
 }
 
-async function ensureLatoFont(): Promise<void> {
-  try {
-    if (typeof FontFace !== "undefined" && document.fonts) {
-      const latoFont = new FontFace(
-        "Lato",
-        "url(https://fonts.gstatic.com/s/lato/v24/S6uyw4BMUTPHjx4wXiWtFCc.woff2)",
-        { weight: "400", style: "normal" }
-      );
-
-      await latoFont.load();
-      document.fonts.add(latoFont);
-
-      await document.fonts.load(`${TEXT_FONT_SIZE}px "Lato"`);
-
-      await document.fonts.ready;
-    }
-  } catch (error) {
-    console.warn(
-      "Could not load Lato font, falling back to system font:",
-      error
-    );
-  }
-}
-
 export async function composeSbsVideo(options: SbsVideoOptions): Promise<Blob> {
   const {
     inputVideoUrl,
@@ -187,12 +166,12 @@ export async function composeSbsVideo(options: SbsVideoOptions): Promise<Blob> {
     ] = await Promise.all([getMediabunny(), getKonva()]);
 
     const inputVideo = new Input({
-      source: new UrlSource(inputVideoUrl),
+      source: new UrlSource(readableRendererMediaUrl(inputVideoUrl)),
       formats: ALL_FORMATS
     });
 
     const renderVideo = new Input({
-      source: new UrlSource(renderVideoUrl),
+      source: new UrlSource(readableRendererMediaUrl(renderVideoUrl)),
       formats: ALL_FORMATS
     });
 
@@ -245,7 +224,7 @@ export async function composeSbsVideo(options: SbsVideoOptions): Promise<Blob> {
     stage = stageResult.stage;
     const layer = stageResult.layer;
 
-    await ensureLatoFont();
+    await loadExportLatoFonts(["400"]);
 
     const canvas = stage.toCanvas() as HTMLCanvasElement;
 

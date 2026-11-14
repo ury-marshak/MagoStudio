@@ -1,5 +1,4 @@
 import { fetchFileBypassingPlaybackCache } from "@app/utils/files/fetchFileBypassingPlaybackCache";
-import { toDesktopCloudStorageUrl } from "@domains/asset/utils/toDesktopCloudStorageUrl";
 import { getTrackAssetId } from "@domains/track/utils/getTrackAssetId";
 import { getTrackDuration } from "@domains/track/utils/getTrackDuration";
 import { getTrackRenderSettings } from "@domains/track/utils/getTrackRenderSettings";
@@ -12,6 +11,7 @@ import { Layer, LayerType } from "@schemas/layer";
 
 import { isCloudAccountActive } from "@/platform/cloudAccount";
 import { isLocalApp } from "@/platform/localDesktop";
+import { readableDesktopStorageUrl } from "@/platform/rendererMediaAccess";
 
 import { downloadLayerVideo } from "./downloadFiles";
 import { saveLayerDownloadToDisk } from "./saveLayerDownloadToDisk";
@@ -256,7 +256,7 @@ export const handleDownloadEXR = async ({
 };
 
 export const downloadFile = async (url: string, filename: string) => {
-  const readableUrl = toDesktopCloudStorageUrl(url);
+  const readableUrl = readableDesktopStorageUrl(url);
   try {
     const response = await fetchFileBypassingPlaybackCache(readableUrl);
     if (!response.ok) {

@@ -1,6 +1,8 @@
 /* oxlint-disable custom-react/no-use-effect -- syncs to an external resource: the image at imageUrl must load before its intrinsic dimensions can be read, and the URL changes as thumbnails resolve */
 import { useEffect, useState } from "react";
 
+import { readableRendererMediaUrl } from "@/platform/rendererMediaAccess";
+
 type ImageOrientationMeasurement = {
   measuredImageUrl: string;
   isImagePortrait: boolean;
@@ -12,6 +14,12 @@ export function useIsImagePortrait(imageUrl: string | undefined) {
   useEffect(() => {
     if (!imageUrl) return;
 
+    let readableUrl: string;
+    try {
+      readableUrl = readableRendererMediaUrl(imageUrl);
+    } catch {
+      return;
+    }
     const image = new Image();
     let hasStoppedListening = false;
 
@@ -22,7 +30,7 @@ export function useIsImagePortrait(imageUrl: string | undefined) {
         isImagePortrait: image.naturalHeight > image.naturalWidth
       });
     };
-    image.src = imageUrl;
+    image.src = readableUrl;
 
     return () => {
       hasStoppedListening = true;

@@ -1,5 +1,6 @@
+import { readableDesktopStorageUrl } from "@/platform/rendererMediaAccess";
+
 import { getCachedVideoBlob } from "./getCachedVideoBlob";
-import { toDesktopCloudStorageUrl } from "./toDesktopCloudStorageUrl";
 
 /** A render that has not landed can answer `200` with nothing behind it, and a read taken
  * mid-write can stop short. An empty body is left uncached and the direct URL handed back, so
@@ -15,6 +16,6 @@ export const cacheVideoUrl = async (
     return { urlToUse: blobUrl, isCached: true };
   } catch (error) {
     console.warn("Error downloading/caching video, using direct URL:", error);
-    return { urlToUse: toDesktopCloudStorageUrl(url), isCached: false };
+    return { urlToUse: readableDesktopStorageUrl(url), isCached: false };
   }
 };

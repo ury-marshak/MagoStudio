@@ -60,14 +60,26 @@ describe("offline renderer", () => {
     expect(response.headers.get("Cache-Control")).toContain("immutable");
   });
 
-  it("forwards other origins without re-entering its own handler", async () => {
-    const remote = new Response("remote");
-    mocks.fetch.mockResolvedValue(remote);
-    const request = new Request("https://example.com/");
-    expect(await handler(request)).toBe(remote);
-    expect(mocks.fetch).toHaveBeenCalledExactlyOnceWith(request, {
-      bypassCustomProtocolHandlers: true
-    });
+  it.each([
+    "https://example.com/",
+    "https://img.clerk.com/avatar.png",
+    "https://www.youtube.com/embed/tutorial",
+    "https://mago-s3-prod.s3.amazonaws.com/historical.mp4"
+  ])("refuses non-bundle %s without Electron forwarding", async (url) => {
+    expect((await handler(new Request(url))).status).toBe(403);
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+
+  it("serves a local-only CSP for native media, fonts, scripts, frames and connections", async () => {
+    mocks.fetch.mockResolvedValue(new Response("<html>local</html>"));
+    const response = await handler(new Request(origin));
+    const policy = response.headers.get("Content-Security-Policy")!;
+    expect(policy).not.toMatch(/https?:|clerk|amazonaws|youtube/);
+    expect(policy).toContain("img-src 'self' data: blob: mago-media:");
+    expect(policy).toContain("media-src 'self' data: blob: mago-media:");
+    expect(policy).toContain("connect-src 'self' mago-media: data: blob:");
+    expect(policy).toContain("frame-src 'none'");
+    expect(policy).toContain("font-src 'self' data: blob:");
   });
 
   it("refuses traversal and writes without reading any file", async () => {

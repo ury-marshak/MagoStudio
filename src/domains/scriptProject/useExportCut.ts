@@ -4,6 +4,7 @@ import { CutShot } from "@schemas/scriptProject";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
+import { fetchRendererMedia } from "@/platform/rendererMediaAccess";
 import { queryKeys } from "@/queryKeys";
 
 import { postProjectCutExport } from "./api/postProjectCutExport";
@@ -44,7 +45,7 @@ export const useExportCut = (
   const expectedRefusal = describeCutExportRefusal(exportDryRun?.refused);
 
   const downloadStitchedFile = async (url: string) => {
-    const response = await fetch(url);
+    const response = await fetchRendererMedia(url);
     if (!response.ok) {
       throw new Error(`Downloading the cut failed with ${response.status}`);
     }

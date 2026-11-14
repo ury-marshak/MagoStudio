@@ -1,6 +1,7 @@
+import { readableDesktopStorageUrl } from "@/platform/rendererMediaAccess";
+
 import { cacheGet } from "./cacheStorage";
 import { downloadImageBlob } from "./downloadImageBlob";
-import { toDesktopCloudStorageUrl } from "./toDesktopCloudStorageUrl";
 
 const isFetchableAssetUrl = (url: string): boolean =>
   url.startsWith("https://");
@@ -16,10 +17,9 @@ export const cacheImageUrl = async (
   cacheKey: string
 ): Promise<{ urlToUse: string; isCached: boolean }> => {
   if (!isFetchableAssetUrl(url)) {
-    return { urlToUse: url, isCached: false };
+    return { urlToUse: readableDesktopStorageUrl(url), isCached: false };
   }
 
-  const readableUrl = toDesktopCloudStorageUrl(url);
   try {
     const cachedBlob = await cacheGet("image", cacheKey);
     if (cachedBlob?.size) {
@@ -28,12 +28,12 @@ export const cacheImageUrl = async (
 
     const blob = await downloadImageBlob(url, cacheKey);
     if (!blob.size) {
-      return { urlToUse: readableUrl, isCached: false };
+      return { urlToUse: readableDesktopStorageUrl(url), isCached: false };
     }
 
     return { urlToUse: URL.createObjectURL(blob), isCached: true };
   } catch (error) {
     console.warn("Error downloading/caching image, using direct URL:", error);
-    return { urlToUse: readableUrl, isCached: false };
+    return { urlToUse: readableDesktopStorageUrl(url), isCached: false };
   }
 };

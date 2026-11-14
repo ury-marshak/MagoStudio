@@ -1,3 +1,5 @@
+import { readableRendererMediaUrl } from "@/platform/rendererMediaAccess";
+
 const DEFAULT_VIDEO_FPS = 30;
 const DEFAULT_IMAGE_QUALITY = 0.95;
 
@@ -16,6 +18,7 @@ export const captureVideoFrame = async ({
   imageFormat = "image/jpeg",
   imageQuality = DEFAULT_IMAGE_QUALITY
 }: CaptureVideoFrameOptions): Promise<string> => {
+  videoUrl = readableRendererMediaUrl(videoUrl);
   return new Promise((resolve, reject) => {
     const video = document.createElement("video");
     const canvas = document.createElement("canvas");

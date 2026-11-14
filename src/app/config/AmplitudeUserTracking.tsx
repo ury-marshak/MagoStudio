@@ -5,11 +5,13 @@ import * as amplitude from "@amplitude/analytics-browser";
 import { useUser } from "@platform/identity";
 import { useEffect } from "react";
 
+import { isCloudAccountActive } from "@/platform/cloudAccount";
+
 export const AmplitudeUserTracking = (): null => {
   const { user, isLoaded } = useUser();
 
   useEffect(() => {
-    if (!isLoaded || !user) {
+    if (!isCloudAccountActive() || !isLoaded || !user) {
       return;
     }
 

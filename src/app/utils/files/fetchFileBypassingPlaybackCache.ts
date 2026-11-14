@@ -1,3 +1,5 @@
+import { fetchRendererMedia } from "@/platform/rendererMediaAccess";
+
 export const fetchFileBypassingPlaybackCache = (
   url: string
-): Promise<Response> => fetch(url, { cache: "no-store" });
+): Promise<Response> => fetchRendererMedia(url, { cache: "no-store" });

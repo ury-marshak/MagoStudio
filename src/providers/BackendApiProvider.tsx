@@ -14,6 +14,7 @@ import {
   registerUnauthorizedHandler,
   setApiKey
 } from "@/lib/backend-api-client";
+import { isCloudAccountActive } from "@/platform/cloudAccount";
 
 export const BackendApiProvider = ({
   children
@@ -27,7 +28,7 @@ export const BackendApiProvider = ({
   useState(() => initializeBackendApiClient(getToken, { waitForApiKey: true }));
 
   useEffect(() => {
-    if (!isLoaded) return;
+    if (!isLoaded || !isCloudAccountActive()) return;
 
     if (!isSignedIn) {
       router.push(hasAccountCookie() ? "/sign-in" : "/sign-up");
@@ -44,9 +45,12 @@ export const BackendApiProvider = ({
     }
     fetchApiUrl = `${fetchApiUrl}/auth`;
 
+    let active = true;
     const fetchApiKey = async () => {
       try {
+        if (!isCloudAccountActive()) return;
         const token = await getToken({ template: "basicToken" });
+        if (!active || !isCloudAccountActive()) return;
         const response = await axios.post<{
           api_key: string;
           key_id: string;
@@ -61,8 +65,10 @@ export const BackendApiProvider = ({
           }
         );
 
+        if (!active || !isCloudAccountActive()) return;
         setApiKey(response.data.api_key);
       } catch (error) {
+        if (!active || !isCloudAccountActive()) return;
         rejectApiKeyInitialization(error);
         console.error("Failed to fetch API key:", error);
         router.push("/api-key-error");
@@ -70,6 +76,9 @@ export const BackendApiProvider = ({
     };
 
     void fetchApiKey();
+    return () => {
+      active = false;
+    };
   }, [getToken, isSignedIn, isLoaded, router]);
 
   return children;

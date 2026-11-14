@@ -130,7 +130,26 @@ export const ensureRendererCertificate = async (
   };
 };
 
-export const buildContentSecurityPolicy = (config: CloudConfig): string => {
+export const buildContentSecurityPolicy = (
+  config: CloudConfig,
+  allowCloud = true
+): string => {
+  if (!allowCloud)
+    return [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob: mago-media:",
+      "font-src 'self' data: blob:",
+      "media-src 'self' data: blob: mago-media:",
+      "worker-src 'self' blob:",
+      "connect-src 'self' mago-media: data: blob:",
+      "frame-src 'none'",
+      "form-action 'none'",
+      "object-src 'none'",
+      "base-uri 'none'",
+      "frame-ancestors 'none'"
+    ].join("; ");
   const { clerk, backend, cloudStatus, media } = cloudOrigins(config);
   const remote = (...values: (string | null)[]) =>
     values.filter((value): value is string => value !== null).join(" ");

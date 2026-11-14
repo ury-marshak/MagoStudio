@@ -1,5 +1,9 @@
+import {
+  fetchRendererMedia,
+  readableDesktopStorageUrl
+} from "@/platform/rendererMediaAccess";
+
 import { mediaDownloads } from "./mediaDownloadScheduler";
-import { toDesktopCloudStorageUrl } from "./toDesktopCloudStorageUrl";
 
 const PROGRESS_PERCENTAGE_MULTIPLIER = 100;
 
@@ -30,7 +34,9 @@ const readVideo = async (
   onProgress?: (progress: DownloadProgress) => void
 ): Promise<Blob> => {
   signal.throwIfAborted();
-  const response = await fetch(toDesktopCloudStorageUrl(url), { signal });
+  const response = await fetchRendererMedia(readableDesktopStorageUrl(url), {
+    signal
+  });
 
   if (!response.ok) {
     throw new Error(

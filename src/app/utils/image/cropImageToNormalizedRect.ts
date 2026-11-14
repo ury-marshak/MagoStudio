@@ -1,5 +1,7 @@
 import { NormalizedCropRect } from "@domains/renders/utils/cropRect";
 
+import { readableRendererMediaUrl } from "@/platform/rendererMediaAccess";
+
 const DEFAULT_IMAGE_QUALITY = 0.95;
 
 export interface CropImageOptions {
@@ -15,6 +17,7 @@ export const cropImageToNormalizedRect = async ({
   imageFormat = "image/jpeg",
   imageQuality = DEFAULT_IMAGE_QUALITY
 }: CropImageOptions): Promise<string> => {
+  imageSrc = readableRendererMediaUrl(imageSrc);
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";

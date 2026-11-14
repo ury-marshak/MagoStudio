@@ -1,8 +1,11 @@
+import { readableRendererMediaUrl } from "@/platform/rendererMediaAccess";
+
 const METADATA_TIMEOUT_MS = 10_000;
 
 export const readVideoDurationSeconds = async (
   videoUrl: string
 ): Promise<number> => {
+  videoUrl = readableRendererMediaUrl(videoUrl);
   return new Promise((resolve, reject) => {
     const video = document.createElement("video");
     let timeoutId: ReturnType<typeof setTimeout>;

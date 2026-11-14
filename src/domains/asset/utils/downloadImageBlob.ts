@@ -1,6 +1,10 @@
+import {
+  fetchRendererMedia,
+  readableDesktopStorageUrl
+} from "@/platform/rendererMediaAccess";
+
 import { cacheSet } from "./cacheStorage";
 import { mediaDownloads } from "./mediaDownloadScheduler";
-import { toDesktopCloudStorageUrl } from "./toDesktopCloudStorageUrl";
 
 export const downloadImageBlob = (
   url: string,
@@ -12,7 +16,10 @@ export const downloadImageBlob = (
     kind: "image",
     run: async (signal) => {
       signal.throwIfAborted();
-      const response = await fetch(toDesktopCloudStorageUrl(url), { signal });
+      const response = await fetchRendererMedia(
+        readableDesktopStorageUrl(url),
+        { signal }
+      );
       if (!response.ok)
         throw new Error(`Failed to fetch image: ${response.status}`);
       const blob = await response.blob();

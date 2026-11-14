@@ -3,11 +3,12 @@ import { isTrackOwnedByCloud } from "@domains/track/utils/isTrackOwnedByCloud";
 import { Layer } from "@schemas/layer";
 
 import { getLocalDesktopApi, isLocalApp } from "@/platform/localDesktop";
+import { fetchRendererMedia } from "@/platform/rendererMediaAccess";
 
 import { downloadLayerVideo } from "./downloadFiles";
 
 const readLibraryVideo = async (filepath: string): Promise<Blob> => {
-  const response = await fetch(filepath);
+  const response = await fetchRendererMedia(filepath);
   if (!response.ok) throw new Error("Local video file could not be read");
   return response.blob();
 };

@@ -6,6 +6,8 @@ import { useUser } from "@platform/identity";
 import { useEffect, useRef } from "react";
 import ReactGA from "react-ga4";
 
+import { isCloudAccountActive } from "@/platform/cloudAccount";
+
 import { enrichUnsafeMetadata } from "./utils/enrichUnsafeMetadata";
 
 declare global {
@@ -27,7 +29,7 @@ export function GoogleTag(): React.ReactNode {
   const hasSavedClientId = useRef(false);
 
   useMountEffect(() => {
-    if (!GOOGLE_TAG_ID || hasInitialized.current) {
+    if (!isCloudAccountActive() || !GOOGLE_TAG_ID || hasInitialized.current) {
       return;
     }
 
@@ -36,7 +38,12 @@ export function GoogleTag(): React.ReactNode {
   });
 
   useEffect(() => {
-    if (typeof window === "undefined" || !isLoaded || !user) {
+    if (
+      !isCloudAccountActive() ||
+      typeof window === "undefined" ||
+      !isLoaded ||
+      !user
+    ) {
       return;
     }
 
@@ -71,6 +78,7 @@ export function GoogleTag(): React.ReactNode {
 
   useEffect(() => {
     if (
+      !isCloudAccountActive() ||
       !GOOGLE_TAG_ID ||
       !hasInitialized.current ||
       hasLoggedClientId.current
@@ -78,17 +86,26 @@ export function GoogleTag(): React.ReactNode {
       return;
     }
 
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const tryGetClientId = () => {
+      if (disposed || !isCloudAccountActive()) return;
       if (typeof window.gtag !== "function") {
         clientIdAttempts.current += 1;
         if (clientIdAttempts.current < MAX_CLIENT_ID_ATTEMPTS) {
-          setTimeout(tryGetClientId, CLIENT_ID_RETRY_DELAY_MS);
+          timer = setTimeout(tryGetClientId, CLIENT_ID_RETRY_DELAY_MS);
         }
         return;
       }
 
       ReactGA.gtag("get", GOOGLE_TAG_ID, "client_id", (clientId: string) => {
-        if (!clientId || clientId.trim() === "" || hasSavedClientId.current) {
+        if (
+          disposed ||
+          !isCloudAccountActive() ||
+          !clientId ||
+          clientId.trim() === "" ||
+          hasSavedClientId.current
+        ) {
           return;
         }
 
@@ -112,6 +129,10 @@ export function GoogleTag(): React.ReactNode {
     };
 
     tryGetClientId();
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+    };
   }, [isLoaded, user]);
 
   return null;

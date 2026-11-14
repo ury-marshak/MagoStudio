@@ -1,3 +1,5 @@
+import { readableRendererMediaUrl } from "@/platform/rendererMediaAccess";
+
 const DEFAULT_IMAGE_QUALITY = 0.8;
 
 export interface ResizeImageOptions {
@@ -61,6 +63,7 @@ export const resizeImageFromUrl = async (
   const { imageFormat = "image/jpeg", imageQuality = DEFAULT_IMAGE_QUALITY } =
     options;
 
+  imageUrl = readableRendererMediaUrl(imageUrl);
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";

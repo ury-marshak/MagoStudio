@@ -2,6 +2,8 @@
 
 import Script from "next/script";
 
+import { isCloudAccountActive } from "@/platform/cloudAccount";
+
 declare global {
   interface Window {
     _rwq: string;
@@ -19,7 +21,7 @@ declare global {
 const REWARDFUL_API_KEY = process.env.NEXT_PUBLIC_REWARDFUL_API_KEY;
 
 export function RewardfulTracking(): React.ReactNode {
-  if (!REWARDFUL_API_KEY) {
+  if (!isCloudAccountActive() || !REWARDFUL_API_KEY) {
     return null;
   }
 
