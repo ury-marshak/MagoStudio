@@ -59,7 +59,13 @@ export const ScriptTab: React.FC<Props> = ({
       ? extractedTarget
       : undefined;
 
-  const { messages, isWaitingForReply, sendMessage } = useScriptChat({
+  const {
+    messages,
+    isWaitingForReply,
+    sendMessage,
+    cancelReply,
+    canCancelReply
+  } = useScriptChat({
     projectId,
     beforeSend: textAccess.ensureAccess,
     scriptBoxText: agentScriptDraft,
@@ -96,6 +102,7 @@ export const ScriptTab: React.FC<Props> = ({
         isWaitingForReply={isWaitingForReply || textAccess.isChecking}
         isScriptLockedAfterSending={isScriptLockedAfterSending}
         onDraftChange={setChatDraft}
+        onCancel={isLocalProject && canCancelReply ? cancelReply : undefined}
         onSubmit={async () => {
           const wasSent = await sendMessage(
             chatDraft,

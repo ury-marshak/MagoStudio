@@ -983,6 +983,11 @@ export interface MagoDesktopApi {
       projectId: string;
       limit?: number;
     }) => Promise<LocalScriptChatMessages>;
+    /** Cancel one pending turn, or the current project turn when ID is omitted. */
+    cancelChat: (input: {
+      projectId: string;
+      messageId?: string;
+    }) => Promise<boolean>;
     /** The local project owning an asset or sheet clip, or null for a cloud id. */
     findMedia: (query: {
       assetId?: string;
@@ -1104,6 +1109,7 @@ export const IPC_CHANNELS = {
   scriptProjectsCast: "script-projects:cast",
   scriptProjectsChatMessage: "script-projects:chat-message",
   scriptProjectsChatMessages: "script-projects:chat-messages",
+  scriptProjectsCancelChat: "script-projects:cancel-chat",
   scriptProjectsFindMedia: "script-projects:find-media",
   scriptProjectsGetRenderMetrics: "script-projects:get-render-metrics",
   scriptProjectsGenerateSheets: "script-projects:generate-sheets",

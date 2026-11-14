@@ -29,11 +29,15 @@ const toLibraryInfo = (rootPath: string): LibraryInfo => ({
 export const registerLibraryHandlers = ({
   settings,
   databaseManager,
-  repository
+  repository,
+  beforeLibraryChange,
+  afterLibraryChange
 }: {
   settings: LibrarySettings;
   databaseManager: DatabaseManager;
   repository: ProjectRepository;
+  beforeLibraryChange?: () => Promise<void>;
+  afterLibraryChange?: () => void;
 }): void => {
   ipcMain.handle(IPC_CHANNELS.libraryIssues, (event) => {
     requireTrustedSender(event);
@@ -68,6 +72,7 @@ export const registerLibraryHandlers = ({
       defaultId: backups.length
     });
     if (selected < 0 || selected >= backups.length) return;
+    await beforeLibraryChange?.();
     await databaseManager.suspendForRecovery();
     try {
       const preserved = await databaseManager.restoreBackup(
@@ -204,8 +209,10 @@ export const registerLibraryHandlers = ({
     if (result.canceled || !rootPath) return null;
 
     await settings.assertWritable(rootPath);
+    await beforeLibraryChange?.();
     await databaseManager.open(rootPath);
     await settings.setLibraryRoot(rootPath);
+    afterLibraryChange?.();
     return toLibraryInfo(rootPath);
   });
 

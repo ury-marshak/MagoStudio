@@ -203,7 +203,10 @@ export const registerScriptProjectHandlers = ({
     IPC_CHANNELS.scriptProjectsChatMessage,
     async (event, value: unknown) => {
       requireTrustedSender(event);
+      const signal = chat.getSessionSignal();
+      signal.throwIfAborted();
       await ensureDatabase();
+      signal.throwIfAborted();
       return chat.post(chatMessageInput(value));
     }
   );
@@ -212,12 +215,34 @@ export const registerScriptProjectHandlers = ({
     IPC_CHANNELS.scriptProjectsChatMessages,
     async (event, value: unknown) => {
       requireTrustedSender(event);
+      const signal = chat.getSessionSignal();
+      signal.throwIfAborted();
       await ensureDatabase();
+      signal.throwIfAborted();
       const input = optionalRecord(value, "chat messages input");
       if (!input) throw new Error("chat messages input must be an object");
       return chat.list(
         requireString(input.projectId, "projectId"),
         optionalNumber(input.limit, "limit")
+      );
+    }
+  );
+
+  ipcMain.handle(
+    IPC_CHANNELS.scriptProjectsCancelChat,
+    async (event, value: unknown) => {
+      requireTrustedSender(event);
+      const signal = chat.getSessionSignal();
+      signal.throwIfAborted();
+      await ensureDatabase();
+      signal.throwIfAborted();
+      const input = optionalRecord(value, "chat cancellation input");
+      if (!input) throw new Error("chat cancellation input must be an object");
+      return chat.cancel(
+        requireString(input.projectId, "projectId"),
+        input.messageId === undefined
+          ? undefined
+          : requireString(input.messageId, "messageId")
       );
     }
   );

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -63,7 +63,7 @@ const setup = async () => {
     settings: { type: "script_to_shots" }
   });
   const messages = new ScriptChatMessageRepository(manager);
-  return { projectId: project.id, messages };
+  return { projectId: project.id, messages, manager, libraryRoot };
 };
 
 /** A model run the test resolves by hand. */
@@ -281,5 +281,209 @@ describe("LocalScriptChatService", () => {
     await expect(
       chat.post({ projectId, message: "too late" })
     ).rejects.toThrow();
+  });
+
+  test("explicit cancellation aborts only its turn and a stale ID cannot cancel the next one", async () => {
+    const { projectId, messages } = await setup();
+    const runs = deferredRuns();
+    const signals: AbortSignal[] = [];
+    const chat = new LocalScriptChatService(
+      messages,
+      async () => {},
+      (prompt, signal) => {
+        signals.push(signal!);
+        return runs.run(prompt);
+      }
+    );
+    const first = await chat.post({
+      projectId,
+      message: "first",
+      tools: TOOLS
+    });
+    expect(await chat.cancel("another-project", first.message_id)).toBe(false);
+    expect(signals[0]!.aborted).toBe(false);
+    expect(await chat.cancel(projectId, first.message_id)).toBe(true);
+    expect(signals[0]!.aborted).toBe(true);
+    expect((await chat.list(projectId)).messages.at(-1)).toMatchObject({
+      status: "FAILED",
+      error: "the reply was cancelled"
+    });
+    const next = await chat.post({ projectId, message: "next", tools: TOOLS });
+    expect(await chat.cancel(projectId, first.message_id)).toBe(false);
+    expect(signals[1]!.aborted).toBe(false);
+    runs.resolvers[0]!(REPLY);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect((await chat.list(projectId)).messages.at(-1)).toMatchObject({
+      id: next.message_id,
+      status: "PENDING"
+    });
+    runs.resolvers[1]!(REPLY);
+    await waitFor(async () => !(await chat.list(projectId)).pending);
+    expect((await chat.list(projectId)).messages[1]?.status).toBe("FAILED");
+  });
+
+  test.each(["malformed", REPLY])(
+    "ignores a late cancelled response (%s) without repair or persistence",
+    async (response) => {
+      const { projectId, messages } = await setup();
+      const runs = deferredRuns();
+      const chat = new LocalScriptChatService(
+        messages,
+        async () => {},
+        runs.run
+      );
+      await chat.post({ projectId, message: "first", tools: TOOLS });
+      expect(await chat.cancel(projectId)).toBe(true);
+      const write = vi.spyOn(messages, "finishReply");
+      runs.resolvers[0]!(response);
+      await chat.list(projectId);
+      expect(runs.prompts).toHaveLength(1);
+      expect(write).not.toHaveBeenCalled();
+      expect((await chat.list(projectId)).pending).toBe(false);
+    }
+  );
+
+  test("cancels an active malformed-response repair", async () => {
+    const { projectId, messages } = await setup();
+    const runs = deferredRuns();
+    let signal!: AbortSignal;
+    const chat = new LocalScriptChatService(
+      messages,
+      async () => {},
+      (prompt, caller) => {
+        signal = caller!;
+        return runs.run(prompt);
+      }
+    );
+    await chat.post({ projectId, message: "first", tools: TOOLS });
+    runs.resolvers[0]!("malformed");
+    await waitFor(async () => runs.prompts.length === 2);
+    await chat.cancel(projectId);
+    expect(signal.aborted).toBe(true);
+    runs.resolvers[1]!(REPLY);
+    expect((await chat.list(projectId)).messages.at(-1)?.status).toBe("FAILED");
+  });
+
+  test("serializes a project cancellation behind a starting turn", async () => {
+    const { projectId, messages } = await setup();
+    const runs = deferredRuns();
+    const chat = new LocalScriptChatService(messages, async () => {}, runs.run);
+    const posting = chat.post({ projectId, message: "queued", tools: TOOLS });
+    const cancelling = chat.cancel(projectId);
+    const listing = chat.list(projectId);
+    await posting;
+    expect(await cancelling).toBe(true);
+    expect((await listing).pending).toBe(false);
+    runs.resolvers[0]!(REPLY);
+  });
+
+  test("suspension drains row operations, refuses queued work and does not wait for the provider", async () => {
+    const { projectId, messages } = await setup();
+    const runs = deferredRuns();
+    const chat = new LocalScriptChatService(messages, async () => {}, runs.run);
+    const accepted = await chat.post({
+      projectId,
+      message: "old library",
+      tools: TOOLS
+    });
+    let release!: () => void;
+    const originalRead = messages.listRecent.bind(messages);
+    const read = vi
+      .spyOn(messages, "listRecent")
+      .mockImplementationOnce(async (...args) => {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return originalRead(...args);
+      });
+    const listing = chat.list(projectId);
+    const rejected = expect(listing).rejects.toThrow();
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const queued = chat.post({ projectId, message: "must not start" });
+    const queuedRejection = expect(queued).rejects.toThrow();
+    let drained = false;
+    const suspended = chat.suspend().then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    release();
+    await Promise.all([suspended, rejected, queuedRejection]);
+    read.mockRestore();
+    expect((await messages.listPending(projectId))[0]?.id).toBe(
+      accepted.message_id
+    );
+    const write = vi.spyOn(messages, "finishReply");
+    chat.reset();
+    runs.resolvers[0]!("malformed");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(write).not.toHaveBeenCalled();
+    expect(runs.prompts).toHaveLength(1);
+    expect((await chat.list(projectId)).pending).toBe(false);
+    await chat.post({ projectId, message: "new library", tools: TOOLS });
+    expect(runs.prompts).toHaveLength(2);
+    runs.resolvers[1]!(REPLY);
+    await waitFor(async () => !(await chat.list(projectId)).pending);
+  });
+
+  test("cancels a persisted orphan without running inference", async () => {
+    const { projectId, messages } = await setup();
+    const { answer } = await messages.insertTurn({
+      projectId,
+      message: "orphan",
+      replyData: {}
+    });
+    const run = vi.fn();
+    const chat = new LocalScriptChatService(messages, async () => {}, run);
+    expect(await chat.cancel(projectId, answer.id)).toBe(true);
+    expect((await chat.list(projectId)).messages.at(-1)).toMatchObject({
+      status: "FAILED",
+      error: "the reply was cancelled"
+    });
+    expect(run).not.toHaveBeenCalled();
+  });
+});
+
+test("late chat completion cannot write to a replacement library with identical project/message IDs", async () => {
+  const { projectId, messages, manager, libraryRoot } = await setup();
+  const runs = deferredRuns();
+  const chat = new LocalScriptChatService(messages, async () => {}, runs.run);
+  const first = await chat.post({
+    projectId,
+    message: "old library",
+    tools: TOOLS
+  });
+  await chat.suspend();
+  manager.close();
+  const replacement = await mkdtemp(
+    path.join(tmpdir(), "mago-chat-replacement-")
+  );
+  temporaryDirectories.push(replacement);
+  await copyFile(
+    path.join(libraryRoot, "mago.sqlite3"),
+    path.join(replacement, "mago.sqlite3")
+  );
+  await manager.open(replacement);
+  chat.reset();
+  const write = vi.spyOn(messages, "finishReply");
+  runs.resolvers[0]!(REPLY);
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(write).not.toHaveBeenCalled();
+  expect((await messages.listPending(projectId))[0]?.id).toBe(first.message_id);
+  // The new session, not the old provider, owns orphan recovery.
+  expect((await chat.list(projectId)).pending).toBe(false);
+  const next = await chat.post({
+    projectId,
+    message: "new library",
+    tools: TOOLS
+  });
+  runs.resolvers[1]!(REPLY);
+  await waitFor(async () => !(await chat.list(projectId)).pending);
+  expect((await chat.list(projectId)).messages.at(-1)).toMatchObject({
+    id: next.message_id,
+    status: "COMPLETED"
   });
 });

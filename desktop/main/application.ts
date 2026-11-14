@@ -534,7 +534,9 @@ void app
     registerLibraryHandlers({
       settings: librarySettings,
       databaseManager,
-      repository: projectRepository
+      repository: projectRepository,
+      beforeLibraryChange: () => localScriptChatService.suspend(),
+      afterLibraryChange: () => localScriptChatService.reset()
     });
     registerProjectHandlers(
       projectRepository,

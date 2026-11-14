@@ -76,6 +76,7 @@ const ipcChannels = {
   scriptProjectsCast: "script-projects:cast",
   scriptProjectsChatMessage: "script-projects:chat-message",
   scriptProjectsChatMessages: "script-projects:chat-messages",
+  scriptProjectsCancelChat: "script-projects:cancel-chat",
   scriptProjectsFindMedia: "script-projects:find-media",
   scriptProjectsGetRenderMetrics: "script-projects:get-render-metrics",
   scriptProjectsGenerateSheets: "script-projects:generate-sheets",
@@ -413,6 +414,8 @@ const api: MagoDesktopApi = {
       ipcRenderer.invoke(ipcChannels.scriptProjectsChatMessage, input),
     chatMessages: (input) =>
       ipcRenderer.invoke(ipcChannels.scriptProjectsChatMessages, input),
+    cancelChat: (input) =>
+      ipcRenderer.invoke(ipcChannels.scriptProjectsCancelChat, input),
     findMedia: (query) =>
       ipcRenderer.invoke(ipcChannels.scriptProjectsFindMedia, query),
     getRenderMetrics: (assetId) =>

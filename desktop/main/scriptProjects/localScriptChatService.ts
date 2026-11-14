@@ -23,9 +23,9 @@ import {
 
 const HISTORY_DEFAULT_LIMIT = 20;
 const HISTORY_MAX_LIMIT = 100;
-
 const ORPHANED_ERROR =
   "the reply was interrupted before it finished (the app was closed or restarted)";
+const CANCELLED_ERROR = "the reply was cancelled";
 
 const errorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : "the reply failed";
@@ -36,9 +36,7 @@ const toWireMessage = (message: ScriptChatMessage) => {
     id: message.id,
     role: message.role,
     status: message.status,
-    // The cloud sends null for a reply with no text yet (PENDING) or ever
-    // (FAILED), which the renderer's schema cannot read and drops — so a
-    // failed turn never shows as failed. An empty string keeps the row.
+    // Keep failed/PENDING rows readable by the renderer schema.
     content: message.content ?? "",
     error:
       error && typeof error === "object" && "message" in error
@@ -50,25 +48,18 @@ const toWireMessage = (message: ScriptChatMessage) => {
   };
 };
 
-/**
- * The local `/chat/message`: the backend's project chat, with the Gemini call replaced by the local
- * script text model or a standalone cloud completion. Same local rows,
- * PENDING marker and history window on both routes.
- *
- * Replies run in this process, so a PENDING row this process is not running
- * was left by an earlier session and can never finish — it is failed on the
- * next read, which is what keeps the chat answerable after a restart.
- */
-export class LocalScriptChatService {
-  private readonly running = new Set<string>();
-  /** Projects whose turn is being written: its PENDING row exists before its
-   *  reply is registered as running, and must not be mistaken for an orphan. */
-  private readonly startingProjects = new Set<string>();
-  private readonly lifetime = new AbortController();
+const newSession = () => ({
+  lifetime: new AbortController(),
+  running: new Map<string, AbortController>(),
+  operations: new Map<string, Promise<unknown>>()
+});
+type Session = ReturnType<typeof newSession>;
 
-  stop(): void {
-    this.lifetime.abort();
-  }
+/** Local chat rows and inference belong to one library session. Explicit
+ * cancellation fails a turn; shutdown/library teardown leaves PENDING rows for
+ * orphan recovery. A provider ignoring abort cannot repair or persist later. */
+export class LocalScriptChatService {
+  private session = newSession();
 
   constructor(
     private readonly messages: ScriptChatMessageRepository,
@@ -79,80 +70,159 @@ export class LocalScriptChatService {
     ) => Promise<string | { content: string; model: string }>
   ) {}
 
-  async list(
+  /** IPC captures this before asynchronous database setup so an old request
+   * cannot be retargeted to a replacement library. */
+  getSessionSignal(): AbortSignal {
+    return this.session.lifetime.signal;
+  }
+
+  stop(): void {
+    this.session.lifetime.abort();
+  }
+
+  /** Drain database work, not an uncooperative provider, before replacing the DB. */
+  async suspend(): Promise<void> {
+    this.stop();
+    await Promise.allSettled(this.session.operations.values());
+  }
+
+  /** Only call after the replacement library has opened. */
+  reset(): void {
+    this.stop();
+    this.session = newSession();
+  }
+
+  private inProject<T>(
+    session: Session,
+    projectId: string,
+    operation: (signal: AbortSignal) => Promise<T>
+  ): Promise<T> {
+    const signal = session.lifetime.signal;
+    const previous = session.operations.get(projectId);
+    const task = (async () => {
+      await previous?.catch(() => {});
+      signal.throwIfAborted();
+      return operation(signal);
+    })();
+    session.operations.set(projectId, task);
+    const cleanup = () => {
+      if (session.operations.get(projectId) === task)
+        session.operations.delete(projectId);
+    };
+    void task.then(cleanup, cleanup);
+    return task;
+  }
+
+  list(
     projectId: string,
     limit = HISTORY_DEFAULT_LIMIT
   ): Promise<LocalScriptChatMessages> {
-    await this.assertLocalProject(projectId);
-    await this.expireOrphans(projectId);
-    const rows = await this.messages.listRecent(
-      projectId,
-      Math.min(Math.max(1, Math.floor(limit)), HISTORY_MAX_LIMIT)
-    );
-    return {
-      project_id: projectId,
-      pending: rows.at(-1)?.status === "PENDING",
-      messages: rows.map(toWireMessage)
-    };
+    const session = this.session;
+    return this.inProject(session, projectId, async (signal) => {
+      await this.assertLocalProject(projectId);
+      signal.throwIfAborted();
+      await this.expireOrphans(session, projectId);
+      signal.throwIfAborted();
+      const rows = await this.messages.listRecent(
+        projectId,
+        Math.min(Math.max(1, Math.floor(limit)), HISTORY_MAX_LIMIT)
+      );
+      signal.throwIfAborted();
+      return {
+        project_id: projectId,
+        pending: rows.at(-1)?.status === "PENDING",
+        messages: rows.map(toWireMessage)
+      };
+    });
   }
 
-  async post(
+  post(
     input: LocalScriptChatMessageInput
   ): Promise<LocalScriptChatMessageAccepted> {
-    this.lifetime.signal.throwIfAborted();
-    await this.assertLocalProject(input.projectId);
-    const message = input.message.trim();
-    if (!message) throw new Error("message is required");
-    const tools = toolDeclarations(input.tools);
+    const session = this.session;
+    return this.inProject(session, input.projectId, async (signal) => {
+      await this.assertLocalProject(input.projectId);
+      signal.throwIfAborted();
+      const message = input.message.trim();
+      if (!message) throw new Error("message is required");
+      const tools = toolDeclarations(input.tools);
+      await this.expireOrphans(session, input.projectId);
+      signal.throwIfAborted();
+      const [inFlight] = await this.messages.listPending(input.projectId);
+      signal.throwIfAborted();
+      if (inFlight) return this.accepted(inFlight);
 
-    await this.expireOrphans(input.projectId);
-    const [inFlight] = await this.messages.listPending(input.projectId);
-    // The cloud answers 409; the renderer treats that as accepted, so the
-    // in-flight reply is returned as the accepted one.
-    if (inFlight) return this.accepted(inFlight);
-
-    const systemPrompt =
-      input.systemPrompt?.trim() ||
-      (await this.messages.latestSystemPrompt(
-        input.projectId,
+      const systemPrompt =
+        input.systemPrompt?.trim() ||
+        (await this.messages.latestSystemPrompt(
+          input.projectId,
+          HISTORY_MAX_LIMIT
+        ));
+      signal.throwIfAborted();
+      const historyLimit = Math.min(
+        Math.max(1, Math.floor(input.historyMessages ?? HISTORY_MAX_LIMIT)),
         HISTORY_MAX_LIMIT
-      ));
-    const historyLimit = Math.min(
-      Math.max(1, Math.floor(input.historyMessages ?? HISTORY_MAX_LIMIT)),
-      HISTORY_MAX_LIMIT
-    );
-    const history = trimHistoryToWordBudget(
-      (await this.messages.listRecent(input.projectId, historyLimit))
-        .filter((row) => row.status === "COMPLETED" && row.content?.trim())
-        .map((row) => ({ role: row.role, content: row.content! })),
-      message
-    );
+      );
+      const rows = await this.messages.listRecent(
+        input.projectId,
+        historyLimit
+      );
+      signal.throwIfAborted();
+      const history = trimHistoryToWordBudget(
+        rows
+          .filter((row) => row.status === "COMPLETED" && row.content?.trim())
+          .map((row) => ({ role: row.role, content: row.content! })),
+        message
+      );
+      let answer: ScriptChatMessage;
+      try {
+        ({ answer } = await this.messages.insertTurn({
+          projectId: input.projectId,
+          message,
+          replyData: { system_prompt: systemPrompt }
+        }));
+      } catch (error) {
+        signal.throwIfAborted();
+        if (error instanceof ScriptChatReplyInFlightError)
+          return this.accepted(error.inFlight);
+        throw error;
+      }
+      signal.throwIfAborted();
+      const controller = new AbortController();
+      session.running.set(answer.id, controller);
+      void runBackgroundTask("Script chat", () =>
+        this.answer(
+          session,
+          input.projectId,
+          answer.id,
+          buildScriptChatPrompt({ systemPrompt, tools, history, message }),
+          tools,
+          AbortSignal.any([signal, controller.signal])
+        ).finally(() => session.running.delete(answer.id))
+      );
+      return this.accepted(answer);
+    });
+  }
 
-    let answer: ScriptChatMessage;
-    this.startingProjects.add(input.projectId);
-    try {
-      ({ answer } = await this.messages.insertTurn({
-        projectId: input.projectId,
-        message,
-        replyData: { system_prompt: systemPrompt }
-      }));
-      this.running.add(answer.id);
-    } catch (error) {
-      if (error instanceof ScriptChatReplyInFlightError)
-        return this.accepted(error.inFlight);
-      throw error;
-    } finally {
-      this.startingProjects.delete(input.projectId);
-    }
-
-    void runBackgroundTask("Script chat", () =>
-      this.answer(
-        answer.id,
-        buildScriptChatPrompt({ systemPrompt, tools, history, message }),
-        tools
-      ).finally(() => this.running.delete(answer.id))
-    );
-    return this.accepted(answer);
+  /** With an ID, a stale Cancel cannot cancel a newer turn. Without one,
+   * cancel the project's currently pending turn, including an orphan. */
+  cancel(projectId: string, messageId?: string): Promise<boolean> {
+    const session = this.session;
+    return this.inProject(session, projectId, async (signal) => {
+      await this.assertLocalProject(projectId);
+      signal.throwIfAborted();
+      const pending = await this.messages.listPending(projectId);
+      signal.throwIfAborted();
+      const row = pending.find(
+        (message) => !messageId || message.id === messageId
+      );
+      if (!row) return false;
+      session.running.get(row.id)?.abort();
+      return this.messages.finishReply(row.id, {
+        status: "FAILED",
+        error: CANCELLED_ERROR
+      });
+    });
   }
 
   private accepted(message: ScriptChatMessage): LocalScriptChatMessageAccepted {
@@ -163,19 +233,21 @@ export class LocalScriptChatService {
     };
   }
 
-  /** One model run, plus one repair when the answer is unusable. */
   private async answer(
+    session: Session,
+    projectId: string,
     answerId: string,
     prompt: string,
-    tools: ScriptChatToolDeclaration[]
+    tools: ScriptChatToolDeclaration[],
+    signal: AbortSignal
   ): Promise<void> {
     try {
       let reply: ScriptChatReply;
       let model = "local";
       const run = async (input: string) => {
-        this.lifetime.signal.throwIfAborted();
-        const result = await this.runChat(input, this.lifetime.signal);
-        this.lifetime.signal.throwIfAborted();
+        signal.throwIfAborted();
+        const result = await this.runChat(input, signal);
+        signal.throwIfAborted();
         if (typeof result === "string") {
           model = "local";
           return result;
@@ -187,7 +259,7 @@ export class LocalScriptChatService {
       try {
         reply = parseScriptChatReply(answer, tools);
       } catch (firstError) {
-        this.lifetime.signal.throwIfAborted();
+        signal.throwIfAborted();
         reply = parseScriptChatReply(
           await run(
             buildScriptChatRepairPrompt(prompt, errorMessage(firstError))
@@ -195,31 +267,41 @@ export class LocalScriptChatService {
           tools
         );
       }
-      await this.messages.finishReply(answerId, {
-        status: "COMPLETED",
-        model,
-        content: scriptChatReplyContent(reply),
-        functionCall: reply.functionCall,
-        functionCalls: reply.functionCalls
+      await this.inProject(session, projectId, async () => {
+        signal.throwIfAborted();
+        await this.messages.finishReply(answerId, {
+          status: "COMPLETED",
+          model,
+          content: scriptChatReplyContent(reply),
+          functionCall: reply.functionCall,
+          functionCalls: reply.functionCalls
+        });
       });
     } catch (error) {
-      // Shutdown leaves the PENDING row for existing restart/orphan recovery.
-      if (this.lifetime.signal.aborted) return;
+      // Explicit cancel owns its FAILED write; teardown preserves orphan recovery.
+      if (signal.aborted) return;
       console.error("Local script chat reply failed", error);
-      await this.messages
-        .finishReply(answerId, { status: "FAILED", error: errorMessage(error) })
-        .catch((writeError: unknown) =>
-          console.error("Could not record the failed chat reply", writeError)
-        );
+      await this.inProject(session, projectId, async () => {
+        signal.throwIfAborted();
+        await this.messages.finishReply(answerId, {
+          status: "FAILED",
+          error: errorMessage(error)
+        });
+      }).catch((writeError: unknown) => {
+        if (!signal.aborted)
+          console.error("Could not record the failed chat reply", writeError);
+      });
     }
   }
 
-  private async expireOrphans(projectId: string): Promise<void> {
-    if (this.startingProjects.has(projectId)) return;
+  private async expireOrphans(
+    session: Session,
+    projectId: string
+  ): Promise<void> {
+    const signal = session.lifetime.signal;
     for (const row of await this.messages.listPending(projectId)) {
-      // Re-checked per row: a turn may have started while the list was read.
-      if (this.running.has(row.id) || this.startingProjects.has(projectId))
-        continue;
+      signal.throwIfAborted();
+      if (session.running.has(row.id)) continue;
       await this.messages.finishReply(row.id, {
         status: "FAILED",
         error: ORPHANED_ERROR

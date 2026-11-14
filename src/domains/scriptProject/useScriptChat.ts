@@ -3,9 +3,13 @@ import {
   AgentScriptDocument,
   ScriptChatMessageRow
 } from "@schemas/scriptProject";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { queryKeys } from "@/queryKeys";
+
+import { cancelScriptChatReply } from "./api/cancelScriptChatReply";
 import { useGetScriptChatMessages } from "./data/useGetScriptChatMessages";
 import { usePostScriptChatMessage } from "./data/usePostScriptChatMessage";
 import { useReportScriptProjectFailure } from "./useReportScriptProjectFailure";
@@ -151,6 +155,30 @@ export const useScriptChat = ({
     });
 
   const isWaitingForReply = isSendPending || isReplyPending;
+  const queryClient = useQueryClient();
+  const { mutate: cancelTurn, isPending: isCancellingReply } = useMutation({
+    mutationFn: cancelScriptChatReply,
+    retry: false,
+    onSettled: (_data, _error, request) => {
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.scriptChatMessages.byProjectId(request.projectId)
+      });
+    },
+    onError: (error) => {
+      reportScriptProjectFailure(
+        error,
+        t("script_project.chat.failed.description")
+      );
+    }
+  });
+  const pendingReply = rows.find(
+    (row) => row.role === "assistant" && row.status === "PENDING"
+  );
+  const canCancelReply = !!pendingReply && !isCancellingReply;
+  const cancelReply = () => {
+    if (pendingReply && !isCancellingReply)
+      cancelTurn({ projectId, messageId: pendingReply.id });
+  };
 
   const sendMessage = async (userInput: string, currentScript?: string) => {
     const trimmedUserInput = userInput.trim();
@@ -173,5 +201,11 @@ export const useScriptChat = ({
       : [])
   ];
 
-  return { messages, isWaitingForReply, sendMessage };
+  return {
+    messages,
+    isWaitingForReply,
+    sendMessage,
+    cancelReply,
+    canCancelReply
+  };
 };

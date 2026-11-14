@@ -1,3 +1,4 @@
+import { MainButton } from "@components/MainButton";
 import { Text } from "@components/Text";
 import { ScriptChatDisplayTurn } from "@domains/scriptProject/utils/mapScriptChatMessagesToTurns";
 import { cn } from "@utils";
@@ -14,6 +15,7 @@ interface Props {
   isScriptLockedAfterSending: boolean;
   onDraftChange: (draft: string) => void;
   onSubmit: () => void;
+  onCancel?: () => void;
 }
 
 const resolveTurnContent = (
@@ -43,7 +45,8 @@ export const ScriptChat: React.FC<Props> = ({
   isWaitingForReply,
   isScriptLockedAfterSending,
   onDraftChange,
-  onSubmit
+  onSubmit,
+  onCancel
 }) => {
   const { t } = useTranslation();
   const messageListRef = useRef<HTMLDivElement>(null);
@@ -115,6 +118,16 @@ export const ScriptChat: React.FC<Props> = ({
           </Text>
         )}
       </div>
+
+      {isWaitingForReply && onCancel && (
+        <MainButton
+          colorScheme="secondary"
+          onPress={onCancel}
+          data-testid="script-chat-cancel"
+        >
+          {t("script_project.text_access_cancel.label")}
+        </MainButton>
+      )}
 
       <ScriptChatInput
         value={draft}
