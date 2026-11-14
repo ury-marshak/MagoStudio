@@ -9,6 +9,8 @@ import { Project } from "@schemas/project";
 import { Shot } from "@schemas/shot";
 import { PreviewMode } from "@store/atoms";
 
+import { isCloudAccountActive } from "@/platform/cloudAccount";
+
 import {
   BaseEventProperties,
   BuyPlanClickProperties,
@@ -78,6 +80,9 @@ const trackEventWithAmplitude = <T extends BaseEventProperties>(
   eventName: string,
   properties: Omit<T, "timestamp">
 ): void => {
+  // SDK initialization is not an authorization gate. Local editor actions
+  // must not enqueue telemetry even if another window initialized the SDK.
+  if (!isCloudAccountActive()) return;
   amplitude.track(eventName, properties);
 };
 

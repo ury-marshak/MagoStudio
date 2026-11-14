@@ -2,6 +2,8 @@
 
 import axios, { AxiosInstance, isAxiosError } from "axios";
 
+import { isCloudAccountActive } from "@/platform/cloudAccount";
+
 const HTTP_UNAUTHORIZED = 401;
 
 export const API_URL =
@@ -30,11 +32,22 @@ const ensureApiKeyReadiness = (): void => {
   void apiKeyReadyPromise.catch(() => undefined);
 };
 
+const requireCloudAccount = (): void => {
+  if (!isCloudAccountActive())
+    throw new Error(
+      "Mago Cloud requests require an explicitly selected cloud account. Local projects remain available without signing in."
+    );
+};
+
 const ensureRequestInterceptor = (): void => {
   if (requestInterceptorId !== null) return;
   requestInterceptorId = backendApiClient.interceptors.request.use(
     async (config) => {
+      // Install this independently of BackendApiProvider: an accidental API
+      // call must fail before credentials, a never-resolved key barrier or I/O.
+      requireCloudAccount();
       if (apiKeyReadyPromise) await apiKeyReadyPromise;
+      requireCloudAccount();
 
       if (getTokenFunction) {
         try {
@@ -45,12 +58,17 @@ const ensureRequestInterceptor = (): void => {
         }
       }
 
+      // Account choice normally rebuilds the window. Still refuse continuations
+      // already waiting for credentials if the bridge has since changed.
+      requireCloudAccount();
       if (apiKey) config.headers["X-API-Key"] = apiKey;
       return config;
     },
     (error) => Promise.reject(error)
   );
 };
+
+ensureRequestInterceptor();
 
 export function initializeBackendApiClient(
   getToken: (options?: { template?: string }) => Promise<string | null>,
