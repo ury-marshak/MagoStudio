@@ -15,6 +15,10 @@ import type {
 import type { ProjectRepository } from "../database/projectRepository";
 import { runBackgroundTask } from "../libraryHealth";
 import {
+  SharedInference,
+  waitForInference
+} from "../providers/sharedInference";
+import {
   createReferenceGrid,
   extractMetricsFrameGrid
 } from "../scriptProjects/localScriptMedia";
@@ -64,15 +68,22 @@ const storedDescription = (asset: LocalAsset): string | null =>
 type GenerateRequest = Omit<VisionRequest, "systemPrompt">;
 
 export class VlmService {
-  /** In-flight captions per asset, so two hooks asking at once share one run. */
-  private readonly pending = new Map<string, Promise<LocalAssetPromptResult>>();
+  private readonly lifetime = new AbortController();
+  /** Shared operations retain independent cancellation ownership per caller. */
+  private readonly pending = new SharedInference<LocalAssetPromptResult>();
+  private readonly pendingDescriptions = new SharedInference<string | null>();
 
-  /** In-flight descriptions per asset: an upload hook and an adaptation asking
-   *  for the same image at once share one caption. */
-  private readonly pendingDescriptions = new Map<
-    string,
-    Promise<string | null>
-  >();
+  stop(): void {
+    this.lifetime.abort();
+  }
+
+  private signal(caller?: AbortSignal): AbortSignal {
+    const signal = caller
+      ? AbortSignal.any([caller, this.lifetime.signal])
+      : this.lifetime.signal;
+    signal.throwIfAborted();
+    return signal;
+  }
 
   /**
    * Serialise generation so background captions do not fill the provider's
@@ -91,15 +102,16 @@ export class VlmService {
     return this.probeVision();
   }
 
-  async captionAsset(assetId: string): Promise<LocalAssetPromptResult> {
+  async captionAsset(
+    assetId: string,
+    caller?: AbortSignal
+  ): Promise<LocalAssetPromptResult> {
     if (!assetId) throw new Error("Asset ID is required");
-    const existing = this.pending.get(assetId);
-    if (existing) return existing;
-    const run = this.generateAssetPrompt(assetId).finally(() =>
-      this.pending.delete(assetId)
+    return this.pending.run(
+      assetId,
+      (signal) => this.generateAssetPrompt(assetId, this.signal(signal)),
+      this.signal(caller)
     );
-    this.pending.set(assetId, run);
-    return run;
   }
 
   /**
@@ -110,12 +122,15 @@ export class VlmService {
   async describeEntityImage(
     sourcePath: string,
     kind: string,
-    generate?: VisionGenerator
+    generate?: VisionGenerator,
+    caller?: AbortSignal
   ): Promise<string> {
+    const signal = this.signal(caller);
     const request = entityDescriptionPrompt(kind);
     const description = await this.generate(
       {
         userPrompt: request.prompt,
+        signal,
         images: [await this.loadImage(sourcePath)],
         maxTokens: DESCRIPTION_MAX_TOKENS,
         temperature: 0.1
@@ -129,15 +144,17 @@ export class VlmService {
 
   /** Same judge contract as the backend, using the configured local VLM. */
   async evaluateShotVideo(
-    input: ShotVideoEvaluationInput
+    input: ShotVideoEvaluationInput,
+    caller?: AbortSignal
   ): Promise<Record<string, unknown>> {
+    const signal = this.signal(caller);
     const timestamps = sampleMetricsTimestamps(input.durationSeconds);
     const images: Buffer[] = [];
     if (input.referencePaths.length) {
       images.push(
         input.referencePaths.length === 1
           ? await this.loadImage(input.referencePaths[0]!)
-          : this.resize(await createReferenceGrid(input.referencePaths))
+          : this.resize(await createReferenceGrid(input.referencePaths, signal))
       );
     }
     for (
@@ -149,11 +166,13 @@ export class VlmService {
         await extractMetricsFrameGrid(
           input.sourcePath,
           timestamps.slice(index, index + METRICS_FRAMES_PER_GRID),
-          input.durationSeconds
+          input.durationSeconds,
+          signal
         )
       );
     }
     const { text, model } = await this.complete({
+      signal,
       userPrompt: buildVideoMetricsPrompt(
         input.prompt,
         timestamps,
@@ -180,15 +199,16 @@ export class VlmService {
    *
    * Resolves to null for a non-image, or an image whose file is not available.
    */
-  async describeImageAsset(assetId: string): Promise<string | null> {
+  async describeImageAsset(
+    assetId: string,
+    caller?: AbortSignal
+  ): Promise<string | null> {
     if (!assetId) throw new Error("Asset ID is required");
-    const existing = this.pendingDescriptions.get(assetId);
-    if (existing) return existing;
-    const run = this.generateImageDescription(assetId).finally(() =>
-      this.pendingDescriptions.delete(assetId)
+    return this.pendingDescriptions.run(
+      assetId,
+      (signal) => this.generateImageDescription(assetId, this.signal(signal)),
+      this.signal(caller)
     );
-    this.pendingDescriptions.set(assetId, run);
-    return run;
   }
 
   /**
@@ -205,8 +225,10 @@ export class VlmService {
   }
 
   async autoPrompt(
-    input: LocalAutoPromptInput
+    input: LocalAutoPromptInput,
+    caller?: AbortSignal
   ): Promise<LocalAutoPromptResult> {
+    const signal = this.signal(caller);
     const style = this.decodeImage(input.styleReferenceImage);
     if (!style) throw new Error("styleReferenceImage is required");
 
@@ -221,6 +243,7 @@ export class VlmService {
       return {
         positive_prompt: await this.generatePositive({
           userPrompt: AUTO_PROMPT_IMG2IMG,
+          signal,
           images: [source, style],
           maxTokens: AUTO_PROMPT_MAX_TOKENS
         })
@@ -233,6 +256,7 @@ export class VlmService {
     return {
       positive_prompt: await this.generatePositive({
         userPrompt: `${AUTO_PROMPT_VIDEO2VIDEO}\n\nMotion description: ${motionDescription}`,
+        signal,
         images: [style],
         maxTokens: AUTO_PROMPT_MAX_TOKENS
       })
@@ -253,8 +277,10 @@ export class VlmService {
   }
 
   async enhancePrompt(
-    input: LocalEnhancePromptInput
+    input: LocalEnhancePromptInput,
+    caller?: AbortSignal
   ): Promise<LocalEnhancePromptResult> {
+    const signal = this.signal(caller);
     const query = input.query?.trim();
     if (!query) throw new Error("Missing required 'query' field");
     // Text only — the enhancer never had an image, and only the kontext version
@@ -262,6 +288,7 @@ export class VlmService {
     const text = await this.generate(
       {
         userPrompt: `${PROMPT_ENHANCER_KONTEXT}\n\nUser prompt: ${query}`,
+        signal,
         maxTokens: ENHANCE_MAX_TOKENS
       },
       this.generateEnhancement
@@ -270,8 +297,10 @@ export class VlmService {
   }
 
   private async generateImageDescription(
-    assetId: string
+    assetId: string,
+    signal: AbortSignal
   ): Promise<string | null> {
+    signal.throwIfAborted();
     const asset = await this.repository.getAsset(assetId);
     if (!asset || asset.type !== "IMAGE") return null;
     if ("description" in asset.data) return storedDescription(asset);
@@ -280,6 +309,7 @@ export class VlmService {
     if (!sourcePath) return null;
     const description = await this.generate({
       userPrompt: IMAGE_DESCRIPTION_PROMPT,
+      signal,
       images: [await this.loadImage(sourcePath)],
       maxTokens: DESCRIPTION_MAX_TOKENS,
       temperature: 0.1
@@ -288,6 +318,7 @@ export class VlmService {
       throw new Error("Vision model returned an empty description");
     // Whatever landed first wins: a user edit made while Qwen was running is
     // kept, and that is what the caller gets back.
+    signal.throwIfAborted();
     const updated = await this.repository.setAssetDescriptionIfAbsent(
       assetId,
       description
@@ -296,8 +327,10 @@ export class VlmService {
   }
 
   private async generateAssetPrompt(
-    assetId: string
+    assetId: string,
+    signal: AbortSignal
   ): Promise<LocalAssetPromptResult> {
+    signal.throwIfAborted();
     const asset = await this.repository.getAsset(assetId);
     if (!asset) throw new Error("Local asset not found");
 
@@ -306,9 +339,10 @@ export class VlmService {
 
     const prompt =
       asset.type === "IMAGE"
-        ? await this.captionImage(assetId)
-        : await this.captionVideo(assetId, asset);
+        ? await this.captionImage(assetId, signal)
+        : await this.captionVideo(assetId, asset, signal);
 
+    signal.throwIfAborted();
     await this.repository.setAssetPrompt(
       assetId,
       prompt as unknown as Record<string, unknown>
@@ -316,12 +350,17 @@ export class VlmService {
     return { prompt };
   }
 
-  private async captionImage(assetId: string): Promise<StructuredPrompt> {
+  private async captionImage(
+    assetId: string,
+    signal: AbortSignal
+  ): Promise<StructuredPrompt> {
+    signal.throwIfAborted();
     const sourcePath = await this.repository.assetSourcePath(assetId);
     if (!sourcePath) throw new Error("Asset file is unavailable");
     const image = await this.loadImage(sourcePath);
     return this.generateStructured({
       userPrompt: STYLE_REFERENCE_PROMPT,
+      signal,
       images: [image],
       maxTokens: CAPTION_MAX_TOKENS
     });
@@ -329,8 +368,10 @@ export class VlmService {
 
   private async captionVideo(
     assetId: string,
-    asset: LocalAsset
+    asset: LocalAsset,
+    signal: AbortSignal
   ): Promise<StructuredPrompt> {
+    signal.throwIfAborted();
     const sourcePath = await this.repository.assetSourcePath(assetId);
     if (!sourcePath) throw new Error("Asset file is unavailable");
     const totalFrames = Number(asset.data.total_frames) || 0;
@@ -338,10 +379,12 @@ export class VlmService {
       throw new Error("Video asset has no frame count to sample from");
     const { firstFrame, grids } = await extractVideoCaptionFrames({
       sourcePath,
+      signal,
       totalFrames
     });
     return this.generateStructured({
       userPrompt: VIDEO_DESCRIPTION_PROMPT,
+      signal,
       images: [firstFrame, ...grids],
       maxTokens: CAPTION_MAX_TOKENS
     });
@@ -397,19 +440,24 @@ export class VlmService {
   }
 
   private complete(request: GenerateRequest, generate = this.generateVision) {
+    const signal = this.signal(request.signal);
     const task = this.queue.then(async () => {
+      signal.throwIfAborted();
       const { text, model } = await generate({
         systemPrompt: SYSTEM_PROMPT,
-        ...request
+        ...request,
+        signal
       });
+      // Even a provider that resolves after abort must not trigger repair or writes.
+      signal.throwIfAborted();
       return { text: text.trim(), model };
     });
-    // Keep the chain alive after a failed job.
+    // Keep serialization until the provider settles, even if a caller leaves.
     this.queue = task.then(
       () => undefined,
       () => undefined
     );
-    return task;
+    return waitForInference(task, signal);
   }
 
   private async loadImage(sourcePath: string): Promise<Buffer> {

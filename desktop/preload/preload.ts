@@ -109,6 +109,7 @@ const ipcChannels = {
   vlmSaveAutoPrompt: "vlm:save-auto-prompt",
   vlmEnhancePrompt: "vlm:enhance-prompt",
   vlmAdaptI2vPrompt: "vlm:adapt-i2v-prompt",
+  vlmCancel: "vlm:cancel",
   videoRendersSubmit: "video-renders:submit",
   tracksCreate: "tracks:create",
   tracksUpdate: "tracks:update",
@@ -333,15 +334,17 @@ const api: MagoDesktopApi = {
   vlm: {
     status: () => ipcRenderer.invoke(ipcChannels.vlmStatus),
     hasExternalText: () => ipcRenderer.invoke(ipcChannels.vlmHasExternalText),
-    captionAsset: (assetId) =>
-      ipcRenderer.invoke(ipcChannels.vlmCaptionAsset, assetId),
-    autoPrompt: (input) => ipcRenderer.invoke(ipcChannels.vlmAutoPrompt, input),
+    captionAsset: (assetId, requestId) =>
+      ipcRenderer.invoke(ipcChannels.vlmCaptionAsset, assetId, requestId),
+    autoPrompt: (input, requestId) =>
+      ipcRenderer.invoke(ipcChannels.vlmAutoPrompt, input, requestId),
+    cancel: (requestId) => ipcRenderer.invoke(ipcChannels.vlmCancel, requestId),
     saveAutoPrompt: (input) =>
       ipcRenderer.invoke(ipcChannels.vlmSaveAutoPrompt, input),
-    enhancePrompt: (input) =>
-      ipcRenderer.invoke(ipcChannels.vlmEnhancePrompt, input),
-    adaptI2vPrompt: (input) =>
-      ipcRenderer.invoke(ipcChannels.vlmAdaptI2vPrompt, input)
+    enhancePrompt: (input, requestId) =>
+      ipcRenderer.invoke(ipcChannels.vlmEnhancePrompt, input, requestId),
+    adaptI2vPrompt: (input, requestId) =>
+      ipcRenderer.invoke(ipcChannels.vlmAdaptI2vPrompt, input, requestId)
   },
   videoRenders: {
     submit: (input) => ipcRenderer.invoke(ipcChannels.videoRendersSubmit, input)

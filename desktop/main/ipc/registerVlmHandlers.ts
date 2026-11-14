@@ -12,6 +12,7 @@ import {
 import type { LocalI2vPromptAdapter } from "../vlm/localI2vPromptAdapter";
 import { VlmService } from "../vlm/vlmService";
 
+import { InferenceRequests } from "./inferenceRequests";
 import { requireTrustedSender } from "./trustedSender";
 
 const record = (value: unknown): Record<string, unknown> => {
@@ -103,7 +104,12 @@ export const registerVlmHandlers = (
   service: VlmService,
   i2vPromptAdapter: LocalI2vPromptAdapter,
   hasExternalText: () => Promise<boolean>
-): void => {
+): (() => void) => {
+  const requests = new InferenceRequests();
+  ipcMain.handle(IPC_CHANNELS.vlmCancel, (event, requestId) => {
+    requireTrustedSender(event);
+    requests.cancel(event.sender, requestId);
+  });
   ipcMain.handle(IPC_CHANNELS.vlmStatus, async (event) => {
     requireTrustedSender(event);
     return service.status();
@@ -112,24 +118,49 @@ export const registerVlmHandlers = (
     requireTrustedSender(event);
     return hasExternalText();
   });
-  ipcMain.handle(IPC_CHANNELS.vlmCaptionAsset, async (event, assetId) => {
-    requireTrustedSender(event);
-    return service.captionAsset(text(assetId, "assetId"));
-  });
-  ipcMain.handle(IPC_CHANNELS.vlmAutoPrompt, async (event, input) => {
-    requireTrustedSender(event);
-    return service.autoPrompt(autoPromptInput(input));
-  });
+  ipcMain.handle(
+    IPC_CHANNELS.vlmCaptionAsset,
+    async (event, assetId, requestId) => {
+      requireTrustedSender(event);
+      const id = text(assetId, "assetId");
+      return requests.run(event.sender, requestId, (signal) =>
+        service.captionAsset(id, signal)
+      );
+    }
+  );
+  ipcMain.handle(
+    IPC_CHANNELS.vlmAutoPrompt,
+    async (event, input, requestId) => {
+      requireTrustedSender(event);
+      const parsed = autoPromptInput(input);
+      return requests.run(event.sender, requestId, (signal) =>
+        service.autoPrompt(parsed, signal)
+      );
+    }
+  );
   ipcMain.handle(IPC_CHANNELS.vlmSaveAutoPrompt, async (event, input) => {
     requireTrustedSender(event);
     return service.saveAutoPrompt(autoPromptSaveInput(input));
   });
-  ipcMain.handle(IPC_CHANNELS.vlmEnhancePrompt, async (event, input) => {
-    requireTrustedSender(event);
-    return service.enhancePrompt(enhancePromptInput(input));
-  });
-  ipcMain.handle(IPC_CHANNELS.vlmAdaptI2vPrompt, async (event, input) => {
-    requireTrustedSender(event);
-    return i2vPromptAdapter.adapt(adaptI2vPromptInput(input));
-  });
+  ipcMain.handle(
+    IPC_CHANNELS.vlmEnhancePrompt,
+    async (event, input, requestId) => {
+      requireTrustedSender(event);
+      const parsed = enhancePromptInput(input);
+      return requests.run(event.sender, requestId, (signal) =>
+        service.enhancePrompt(parsed, signal)
+      );
+    }
+  );
+  ipcMain.handle(
+    IPC_CHANNELS.vlmAdaptI2vPrompt,
+    async (event, input, requestId) => {
+      requireTrustedSender(event);
+      const parsed = adaptI2vPromptInput(input);
+      return requests.run(event.sender, requestId, (signal) =>
+        i2vPromptAdapter.adapt(parsed, signal)
+      );
+    }
+  );
+  return () => requests.stop();
 };

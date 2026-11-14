@@ -3382,6 +3382,20 @@
     "sequential_mode_key_frames": {
       "label": "Nyckelbildrutor"
     },
+    "sequential_mode_last_chunk": { "label": "Slutet av föregående video" },
+    "sequential_chunk_seconds": { "label": "Slutklippets längd (sekunder)" },
+    "sequential_video_tail_hint": {
+      "label": "fal använder 2–10 sekunder från slutet av en föregående video med konstant bildfrekvens, omvandlat till en ljudlös video med 24 bilder/s och högst 1280×720. Korta källor eller källor med varierande bildfrekvens avvisas före inskickning. Videoreferenser kan medföra en extra kostnad."
+    },
+    "shot_blocked_fal_video_tail": {
+      "label": "H3 Max (fal) kräver ett slutklipp på 2–10 sekunder från föregående video"
+    },
+    "fal_video_tail_estimate": {
+      "label": "Grundkostnad för genererad fortsättning: cirka {{base}}. Referensexempel med enbart video: {{min}}–{{max}} för {{from}}–{{to}} s med 24 bilder/s och 16:9/9:16. Bilder ökar användningen och delar den inkluderade kvoten. Andra format, bildruteantal och kortare källor ger andra kostnader; detta är varken ett totalpris eller en prisgräns."
+    },
+    "fal_video_tail_pricing_source": {
+      "label": "Prisexempel från fal (kontrollerade 14 november 2026)"
+    },
     "sequential_key_frame_count": {
       "label": "Bildrutor att välja (1–4)"
     },

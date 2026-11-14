@@ -904,17 +904,27 @@ export interface MagoDesktopApi {
     status: () => Promise<VlmModelStatus>;
     hasExternalText: () => Promise<boolean>;
     /** Return the asset's caption, generating and persisting it if absent. */
-    captionAsset: (assetId: string) => Promise<LocalAssetPromptResult>;
-    autoPrompt: (input: LocalAutoPromptInput) => Promise<LocalAutoPromptResult>;
+    captionAsset: (
+      assetId: string,
+      requestId?: string
+    ) => Promise<LocalAssetPromptResult>;
+    autoPrompt: (
+      input: LocalAutoPromptInput,
+      requestId?: string
+    ) => Promise<LocalAutoPromptResult>;
+    /** Cancel only a request owned by this renderer. */
+    cancel: (requestId: string) => Promise<void>;
     saveAutoPrompt: (
       input: LocalAutoPromptSaveInput
     ) => Promise<LocalAsset | null>;
     enhancePrompt: (
-      input: LocalEnhancePromptInput
+      input: LocalEnhancePromptInput,
+      requestId?: string
     ) => Promise<LocalEnhancePromptResult>;
     /** MiniMax reference-prompt adaptation using desktop-managed assets. */
     adaptI2vPrompt: (
-      input: LocalAdaptI2vPromptInput
+      input: LocalAdaptI2vPromptInput,
+      requestId?: string
     ) => Promise<LocalAdaptI2vPromptResult>;
   };
   videoRenders: {
@@ -1127,6 +1137,7 @@ export const IPC_CHANNELS = {
   vlmSaveAutoPrompt: "vlm:save-auto-prompt",
   vlmEnhancePrompt: "vlm:enhance-prompt",
   vlmAdaptI2vPrompt: "vlm:adapt-i2v-prompt",
+  vlmCancel: "vlm:cancel",
   videoRendersSubmit: "video-renders:submit",
   tracksCreate: "tracks:create",
   tracksUpdate: "tracks:update",

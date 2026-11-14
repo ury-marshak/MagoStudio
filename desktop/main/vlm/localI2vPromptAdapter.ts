@@ -53,25 +53,44 @@ export class LocalI2vPromptAdapter {
     private readonly dependencies: {
       getAsset: (assetId: string) => Promise<LocalAsset | null>;
       /** Fills and returns an image's `description`, captioning it if absent. */
-      describeImage: (assetId: string) => Promise<string | null>;
+      describeImage: (
+        assetId: string,
+        signal?: AbortSignal
+      ) => Promise<string | null>;
       /** Returns a video's structured caption, generating it if absent. */
-      captionVideo: (assetId: string) => Promise<LocalAssetPrompt | null>;
-      runTextPrompt: RunTextPrompt;
+      captionVideo: (
+        assetId: string,
+        signal?: AbortSignal
+      ) => Promise<LocalAssetPrompt | null>;
+      runTextPrompt: (
+        prompt: string,
+        signal?: AbortSignal
+      ) => ReturnType<RunTextPrompt>;
     }
   ) {}
 
   async adapt(
-    input: LocalAdaptI2vPromptInput
+    input: LocalAdaptI2vPromptInput,
+    signal?: AbortSignal
   ): Promise<LocalAdaptI2vPromptResult> {
+    signal?.throwIfAborted();
     const userPrompt = input.prompt.trim();
     if (!userPrompt) throw new Error("prompt is required");
     return adaptI2vPrompt({
       userPrompt,
-      described: await this.describeReferences(input.reference_asset_ids ?? []),
+      described: await this.describeReferences(
+        input.reference_asset_ids ?? [],
+        signal
+      ),
       engine: input.engine,
       durationSeconds: input.duration_s,
       aspect: input.aspect,
-      run: this.dependencies.runTextPrompt
+      run: async (prompt) => {
+        signal?.throwIfAborted();
+        const result = await this.dependencies.runTextPrompt(prompt, signal);
+        signal?.throwIfAborted();
+        return result;
+      }
     });
   }
 
@@ -80,10 +99,12 @@ export class LocalI2vPromptAdapter {
    * order, which is what decides the slot numbers.
    */
   private async describeReferences(
-    assetIds: string[]
+    assetIds: string[],
+    signal?: AbortSignal
   ): Promise<DescribedReferences> {
     const described: DescribedReferences = { image: [], video: [], audio: [] };
     for (const assetId of assetIds) {
+      signal?.throwIfAborted();
       const asset = await this.dependencies.getAsset(assetId);
       if (!asset) throw new Error(`reference asset ${assetId} not found`);
       const kind =
@@ -96,12 +117,13 @@ export class LocalI2vPromptAdapter {
         );
       const description =
         kind === "image"
-          ? await this.describeImage(asset)
+          ? await this.describeImage(asset, signal)
           : kind === "video"
-            ? await this.describeVideo(asset)
+            ? await this.describeVideo(asset, signal)
             : storedCaption(asset);
       described[kind].push(description ?? UNKNOWN_REFERENCE[kind]);
     }
+    signal?.throwIfAborted();
     return described;
   }
 
@@ -111,13 +133,17 @@ export class LocalI2vPromptAdapter {
    * an image that predates captioning gets one. A failed caption degrades to
    * the generic description rather than failing the whole adaptation.
    */
-  private async describeImage(asset: LocalAsset): Promise<string | null> {
+  private async describeImage(
+    asset: LocalAsset,
+    signal?: AbortSignal
+  ): Promise<string | null> {
     const existing =
       text(asset.data.description) ?? text(asset.data.i2v_caption);
     if (existing || "description" in asset.data) return existing;
     try {
-      return text(await this.dependencies.describeImage(asset.id));
+      return text(await this.dependencies.describeImage(asset.id, signal));
     } catch {
+      signal?.throwIfAborted();
       return null;
     }
   }
@@ -129,14 +155,20 @@ export class LocalI2vPromptAdapter {
    * the AutoPrompt flow reads the same one) is what keeps the source video from
    * reaching the model as "a video clip whose contents could not be described".
    */
-  private async describeVideo(asset: LocalAsset): Promise<string | null> {
+  private async describeVideo(
+    asset: LocalAsset,
+    signal?: AbortSignal
+  ): Promise<string | null> {
     const existing =
       text(asset.data.i2v_caption) ??
       videoPromptText(readCachedPrompt(asset.data.prompt));
     if (existing) return existing;
     try {
-      return videoPromptText(await this.dependencies.captionVideo(asset.id));
+      return videoPromptText(
+        await this.dependencies.captionVideo(asset.id, signal)
+      );
     } catch {
+      signal?.throwIfAborted();
       return null;
     }
   }

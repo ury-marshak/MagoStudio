@@ -3,6 +3,7 @@ import { AssetPromptResponse } from "@hooks/assets/interface";
 import { AutoPromptVersionEnum } from "@hooks/types";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import { cancellableInference } from "@/platform/cancellableInference";
 
 import { formatPromptFromResponse } from "../helpers/formatPromptFromResponse";
 
@@ -17,8 +18,10 @@ import {
 /** The desktop bridge runs the same AutoPrompt templates through Qwen3-VL in
  *  ComfyUI and returns the identical `{positive_prompt}` payload. */
 const requestLocalAutoPrompt = async (
-  requestBody: AutoPromptRequestBody
+  requestBody: AutoPromptRequestBody,
+  signal?: AbortSignal
 ): Promise<AutoPromptApiResponse> => {
+  signal?.throwIfAborted();
   const { imageUrls, motionDescription } = requestBody.apiRequestData;
   const urlFor = (type: "styleReferenceImage" | "sourceVideoFrame") =>
     imageUrls.find((image) => image.type === type)?.url;
@@ -26,25 +29,35 @@ const requestLocalAutoPrompt = async (
   if (!styleReferenceImage) {
     throw new Error("styleReferenceImage is required");
   }
-  return window.mago!.vlm.autoPrompt({
-    version: requestBody.version,
-    styleReferenceImage,
-    sourceVideoFrame: urlFor("sourceVideoFrame"),
-    motionDescription
-  });
+  return cancellableInference(
+    (id) =>
+      window.mago!.vlm.autoPrompt(
+        {
+          version: requestBody.version,
+          styleReferenceImage,
+          sourceVideoFrame: urlFor("sourceVideoFrame"),
+          motionDescription
+        },
+        id
+      ),
+    signal
+  );
 };
 
 const sendAutoPromptRequest = async (
-  requestBody: AutoPromptRequestBody
+  requestBody: AutoPromptRequestBody,
+  signal?: AbortSignal
 ): Promise<AssetPromptResponse> => {
+  signal?.throwIfAborted();
   try {
     const data =
       typeof window !== "undefined" && window.mago
-        ? await requestLocalAutoPrompt(requestBody)
+        ? await requestLocalAutoPrompt(requestBody, signal)
         : (
             await backendApiClient.post<AutoPromptApiResponse>(
               "/chat/auto-prompt",
-              requestBody
+              requestBody,
+              { signal }
             )
           ).data;
 
@@ -89,8 +102,10 @@ const sendAutoPromptRequest = async (
 };
 
 export const generateNewPrompt = async (
-  params: UseAutoPromptParams
+  params: UseAutoPromptParams,
+  signal?: AbortSignal
 ): Promise<AssetPromptResponse> => {
+  signal?.throwIfAborted();
   const {
     styleReferenceImageBase64,
     sourceVideoFrameBase64,
@@ -110,22 +125,29 @@ export const generateNewPrompt = async (
     if (!sourceVideoFrameBase64) {
       throw new Error("sourceVideoFrame is required for img2img_mago");
     }
-    result = await generateAutoPrompt({
-      styleReferenceImageUrl: styleReferenceImageBase64,
-      sourceVideoFrameUrl: sourceVideoFrameBase64,
-      version
-    });
+    result = await generateAutoPrompt(
+      {
+        styleReferenceImageUrl: styleReferenceImageBase64,
+        sourceVideoFrameUrl: sourceVideoFrameBase64,
+        version
+      },
+      signal
+    );
   } else {
     if (!motionDescription?.trim()) {
       throw new Error("motionDescription is required for video2video_default");
     }
-    result = await generateAutoPrompt({
-      styleReferenceImageUrl: styleReferenceImageBase64,
-      version,
-      motionDescription
-    });
+    result = await generateAutoPrompt(
+      {
+        styleReferenceImageUrl: styleReferenceImageBase64,
+        version,
+        motionDescription
+      },
+      signal
+    );
   }
 
+  signal?.throwIfAborted();
   if (!result || !styleReferenceImageId || !videoAssetId) {
     return result;
   }
@@ -138,12 +160,15 @@ export const generateNewPrompt = async (
     formattedPrompt
   );
 
+  signal?.throwIfAborted();
   return result;
 };
 
 const generateAutoPrompt = async (
-  params: GenerateAutoPromptParams
+  params: GenerateAutoPromptParams,
+  signal?: AbortSignal
 ): Promise<AssetPromptResponse> => {
+  signal?.throwIfAborted();
   const {
     styleReferenceImageUrl,
     sourceVideoFrameUrl,
@@ -169,7 +194,7 @@ const generateAutoPrompt = async (
       version
     };
 
-    return sendAutoPromptRequest(requestBody);
+    return sendAutoPromptRequest(requestBody, signal);
   }
 
   if (version === AutoPromptVersionEnum.IMG2IMG_MAGO) {
@@ -193,7 +218,7 @@ const generateAutoPrompt = async (
       version
     };
 
-    return sendAutoPromptRequest(requestBody);
+    return sendAutoPromptRequest(requestBody, signal);
   }
 
   throw new Error(`Unknown version: ${String(version)}`);

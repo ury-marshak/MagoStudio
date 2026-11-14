@@ -36,13 +36,13 @@ export const useGetVideoAssetPrompt = ({
 
   return useQuery({
     queryKey: queryKeys.assetPrompt.byId(assetId),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       if (assetExistingPrompt) {
         return {
           prompt: assetExistingPrompt
         };
       }
-      const response = await getAssetPrompt(assetId);
+      const response = await getAssetPrompt(assetId, signal);
       // A newly generated caption also lands on the asset row, and AutoPrompt's
       // `motionDescription` reads it off the *track's* asset rather than off
       // this query. Without refreshing the asset the video2video AutoPrompt
@@ -65,7 +65,7 @@ export const useGetVideoAssetPrompt = ({
     staleTime: Infinity,
     // Locally this is a minute-long VLM run, not a cheap GET — the default
     // three retries would leave the disclosure spinning for far too long.
-    retry: 1,
+    retry: false,
     // ...and a failure must not re-submit the job every time the disclosure
     // remounts. Reachability is already tracked by useVlmStatus.
     retryOnMount: false

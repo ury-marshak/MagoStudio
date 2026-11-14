@@ -501,8 +501,11 @@ export class ComfyScriptProjectClient {
 
   /** One script-chat turn. A `write_script` answer carries a whole script, so
    *  it gets casting's budget and mode rather than a short reply's. */
-  async runScriptChat(prompt: string): Promise<string> {
-    return this.runQwen(prompt, 16_000, undefined, "direct_clean");
+  async runScriptChat(
+    prompt: string,
+    isCancelled?: () => boolean
+  ): Promise<string> {
+    return this.runQwen(prompt, 16_000, isCancelled, "direct_clean");
   }
 
   private async runQwen(

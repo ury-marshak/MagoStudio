@@ -65,7 +65,9 @@ describe("useGetImageAssetPrompt in the desktop app without the local VLM", () =
     );
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(get).toHaveBeenCalledWith("/assets/asset-1/prompt");
+    expect(get).toHaveBeenCalledWith("/assets/asset-1/prompt", {
+      signal: expect.any(AbortSignal)
+    });
     expect(captionAsset).not.toHaveBeenCalled();
   });
 

@@ -3,6 +3,7 @@ import { AutoPromptVersionEnum } from "@hooks/types";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
+import { useInferenceCancellation } from "@/domains/prompt/useInferenceCancellation";
 import { queryKeys } from "@/queryKeys";
 
 import { formatPromptFromResponse } from "../helpers/formatPromptFromResponse";
@@ -13,6 +14,7 @@ import { generateNewPrompt } from "./utils";
 
 export const useAutoPrompt = (params: UseAutoPromptParams) => {
   const queryClient = useQueryClient();
+  const { run, cancel } = useInferenceCancellation();
   const {
     styleReferenceImageId,
     videoAssetId,
@@ -60,12 +62,12 @@ export const useAutoPrompt = (params: UseAutoPromptParams) => {
     ),
     enabled: canGenerate && !existingPromptResponse,
 
-    queryFn: async () => {
-      const newPrompt = await generateNewPrompt(params);
+    queryFn: async ({ signal }) => {
+      const newPrompt = await generateNewPrompt(params, signal);
       handleNewPromptGenerated(newPrompt);
       return newPrompt;
     },
-    retry: 1,
+    retry: false,
     staleTime: Infinity,
     gcTime: Infinity
   });
@@ -74,7 +76,9 @@ export const useAutoPrompt = (params: UseAutoPromptParams) => {
     if (!canGenerate || isRegeneratingAutoPrompt) return;
     setIsRegeneratingAutoPrompt(true);
     try {
-      const newPrompt = await generateNewPrompt(params);
+      const newPrompt = await run((signal) =>
+        generateNewPrompt(params, signal)
+      );
       queryClient.setQueryData(
         queryKeys.autoPrompt.for(version, styleReferenceImageId, videoAssetId),
         newPrompt
@@ -100,6 +104,7 @@ export const useAutoPrompt = (params: UseAutoPromptParams) => {
     isFetching: queryResult.isFetching,
     isRegeneratingAutoPrompt,
     regenerateAutoPrompt,
+    cancel,
     error: queryResult.error
   };
 };

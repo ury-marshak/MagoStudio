@@ -31,13 +31,13 @@ export const useGetImageAssetPrompt = ({
 
   return useQuery({
     queryKey: queryKeys.assetPrompt.byId(assetId),
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       if (assetExistingPrompt) {
         return {
           prompt: assetExistingPrompt
         };
       }
-      return getAssetPrompt(assetId);
+      return getAssetPrompt(assetId, signal);
     },
     select: selectPromptWithFormattedText,
     // A cached prompt is a free read; generating one locally is a multi-minute
@@ -50,7 +50,7 @@ export const useGetImageAssetPrompt = ({
     staleTime: Infinity,
     // Locally this is a minute-long VLM run, not a cheap GET — the default
     // three retries would leave the disclosure spinning for far too long.
-    retry: 1,
+    retry: false,
     // ...and a failure must not re-submit the job every time the disclosure
     // remounts. Reachability is already tracked by useVlmStatus.
     retryOnMount: false

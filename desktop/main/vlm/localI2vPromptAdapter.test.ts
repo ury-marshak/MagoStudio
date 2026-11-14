@@ -62,7 +62,7 @@ describe("LocalI2vPromptAdapter", () => {
     expect(await inventoryOf(adapter, ["old"])).toContain(
       "IMAGE_1: a freshly captioned image"
     );
-    expect(dependencies.describeImage).toHaveBeenCalledWith("old");
+    expect(dependencies.describeImage).toHaveBeenCalledWith("old", undefined);
   });
 
   it("does not re-caption an image whose description was cleared", async () => {
@@ -129,5 +129,54 @@ describe("LocalI2vPromptAdapter", () => {
     await expect(
       adapter.adapt({ prompt: "she walks", reference_asset_ids: ["gone"] })
     ).rejects.toThrow("reference asset gone not found");
+  });
+
+  it.each(["IMAGE", "VIDEO"] as const)(
+    "does not swallow cancellation during %s captioning",
+    async (type) => {
+      const controller = new AbortController();
+      const describe = vi.fn(async (_id: string, signal?: AbortSignal) => {
+        expect(signal).toBe(controller.signal);
+        controller.abort();
+        throw controller.signal.reason;
+      });
+      const run = vi.fn();
+      const adapter = new LocalI2vPromptAdapter({
+        getAsset: async () => asset("reference", type),
+        describeImage: describe,
+        captionVideo: describe,
+        runTextPrompt: run
+      });
+      await expect(
+        adapter.adapt(
+          { prompt: "walk", reference_asset_ids: ["reference"] },
+          controller.signal
+        )
+      ).rejects.toThrow();
+      expect(describe).toHaveBeenCalledTimes(1);
+      expect(run).not.toHaveBeenCalled();
+    }
+  );
+
+  it("does not run a repair after a cancelled malformed completion", async () => {
+    const controller = new AbortController();
+    const { adapter, dependencies } = setup([]);
+    dependencies.runTextPrompt.mockImplementation(async () => {
+      controller.abort();
+      return "malformed";
+    });
+    await expect(
+      adapter.adapt({ prompt: "walk" }, controller.signal)
+    ).rejects.toThrow();
+    expect(dependencies.runTextPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("does no asset lookup or inference for a pre-cancelled request", async () => {
+    const { adapter, dependencies } = setup([]);
+    await expect(
+      adapter.adapt({ prompt: "walk" }, AbortSignal.abort())
+    ).rejects.toThrow();
+    expect(dependencies.getAsset).not.toHaveBeenCalled();
+    expect(dependencies.runTextPrompt).not.toHaveBeenCalled();
   });
 });

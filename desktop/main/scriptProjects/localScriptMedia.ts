@@ -98,27 +98,31 @@ export const extractFirstFrame = (filename: string): Promise<Buffer> =>
 export const extractMetricsFrameGrid = (
   filename: string,
   timestamps: number[],
-  durationSeconds: number
+  durationSeconds: number,
+  signal?: AbortSignal
 ): Promise<Buffer> => {
   const lastFrame = Math.max(0, Math.round(durationSeconds * 24) - 1);
   const indices = timestamps.map((time) =>
     Math.min(lastFrame, Math.round(time * 24))
   );
-  return runImagePipe([
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-i",
-    filename,
-    "-map",
-    "0:v:0",
-    "-vf",
-    `select='${indices.map((index) => `eq(n\\,${index})`).join("+")}',` +
-      "scale=512:512:force_original_aspect_ratio=decrease," +
-      "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black," +
-      `tile=2x2:nb_frames=${indices.length}:color=black`,
-    ...outputArgs
-  ]);
+  return runImagePipe(
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      filename,
+      "-map",
+      "0:v:0",
+      "-vf",
+      `select='${indices.map((index) => `eq(n\\,${index})`).join("+")}',` +
+        "scale=512:512:force_original_aspect_ratio=decrease," +
+        "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black," +
+        `tile=2x2:nb_frames=${indices.length}:color=black`,
+      ...outputArgs
+    ],
+    signal
+  );
 };
 
 /** Try the bounded tail first; sparse video may end well before container EOF. */
@@ -207,7 +211,10 @@ export const extractKeyframeGrid = (
   );
 };
 
-export const createReferenceGrid = (filenames: string[]): Promise<Buffer> => {
+export const createReferenceGrid = (
+  filenames: string[],
+  signal?: AbortSignal
+): Promise<Buffer> => {
   if (!filenames.length) throw new Error("A reference grid needs an image");
   const columns = Math.ceil(Math.sqrt(filenames.length));
   const rows = Math.ceil(filenames.length / columns);
@@ -225,19 +232,22 @@ export const createReferenceGrid = (filenames: string[]): Promise<Buffer> => {
   const stack =
     filenames.map((_, index) => `[v${index}]`).join("") +
     `xstack=inputs=${filenames.length}:layout=${layout}:fill=black[out]`;
-  return runImagePipe([
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    ...inputs,
-    "-filter_complex",
-    [...normalized, stack].join(";"),
-    "-map",
-    "[out]",
-    "-s",
-    `${columns * 512}x${rows * 512}`,
-    ...outputArgs
-  ]);
+  return runImagePipe(
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      ...inputs,
+      "-filter_complex",
+      [...normalized, stack].join(";"),
+      "-map",
+      "[out]",
+      "-s",
+      `${columns * 512}x${rows * 512}`,
+      ...outputArgs
+    ],
+    signal
+  );
 };
 
 export const concatenateVideos = async (

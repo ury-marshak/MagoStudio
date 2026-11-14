@@ -43,7 +43,9 @@ describe("getAssetPrompt in the desktop app", () => {
 
     const response = await getAssetPrompt("asset-1");
 
-    expect(get).toHaveBeenCalledWith("/assets/asset-1/prompt");
+    expect(get).toHaveBeenCalledWith("/assets/asset-1/prompt", {
+      signal: undefined
+    });
     expect(response).toBe(CLOUD_PROMPT);
     expect(captionAsset).not.toHaveBeenCalled();
   });
@@ -57,7 +59,9 @@ describe("getAssetPrompt in the desktop app", () => {
 
     await getAssetPrompt("asset-1");
 
-    expect(get).toHaveBeenCalledWith("/assets/asset-1/prompt");
+    expect(get).toHaveBeenCalledWith("/assets/asset-1/prompt", {
+      signal: undefined
+    });
     expect(captionAsset).not.toHaveBeenCalled();
   });
 
@@ -70,7 +74,7 @@ describe("getAssetPrompt in the desktop app", () => {
     await getAssetPrompt("asset-1");
 
     expect(get).not.toHaveBeenCalled();
-    expect(captionAsset).toHaveBeenCalledWith("asset-1");
+    expect(captionAsset).toHaveBeenCalledWith("asset-1", undefined);
   });
 
   it("captions a local-only asset with the local VLM even while signed in", async () => {
@@ -81,7 +85,7 @@ describe("getAssetPrompt in the desktop app", () => {
 
     const response = await getAssetPrompt("asset-1");
 
-    expect(captionAsset).toHaveBeenCalledWith("asset-1");
+    expect(captionAsset).toHaveBeenCalledWith("asset-1", undefined);
     expect(response).toEqual({ prompt: { positive: { content: "local" } } });
     expect(get).not.toHaveBeenCalled();
   });
@@ -94,7 +98,7 @@ describe("getAssetPrompt in the desktop app", () => {
 
     await getAssetPrompt("asset-1");
 
-    expect(captionAsset).toHaveBeenCalledWith("asset-1");
+    expect(captionAsset).toHaveBeenCalledWith("asset-1", undefined);
     expect(get).not.toHaveBeenCalled();
   });
 

@@ -123,11 +123,15 @@ const getExternalGenerator = async (capability: ExternalModelCapability) => {
 };
 const comfyVision = generateComfyVision(librarySettings);
 const generateVision: VisionGenerator = async (request) => {
+  request.signal?.throwIfAborted();
   const generate = (await getExternalGenerator("vision")) ?? comfyVision;
+  request.signal?.throwIfAborted();
   return generate(request);
 };
 const generateEnhancement: VisionGenerator = async (request) => {
+  request.signal?.throwIfAborted();
   const generate = (await getExternalGenerator("text")) ?? comfyVision;
+  request.signal?.throwIfAborted();
   return generate(request);
 };
 const vlmService = new VlmService(
@@ -169,9 +173,16 @@ const getComfyScriptClient = async () =>
   );
 const PROMPT_ADAPTATION_MAX_TOKENS = 4600;
 const SCRIPT_CHAT_MAX_TOKENS = 16_000;
-const runExternalScriptText = async (prompt: string, maxTokens: number) => {
+const runExternalScriptText = async (
+  prompt: string,
+  maxTokens: number,
+  signal?: AbortSignal
+) => {
+  signal?.throwIfAborted();
   const generate = await getExternalGenerator("text");
+  signal?.throwIfAborted();
   return generate?.({
+    signal,
     systemPrompt:
       "Return only valid JSON. The final answer's first character must be { and its last must be }.",
     userPrompt: prompt,
@@ -185,17 +196,22 @@ const describeImageLater = (assetId: string) =>
   vlmService.describeAssetLater(assetId);
 const i2vPromptAdapter = new LocalI2vPromptAdapter({
   getAsset: (assetId) => projectRepository.getAsset(assetId),
-  describeImage: (assetId) => vlmService.describeImageAsset(assetId),
-  captionVideo: async (assetId) =>
-    (await vlmService.captionAsset(assetId)).prompt,
-  runTextPrompt: async (prompt) => {
+  describeImage: (assetId, signal) =>
+    vlmService.describeImageAsset(assetId, signal),
+  captionVideo: async (assetId, signal) =>
+    (await vlmService.captionAsset(assetId, signal)).prompt,
+  runTextPrompt: async (prompt, signal) => {
     const external = await runExternalScriptText(
       prompt,
-      PROMPT_ADAPTATION_MAX_TOKENS
+      PROMPT_ADAPTATION_MAX_TOKENS,
+      signal
     );
     return external
       ? external.text
-      : (await getComfyScriptClient()).runPromptAdaptation(prompt);
+      : (await getComfyScriptClient()).runPromptAdaptation(
+          prompt,
+          () => signal?.aborted === true
+        );
   }
 });
 const textModelBridge = new TextModelBridge();
@@ -222,15 +238,25 @@ const localScriptProjectService = new LocalScriptProjectService(
 const localScriptChatService = new LocalScriptChatService(
   new ScriptChatMessageRepository(databaseManager),
   (projectId) => localScriptProjectService.assertLocalProject(projectId),
-  async (prompt) => {
+  async (prompt, signal) => {
     const external = await runExternalScriptText(
       prompt,
-      SCRIPT_CHAT_MAX_TOKENS
+      SCRIPT_CHAT_MAX_TOKENS,
+      signal
     );
     if (external) return { content: external.text, model: external.model };
-    const cloud = await textModelBridge.run("chat", { prompt });
+    signal?.throwIfAborted();
+    const cloud = await textModelBridge.run(
+      "chat",
+      { prompt },
+      () => signal?.aborted === true
+    );
     if (cloud) return { content: String(cloud.content), model: "cloud" };
-    return (await getComfyScriptClient()).runScriptChat(prompt);
+    signal?.throwIfAborted();
+    return (await getComfyScriptClient()).runScriptChat(
+      prompt,
+      () => signal?.aborted === true
+    );
   }
 );
 const cloudLinkRepository = new CloudLinkRepository(databaseManager);
@@ -254,6 +280,7 @@ const developmentRendererUrl = process.env.MAGO_RENDERER_URL;
 const cloudConfig = resolveCloudConfig();
 const RENDERER_LOAD_TIMEOUT_MS = 15_000;
 let windowsBeingCreated = 0;
+let stopVlmRequests = () => {};
 
 /**
  * Bring up the https origin the renderer is served from, and point its hostname
@@ -496,7 +523,7 @@ void app
     registerImageRenderHandlers(imageRenderService, cloudRenderJobRepository);
     registerMediaHandlers(videoFrameService);
     registerCloudStorageHandlers();
-    registerVlmHandlers(
+    stopVlmRequests = registerVlmHandlers(
       vlmService,
       i2vPromptAdapter,
       async () => !!(await externalProviders.get("text"))
@@ -565,6 +592,9 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  stopVlmRequests();
+  vlmService.stop();
+  localScriptChatService.stop();
   void rendererOriginPromise?.then((origin) => origin.close());
   imageRenderService.stop();
   closeAllComfyProgressMonitors();

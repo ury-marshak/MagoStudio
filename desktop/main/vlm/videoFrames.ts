@@ -104,27 +104,38 @@ const executable = (): string => {
   return ffmpegPath.replace("app.asar", "app.asar.unpacked");
 };
 
-const runFfmpeg = (args: string[]): Promise<void> =>
-  new Promise((resolve, reject) => {
+const runFfmpeg = async (
+  args: string[],
+  signal?: AbortSignal
+): Promise<void> => {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
     const child = spawn(executable(), args, { windowsHide: true });
     let stderr = "";
+    let failure: Error | undefined;
+    const abort = () => child.kill("SIGKILL");
+    signal?.addEventListener("abort", abort, { once: true });
     const timer = setTimeout(() => {
+      failure = new Error("ffmpeg timed out extracting frames");
       child.kill("SIGKILL");
-      reject(new Error("ffmpeg timed out extracting frames"));
     }, FFMPEG_TIMEOUT_MS);
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr = (stderr + chunk.toString()).slice(-STDERR_TAIL_CHARS);
     });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+    child.once("error", (error) => {
+      failure = error;
     });
-    child.on("close", (code) => {
+    // Wait for process exit before the caller removes its output directory.
+    child.once("close", (code) => {
       clearTimeout(timer);
-      if (code === 0) resolve();
+      signal?.removeEventListener("abort", abort);
+      if (signal?.aborted) reject(signal.reason);
+      else if (failure) reject(failure);
+      else if (code === 0) resolve();
       else reject(new Error(`ffmpeg exited with ${code}: ${stderr}`));
     });
   });
+};
 
 const readOutputs = async (directory: string): Promise<Buffer[]> => {
   const names = (await readdir(directory))
@@ -139,11 +150,14 @@ const readOutputs = async (directory: string): Promise<Buffer[]> => {
  */
 export const extractVideoCaptionFrames = async ({
   sourcePath,
-  totalFrames
+  totalFrames,
+  signal
 }: {
   sourcePath: string;
   totalFrames: number;
+  signal?: AbortSignal;
 }): Promise<VideoCaptionFrames> => {
+  signal?.throwIfAborted();
   const workDir = await mkdtemp(path.join(tmpdir(), "mago-vlm-"));
   try {
     const firstDir = path.join(workDir, "first");
@@ -152,20 +166,23 @@ export const extractVideoCaptionFrames = async ({
     await mkdir(firstDir, { recursive: true });
     await mkdir(gridDir, { recursive: true });
 
-    await runFfmpeg([
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      sourcePath,
-      "-vf",
-      `select='lt(n\\,${FIRST_FRAME_CANDIDATES})',${scaleFilter(FIRST_FRAME_MAX_RES)}`,
-      "-vsync",
-      "0",
-      "-frames:v",
-      String(FIRST_FRAME_CANDIDATES),
-      path.join(firstDir, "f_%03d.png")
-    ]);
+    await runFfmpeg(
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        sourcePath,
+        "-vf",
+        `select='lt(n\\,${FIRST_FRAME_CANDIDATES})',${scaleFilter(FIRST_FRAME_MAX_RES)}`,
+        "-vsync",
+        "0",
+        "-frames:v",
+        String(FIRST_FRAME_CANDIDATES),
+        path.join(firstDir, "f_%03d.png")
+      ],
+      signal
+    );
 
     const candidates = await readOutputs(firstDir);
     if (!candidates.length)
@@ -176,24 +193,28 @@ export const extractVideoCaptionFrames = async ({
       candidates.find((frame) => !isBlackFrame(frame)) ?? candidates[0]!;
 
     const indices = selectGridFrameIndices(totalFrames);
-    await runFfmpeg([
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      sourcePath,
-      "-vf",
+    await runFfmpeg(
       [
-        `select='${indices.map((index) => `eq(n\\,${index})`).join("+")}'`,
-        scaleFilter(GRID_FRAME_MAX_RES),
-        `tile=${GRID_COLS}x${GRID_ROWS}`
-      ].join(","),
-      "-vsync",
-      "0",
-      path.join(gridDir, "g_%03d.png")
-    ]);
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        sourcePath,
+        "-vf",
+        [
+          `select='${indices.map((index) => `eq(n\\,${index})`).join("+")}'`,
+          scaleFilter(GRID_FRAME_MAX_RES),
+          `tile=${GRID_COLS}x${GRID_ROWS}`
+        ].join(","),
+        "-vsync",
+        "0",
+        path.join(gridDir, "g_%03d.png")
+      ],
+      signal
+    );
 
     const grids = (await readOutputs(gridDir)).slice(0, GRID_LIMIT);
+    signal?.throwIfAborted();
     return { firstFrame, grids };
   } finally {
     await rm(workDir, { recursive: true, force: true });

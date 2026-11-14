@@ -31,10 +31,13 @@ describe("desktop image prompt enhancement", () => {
     await expect(
       postEnhancePrompt({ query: "A courier" }, "external")
     ).resolves.toEqual({ enhanced_prompt: "Expanded" });
-    expect(enhancePrompt).toHaveBeenCalledExactlyOnceWith({
-      query: "A courier",
-      version: undefined
-    });
+    expect(enhancePrompt).toHaveBeenCalledExactlyOnceWith(
+      {
+        query: "A courier",
+        version: undefined
+      },
+      undefined
+    );
     expect(post).not.toHaveBeenCalled();
   });
 

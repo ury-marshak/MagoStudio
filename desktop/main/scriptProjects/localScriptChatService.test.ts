@@ -232,4 +232,54 @@ describe("LocalScriptChatService", () => {
       "Local script project not found"
     );
   });
+
+  test("does not retry a transport failure as a malformed response", async () => {
+    const { projectId, messages } = await setup();
+    const run = vi.fn(async () => {
+      throw new Error("provider unavailable");
+    });
+    const chat = new LocalScriptChatService(messages, async () => {}, run);
+    await chat.post({ projectId, message: "hi", tools: TOOLS });
+    await waitFor(async () => !(await chat.list(projectId)).pending);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect((await chat.list(projectId)).messages[1]?.error).toBe(
+      "provider unavailable"
+    );
+  });
+
+  test("shutdown aborts the completion, suppresses repair and preserves orphan recovery", async () => {
+    const { projectId, messages } = await setup();
+    let finish!: (value: string) => void;
+    let signal!: AbortSignal;
+    const run = vi.fn((_prompt: string, caller?: AbortSignal) => {
+      signal = caller!;
+      return new Promise<string>((resolve) => {
+        finish = resolve;
+      });
+    });
+    const chat = new LocalScriptChatService(messages, async () => {}, run);
+    const accepted = await chat.post({
+      projectId,
+      message: "hi",
+      tools: TOOLS
+    });
+    chat.stop();
+    expect(signal.aborted).toBe(true);
+    finish("malformed");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(run).toHaveBeenCalledTimes(1);
+    expect((await messages.listPending(projectId))[0]?.id).toBe(
+      accepted.message_id
+    );
+    const restarted = new LocalScriptChatService(
+      messages,
+      async () => {},
+      vi.fn()
+    );
+    expect((await restarted.list(projectId)).pending).toBe(false);
+    await expect(
+      chat.post({ projectId, message: "too late" })
+    ).rejects.toThrow();
+  });
 });

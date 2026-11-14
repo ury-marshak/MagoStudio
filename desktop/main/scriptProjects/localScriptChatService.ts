@@ -64,12 +64,18 @@ export class LocalScriptChatService {
   /** Projects whose turn is being written: its PENDING row exists before its
    *  reply is registered as running, and must not be mistaken for an orphan. */
   private readonly startingProjects = new Set<string>();
+  private readonly lifetime = new AbortController();
+
+  stop(): void {
+    this.lifetime.abort();
+  }
 
   constructor(
     private readonly messages: ScriptChatMessageRepository,
     private readonly assertLocalProject: (projectId: string) => Promise<void>,
     private readonly runChat: (
-      prompt: string
+      prompt: string,
+      signal?: AbortSignal
     ) => Promise<string | { content: string; model: string }>
   ) {}
 
@@ -93,6 +99,7 @@ export class LocalScriptChatService {
   async post(
     input: LocalScriptChatMessageInput
   ): Promise<LocalScriptChatMessageAccepted> {
+    this.lifetime.signal.throwIfAborted();
     await this.assertLocalProject(input.projectId);
     const message = input.message.trim();
     if (!message) throw new Error("message is required");
@@ -166,7 +173,9 @@ export class LocalScriptChatService {
       let reply: ScriptChatReply;
       let model = "local";
       const run = async (input: string) => {
-        const result = await this.runChat(input);
+        this.lifetime.signal.throwIfAborted();
+        const result = await this.runChat(input, this.lifetime.signal);
+        this.lifetime.signal.throwIfAborted();
         if (typeof result === "string") {
           model = "local";
           return result;
@@ -174,9 +183,11 @@ export class LocalScriptChatService {
         model = result.model;
         return result.content;
       };
+      const answer = await run(prompt);
       try {
-        reply = parseScriptChatReply(await run(prompt), tools);
+        reply = parseScriptChatReply(answer, tools);
       } catch (firstError) {
+        this.lifetime.signal.throwIfAborted();
         reply = parseScriptChatReply(
           await run(
             buildScriptChatRepairPrompt(prompt, errorMessage(firstError))
@@ -192,6 +203,8 @@ export class LocalScriptChatService {
         functionCalls: reply.functionCalls
       });
     } catch (error) {
+      // Shutdown leaves the PENDING row for existing restart/orphan recovery.
+      if (this.lifetime.signal.aborted) return;
       console.error("Local script chat reply failed", error);
       await this.messages
         .finishReply(answerId, { status: "FAILED", error: errorMessage(error) })
