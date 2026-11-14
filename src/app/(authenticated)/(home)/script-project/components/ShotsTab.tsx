@@ -880,7 +880,7 @@ export const ShotsTab: React.FC<Props> = ({
             }
           />
         )}
-      <div className="flex items-center gap-3 border-b border-element-primary px-6 py-3">
+      <div className="flex shrink-0 flex-wrap items-start gap-3 border-b border-element-primary px-6 py-3">
         {listedShots.length > 0 && (
           <ScenesLayoutSwitcher
             scenesLayout={scenesLayout}
@@ -888,7 +888,7 @@ export const ShotsTab: React.FC<Props> = ({
           />
         )}
         {isStoryboardViewSelected && (
-          <div className="flex flex-1 items-center justify-end gap-3">
+          <div className="flex min-w-0 flex-1 flex-wrap items-end justify-end gap-3 [&>*]:shrink-0">
             {isLocalProject &&
               (!storyboardInstall.isLocalSheetModelInstalled ||
                 !isStoryboardModelInstalled) && (
@@ -986,7 +986,7 @@ export const ShotsTab: React.FC<Props> = ({
           </div>
         )}
         {isVideoViewSelected && (
-          <div className="flex flex-1 items-center justify-end gap-3">
+          <div className="flex min-w-0 flex-1 flex-wrap items-end justify-end gap-3 [&>*]:shrink-0">
             {cutShotsInActiveScript.length > 0 && (
               <Text variant="xs" color="glyph-secondary">
                 {t("script_project.cut_membership_count.label", {

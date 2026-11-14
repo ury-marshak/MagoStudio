@@ -644,8 +644,8 @@ export const AssetsTab: React.FC<Props> = ({
           setPendingPin(null);
         }}
       />
-      <div className="flex items-center gap-3 border-b border-element-primary px-6 py-3">
-        <div className="flex flex-1 items-center justify-end gap-3">
+      <div className="flex shrink-0 items-center gap-3 border-b border-element-primary px-6 py-3">
+        <div className="flex min-w-0 flex-1 flex-wrap items-end justify-end gap-3 [&>*]:shrink-0">
           {renderInProgressKeyCount > 0 && (
             <Text variant="xs" color="glyph-tertiary">
               {t("script_project.dry_run_render_in_progress.label", {

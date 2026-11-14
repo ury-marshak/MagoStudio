@@ -2,13 +2,13 @@
 
 Prepared and run 2026-11-13 with the user's **$1 combined budget approval**. Fresh packaging passed in Herdr terminal `t9` using nvm Node 24.15.0. The tested bundle is `/Users/ury/sources/MagoStudio/release/Mago Studio-darwin-arm64/Mago Studio.app`, built at 01:05:36 IST on November 13; `file` and `lipo` confirm arm64. See the detailed live result in [the integration plan](../PROVIDER_INTEGRATION_PLAN.md#packaged-storyboard-to-video-validation-2026-11-13).
 
-**Historical run, not a reusable authorization.** Future video tests must use **480P**, as requested after this run's 768P video completed. The current source now supports a resolution override; the previously tested packaged bundle predates that change. Package and inspect the controls before any new generation. The $1 approval below is complete.
+**Historical run, not a reusable authorization.** Future video tests must use **480P**, as requested after this run's 768P video completed. The current source supports a resolution override, and the November 14 package now includes it. The $1 approval below is complete.
 
-## Next controls validation (no paid requests)
+## Controls validation completed 2026-11-14 (no paid requests)
 
-- Preserve the prior bundle/profile and build the updated arm64 app using Node 24.15.0.
-- Use an isolated profile/library; inspect Providers and reference, draft/edit, storyboard, individual-shot and batch controls at normal and smaller supported window sizes.
-- Verify per-model choices, app persistence after restart, explicit project-default saving, and action override precedence. Use previews/dry runs only where they do not generate.
+- Preserved the earlier bundle/profile under `/tmp/mago-controls-validation-20261114/preserved/`; packaged the updated arm64 app with Node 24.15.0 through Herdr. Both the initial and responsive-fix builds exited 0.
+- Used a copied isolated profile/library with nonexistent Keychain account references. Inspected Providers, Assets/draft, Storyboard, individual-shot and batch controls. Fixed toolbar clipping/squeezing; geometry assertions and screenshots cover 1440×868 and 1024×700. The existing-reference edit form still needs a populated-fixture pass.
+- Verified independent per-model choices, app persistence after restart, explicit project-default saving, and individual/batch overrides. Historical accepted payloads and the two-job count are unchanged. No inference was submitted. Details, evidence paths and limitations are in the [integration plan](../PROVIDER_INTEGRATION_PLAN.md#packaged-controls-validation-2026-11-14-no-paid-requests).
 - Do not submit an inference request during this pass. A subsequent five-second 480P check needs a fresh total budget including required text composition; reuse an existing synthetic reference where practical.
 - Verify `resolution: "480P"` in the immutable saved request after an authorized submission. Record requested settings separately from measured media properties. The UI currently composes and submits as one plan: do not promise an intervening inspection pause.
 

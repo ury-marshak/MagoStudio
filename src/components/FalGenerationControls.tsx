@@ -69,7 +69,7 @@ export const FalGenerationControls = ({
   ];
   return (
     <div
-      className="flex flex-wrap items-end gap-2"
+      className="flex min-w-0 max-w-full flex-wrap items-end gap-2"
       data-testid="fal-generation-controls"
     >
       {fields.map(({ key, options }) => (
