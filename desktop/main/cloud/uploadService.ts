@@ -128,8 +128,10 @@ export class UploadService {
     filePath: string;
     presignedUrl: string;
     onProgress?: (fraction: number) => void;
+    assertAccess?: () => Promise<void>;
   }): Promise<void> {
     await uploadFileToPresignedUrl({
+      assertAccess: input.assertAccess,
       filePath: input.filePath,
       presignedUrl: input.presignedUrl,
       contentType: UPLOAD_CONTENT_TYPE,

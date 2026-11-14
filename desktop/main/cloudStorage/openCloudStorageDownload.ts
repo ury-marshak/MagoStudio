@@ -9,6 +9,7 @@ import {
 export type CloudStorageAccess = {
   allowedHosts: readonly string[];
   fetchFromCloudStorage?: FetchCloudStorage;
+  assertAccess?: () => Promise<void>;
 };
 
 export type CloudStorageDownload = {
@@ -20,6 +21,7 @@ export const openCloudStorageDownload = async ({
   url,
   allowedHosts,
   fetchFromCloudStorage,
+  assertAccess,
   signal
 }: CloudStorageAccess & {
   url: unknown;
@@ -29,6 +31,7 @@ export const openCloudStorageDownload = async ({
     url,
     allowedHosts,
     signal,
+    assertAccess,
     fetchFromCloudStorage
   });
   if (!response.ok || !response.body) {

@@ -157,8 +157,20 @@ it.each(["fal", "text", "vision"])(
       throw new Error("Unexpected HTTPS request");
     });
     const { DatabaseManager } = await import("./database/databaseManager.js");
-    const { assets, clips, imageRenderJobs, projects, shots, tracks } =
-      await import("./database/schema.js");
+    const {
+      assets,
+      clips,
+      imageRenderJobs,
+      projects,
+      shots,
+      tracks,
+      scriptProjectSnapshots,
+      scriptProjectMedia
+    } = await import("./database/schema.js");
+    const { IPC_CHANNELS } = await import("../shared/contracts.js");
+    const { resolveCloudConfig } = await import("../shared/cloudConfig.js");
+    const config = resolveCloudConfig();
+    const historicalUrl = `https://${config.cloudStorageHosts[0]}/historical.mp4`;
     const seed = new DatabaseManager();
     await seed.open(library);
     try {
@@ -204,6 +216,32 @@ it.each(["fal", "text", "vision"])(
           comfyEndpoint: "http://localhost:8188"
         })
       });
+      await db.insert(projects).values({
+        id: "cloud-history",
+        name: "Saved cloud project",
+        settingsJson: JSON.stringify({
+          origin: "cloud",
+          type: "script_to_shots"
+        })
+      });
+      await db.insert(scriptProjectSnapshots).values({
+        projectId: "cloud-history",
+        stateJson: JSON.stringify({
+          uncached: { url: historicalUrl },
+          cached: { url: "mago-media://script-project/cached" }
+        }),
+        cutJson: JSON.stringify({ versions: [{ id: "historical-output" }] })
+      });
+      await writeFile(
+        path.join(library, "cached.mp4"),
+        "local historical output"
+      );
+      await db.insert(scriptProjectMedia).values({
+        id: "cached",
+        projectId: "cloud-history",
+        sourceUrl: `${historicalUrl}/cached.mp4`,
+        relativePath: "cached.mp4"
+      });
     } finally {
       seed.close();
     }
@@ -224,6 +262,105 @@ it.each(["fal", "text", "vision"])(
     expect(mocks.protocols.has("https")).toBe(true);
     const { listLibraryIssues } = await import("./libraryHealth.js");
     expect(listLibraryIssues()).toEqual([]);
+    // Exercise the real application wiring, not renderer account gates. Saved
+    // remote URLs and trusted IPC cannot authorize uploads/downloads by themselves.
+    const invoke = (channel: string, ...args: unknown[]) =>
+      (
+        mocks.handlers.get(channel) as (
+          event: unknown,
+          ...args: unknown[]
+        ) => Promise<unknown>
+      )(
+        {
+          senderFrame: { url: `https://${config.rendererHost}/` },
+          sender: { isDestroyed: () => false, send: vi.fn() }
+        },
+        ...args
+      );
+    for (const [channel, args] of [
+      [IPC_CHANNELS.cloudPrepareUpload, [{ assetId: "asset" }]],
+      [
+        IPC_CHANNELS.cloudUploadPrepared,
+        [{ assetId: "asset", presignedUrl: "https://upload.invalid/" }]
+      ],
+      [
+        IPC_CHANNELS.cloudUploadBytes,
+        [
+          {
+            uploadId: "bytes",
+            bytes: new Uint8Array([1]),
+            presignedUrl: "https://upload.invalid/",
+            contentType: "image/png"
+          }
+        ]
+      ],
+      [
+        IPC_CHANNELS.cloudUploadAsset,
+        [{ assetId: "asset", presignedUrl: "https://upload.invalid/" }]
+      ],
+      [IPC_CHANNELS.cloudRenderRegister, [{}]],
+      [IPC_CHANNELS.cloudImageRenderRegister, [{}]],
+      [
+        IPC_CHANNELS.cloudRenderFinish,
+        [{ jobId: "historical-local", url: historicalUrl }]
+      ],
+      [
+        IPC_CHANNELS.projectsMirrorCloud,
+        [{ project: { id: "cloud-history" }, includeContent: true }]
+      ],
+      [
+        IPC_CHANNELS.projectsCacheCloudAsset,
+        [
+          {
+            projectId: "cloud-history",
+            assetId: "asset",
+            sourceUrl: historicalUrl
+          }
+        ]
+      ],
+      [IPC_CHANNELS.scriptProjectsCacheMedia, ["cloud-history", historicalUrl]],
+      [IPC_CHANNELS.filesSaveCloudStorageObjectAs, [{ url: historicalUrl }]]
+    ] as Array<[string, unknown[]]>) {
+      await expect(invoke(channel, ...args)).rejects.toThrow(
+        "explicit cloud account"
+      );
+    }
+    await invoke(IPC_CHANNELS.scriptProjectsPut, {
+      projectId: "cloud-history",
+      state: {
+        uncached: { url: historicalUrl },
+        cached: { url: "mago-media://script-project/cached" }
+      }
+    });
+    expect(
+      await invoke(IPC_CHANNELS.scriptProjectsGet, "cloud-history")
+    ).toMatchObject({
+      state: { uncached: { url: historicalUrl } },
+      cut: { versions: [{ id: "historical-output" }] }
+    });
+    expect(
+      await invoke(IPC_CHANNELS.projectsGet, "cloud-history")
+    ).toMatchObject({ id: "cloud-history", name: "Saved cloud project" });
+    const media = mocks.protocols.get("mago-media") as (
+      request: Request
+    ) => Promise<Response>;
+    expect(
+      (
+        await media(
+          new Request(
+            `mago-media://cloud-storage/?url=${encodeURIComponent(historicalUrl)}`
+          )
+        )
+      ).status
+    ).toBe(403);
+    const cached = await media(
+      new Request("mago-media://script-project/cached", {
+        headers: { range: "bytes=0-4" }
+      })
+    );
+    expect(cached.status).toBe(206);
+    expect(await cached.text()).toBe("local");
+    expect(listLibraryIssues()).toEqual([]);
     expect(transport).not.toHaveBeenCalled();
     expect(socket).not.toHaveBeenCalled();
     expect(mocks.netFetch).not.toHaveBeenCalled();
@@ -243,6 +380,17 @@ it.each(["fal", "text", "vision"])(
           id: "historical-local",
           status: "INQUEUE",
           providerRequestId: "accepted-comfy-prompt"
+        }
+      ]);
+      expect(await seed.get().select().from(scriptProjectMedia)).toMatchObject([
+        { id: "cached", relativePath: "cached.mp4" }
+      ]);
+      expect(
+        await seed.get().select().from(scriptProjectSnapshots)
+      ).toMatchObject([
+        {
+          projectId: "cloud-history",
+          cutJson: JSON.stringify({ versions: [{ id: "historical-output" }] })
         }
       ]);
     } finally {

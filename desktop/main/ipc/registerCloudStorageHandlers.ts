@@ -4,18 +4,23 @@ import { BrowserWindow, dialog, ipcMain } from "electron";
 
 import { resolveCloudConfig } from "../../shared/cloudConfig";
 import { IPC_CHANNELS } from "../../shared/contracts";
+import { requireCloudAccount } from "../cloud/requireCloudAccount";
 import { parseAllowedCloudStorageUrl } from "../cloudStorage/parseAllowedCloudStorageUrl";
 import { saveCloudStorageObject } from "../cloudStorage/saveCloudStorageObject";
+import { LibrarySettings } from "../librarySettings";
 
 import { requireTrustedSender } from "./trustedSender";
 
-export const registerCloudStorageHandlers = (): void => {
+export const registerCloudStorageHandlers = (
+  settings: LibrarySettings
+): void => {
   const allowedHosts = resolveCloudConfig().cloudStorageHosts;
 
   ipcMain.handle(
     IPC_CHANNELS.filesSaveCloudStorageObjectAs,
     async (event, value) => {
       requireTrustedSender(event);
+      await requireCloudAccount(settings);
       const window = BrowserWindow.fromWebContents(event.sender);
       if (!window) throw new Error("The Mago window is unavailable");
       const input = (value ?? {}) as { url?: unknown; suggestedName?: unknown };
@@ -30,6 +35,7 @@ export const registerCloudStorageHandlers = (): void => {
       });
       if (result.canceled || !result.filePath) return false;
       await saveCloudStorageObject({
+        assertAccess: () => requireCloudAccount(settings),
         url: objectUrl.toString(),
         allowedHosts,
         destinationPath: result.filePath

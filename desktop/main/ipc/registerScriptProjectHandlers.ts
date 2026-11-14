@@ -5,6 +5,7 @@ import {
   type LocalScriptChatMessageInput,
   type LocalScriptProjectSnapshotInput
 } from "../../shared/contracts";
+import { requireCloudAccount } from "../cloud/requireCloudAccount";
 import { DatabaseManager } from "../database/databaseManager";
 import { LibrarySettings } from "../librarySettings";
 import { LocalScriptChatService } from "../scriptProjects/localScriptChatService";
@@ -100,6 +101,7 @@ export const registerScriptProjectHandlers = ({
   handle(
     IPC_CHANNELS.scriptProjectsCacheMedia,
     async (event, projectId: unknown, sourceUrl: unknown) => {
+      await requireCloudAccount(settings);
       await ensureDatabase();
       await service.cacheMedia(
         requireString(projectId, "projectId"),
@@ -124,7 +126,10 @@ export const registerScriptProjectHandlers = ({
     const input = value as Record<string, unknown>;
     await service.putSnapshot({
       projectId: requireString(input.projectId, "projectId"),
-      metadataOnly: input.metadataOnly === true,
+      // Saving history is local. Remote URLs are not background-transfer grants.
+      metadataOnly:
+        input.metadataOnly === true ||
+        (await settings.getAppMode()) !== "cloud",
       project: optionalRecord(input.project, "project"),
       state: optionalRecord(input.state, "state"),
       scriptVersions: optionalRecord(input.scriptVersions, "scriptVersions"),

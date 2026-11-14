@@ -23,6 +23,7 @@ export interface PresignedUploadRequest {
   onProgress?: (fraction: number) => void;
   /** Test seam: lets an integration test trust a local self-signed listener. */
   agent?: Agent;
+  assertAccess?: () => Promise<void>;
 }
 
 /**
@@ -59,6 +60,7 @@ export const uploadFileToPresignedUrl = async (
   const url = assertUploadUrl(request.presignedUrl);
   const { size } = await stat(request.filePath);
   if (size === 0) throw new Error("Refusing to upload an empty file");
+  await request.assertAccess?.();
   await putToPresignedUrl({
     url,
     size,
@@ -81,11 +83,13 @@ export const uploadBytesToPresignedUrl = async (request: {
   onProgress?: (fraction: number) => void;
   signal?: AbortSignal;
   agent?: Agent;
+  assertAccess?: () => Promise<void>;
 }): Promise<void> => {
   const url = assertUploadUrl(request.presignedUrl);
   if (request.bytes.length === 0) {
     throw new Error("Refusing to upload an empty file");
   }
+  await request.assertAccess?.();
   await putToPresignedUrl({
     url,
     size: request.bytes.length,

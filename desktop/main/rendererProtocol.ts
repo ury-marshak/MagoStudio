@@ -7,10 +7,12 @@ import { protocol } from "electron";
 
 import { resolveCloudConfig } from "../shared/cloudConfig";
 
+import { requireCloudAccount } from "./cloud/requireCloudAccount";
 import { cloudStorageProtocolResponse } from "./cloudStorage/cloudStorageProtocolResponse";
 import { ProjectRepository } from "./database/projectRepository";
 import { ScriptProjectSnapshotRepository } from "./database/scriptProjectSnapshotRepository";
 import { clearLibraryIssue, reportLibraryIssue } from "./libraryHealth";
+import { LibrarySettings } from "./librarySettings";
 
 const HTTP_OK = 200;
 const HTTP_PARTIAL_CONTENT = 206;
@@ -129,7 +131,8 @@ protocol.registerSchemesAsPrivileged([
 
 export const registerMediaProtocol = (
   repository: ProjectRepository,
-  scriptProjects: ScriptProjectSnapshotRepository
+  scriptProjects: ScriptProjectSnapshotRepository,
+  settings: LibrarySettings
 ): void => {
   const cloudStorageHosts = resolveCloudConfig().cloudStorageHosts;
   protocol.handle("mago-media", async (request) => {
@@ -137,7 +140,12 @@ export const registerMediaProtocol = (
       const url = new URL(request.url);
       const kind = url.hostname;
       if (kind === CLOUD_STORAGE_PROTOCOL_HOST) {
-        return await cloudStorageProtocolResponse(request, cloudStorageHosts);
+        return await cloudStorageProtocolResponse(
+          request,
+          cloudStorageHosts,
+          undefined,
+          () => requireCloudAccount(settings)
+        );
       }
       if (
         kind !== "asset" &&

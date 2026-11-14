@@ -18,6 +18,7 @@ export const fetchCloudStorageObject = async ({
   method = "GET",
   range,
   signal,
+  assertAccess,
   fetchFromCloudStorage = fetch
 }: {
   url: unknown;
@@ -25,10 +26,15 @@ export const fetchCloudStorageObject = async ({
   method?: "GET" | "HEAD";
   range?: string;
   signal?: AbortSignal;
+  /** Main-process account policy, rechecked before every dispatch/redirect. */
+  assertAccess?: () => Promise<void>;
   fetchFromCloudStorage?: FetchCloudStorage;
 }): Promise<Response> => {
   let target = parseAllowedCloudStorageUrl(url, allowedHosts);
   for (let redirectsFollowed = 0; ; redirectsFollowed += 1) {
+    signal?.throwIfAborted();
+    await assertAccess?.();
+    signal?.throwIfAborted();
     const response = await fetchFromCloudStorage(target, {
       method,
       headers: range ? { range } : {},

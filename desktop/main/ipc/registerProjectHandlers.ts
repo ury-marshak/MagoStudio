@@ -9,6 +9,7 @@ import {
   type LocalTrackUpdateInput,
   type LocalVideoImport
 } from "../../shared/contracts";
+import { requireCloudAccount } from "../cloud/requireCloudAccount";
 import { CloudProjectMirrorRepository } from "../database/cloudProjectMirrorRepository";
 import { DatabaseManager } from "../database/databaseManager";
 import { ProjectRepository } from "../database/projectRepository";
@@ -168,6 +169,7 @@ export const registerProjectHandlers = (
     IPC_CHANNELS.projectsMirrorCloud,
     async (event, value: unknown) => {
       requireTrustedSender(event);
+      await requireCloudAccount(settings);
       await ensureDatabase(true);
       const input = requireRecord(value);
       const project = requireRecord(input.project);
@@ -188,6 +190,7 @@ export const registerProjectHandlers = (
     IPC_CHANNELS.projectsCacheCloudAsset,
     async (event, value: unknown) => {
       requireTrustedSender(event);
+      await requireCloudAccount(settings);
       await ensureDatabase(true);
       const input = requireRecord(value);
       return cloudProjects.cacheAsset({

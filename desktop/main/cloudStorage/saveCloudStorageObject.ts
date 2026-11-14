@@ -11,16 +11,19 @@ export const saveCloudStorageObject = async ({
   url,
   allowedHosts,
   destinationPath,
+  assertAccess,
   fetchFromCloudStorage
 }: {
   url: unknown;
   allowedHosts: readonly string[];
   destinationPath: string;
+  assertAccess?: () => Promise<void>;
   fetchFromCloudStorage?: FetchCloudStorage;
 }): Promise<void> => {
   const download = await openCloudStorageDownload({
     url,
     allowedHosts,
+    assertAccess,
     fetchFromCloudStorage
   });
 

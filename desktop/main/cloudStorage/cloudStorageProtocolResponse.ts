@@ -1,3 +1,5 @@
+import { CloudAccountRequiredError } from "../cloud/requireCloudAccount";
+
 import {
   fetchCloudStorageObject,
   type FetchCloudStorage
@@ -38,7 +40,8 @@ const buildForwardedHeaders = (upstream: Response): Headers => {
 export const cloudStorageProtocolResponse = async (
   request: Request,
   allowedHosts: readonly string[],
-  fetchFromCloudStorage?: FetchCloudStorage
+  fetchFromCloudStorage?: FetchCloudStorage,
+  assertAccess?: () => Promise<void>
 ): Promise<Response> => {
   const isReadRequest = request.method === "GET" || request.method === "HEAD";
   if (!isReadRequest) {
@@ -50,6 +53,7 @@ export const cloudStorageProtocolResponse = async (
   const objectUrl = new URL(request.url).searchParams.get("url");
   try {
     parseAllowedCloudStorageUrl(objectUrl, allowedHosts);
+    await assertAccess?.();
   } catch {
     return new Response("Forbidden", { status: HTTP_FORBIDDEN });
   }
@@ -62,9 +66,13 @@ export const cloudStorageProtocolResponse = async (
       method: request.method === "HEAD" ? "HEAD" : "GET",
       range: request.headers.get("range") ?? undefined,
       signal: request.signal,
+      assertAccess,
       fetchFromCloudStorage
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof CloudAccountRequiredError) {
+      return new Response("Forbidden", { status: HTTP_FORBIDDEN });
+    }
     return new Response("Mago cloud storage is unreachable", {
       status: HTTP_BAD_GATEWAY
     });

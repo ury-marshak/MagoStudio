@@ -11,6 +11,7 @@ import { IPC_CHANNELS, type MagoAppMode } from "../shared/contracts";
 import { CloudLinkRepository } from "./cloud/cloudLinkRepository";
 import { CloudRenderJobRepository } from "./cloud/cloudRenderJobRepository";
 import { CloudRenderSubmitService } from "./cloud/cloudRenderSubmitService";
+import { requireCloudAccount } from "./cloud/requireCloudAccount";
 import { UploadService } from "./cloud/uploadService";
 import { closeAllComfyProgressMonitors } from "./comfy/comfyProgressMonitors";
 import { CloudProjectMirrorRepository } from "./database/cloudProjectMirrorRepository";
@@ -79,16 +80,22 @@ import { VlmService } from "./vlm/vlmService";
 
 const databaseManager = new DatabaseManager();
 const librarySettings = new LibrarySettings();
+const cloudStorageAccess = {
+  allowedHosts: resolveCloudConfig().cloudStorageHosts,
+  assertAccess: () => requireCloudAccount(librarySettings)
+};
 const projectRepository = new ProjectRepository(databaseManager, () =>
   librarySettings.getLibraryRoot()
 );
 const cloudProjectMirrorRepository = new CloudProjectMirrorRepository(
   databaseManager,
-  () => librarySettings.getLibraryRoot()
+  () => librarySettings.getLibraryRoot(),
+  cloudStorageAccess
 );
 const scriptProjectSnapshotRepository = new ScriptProjectSnapshotRepository(
   databaseManager,
-  () => librarySettings.getLibraryRoot()
+  () => librarySettings.getLibraryRoot(),
+  cloudStorageAccess
 );
 const externalProviders = createExternalProviderSettings(() =>
   app.getPath("userData")
@@ -473,7 +480,11 @@ void app
   .whenReady()
   .then(async () => {
     logStartup("Electron ready; registering services");
-    registerMediaProtocol(projectRepository, scriptProjectSnapshotRepository);
+    registerMediaProtocol(
+      projectRepository,
+      scriptProjectSnapshotRepository,
+      librarySettings
+    );
     registerComfyHandlers(librarySettings, assertLegacyInferenceAvailable);
     registerExternalProviderHandlers(externalProviders);
     textModelBridge.register();
@@ -484,11 +495,12 @@ void app
       renderJobs: cloudRenderJobRepository,
       renderSubmits: cloudRenderSubmitService,
       databaseManager,
-      getLibraryRoot: () => librarySettings.getLibraryRoot()
+      getLibraryRoot: () => librarySettings.getLibraryRoot(),
+      settings: librarySettings
     });
     registerImageRenderHandlers(imageRenderService, cloudRenderJobRepository);
     registerMediaHandlers(videoFrameService);
-    registerCloudStorageHandlers();
+    registerCloudStorageHandlers(librarySettings);
     stopVlmRequests = registerVlmHandlers(
       vlmService,
       i2vPromptAdapter,

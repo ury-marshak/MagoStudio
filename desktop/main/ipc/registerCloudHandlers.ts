@@ -1,5 +1,6 @@
 import { ipcMain } from "electron";
 
+import { resolveCloudConfig } from "../../shared/cloudConfig";
 import { IPC_CHANNELS } from "../../shared/contracts";
 import { prepareCloudImageFile } from "../cloud/cloudImageFile";
 import {
@@ -18,6 +19,7 @@ import {
   readLocalAssetInfo,
   resolveScriptProjectMediaPath
 } from "../cloud/localAssetInfo";
+import { requireCloudAccount } from "../cloud/requireCloudAccount";
 import { toCloudImageOutputExtension } from "../cloud/toCloudImageOutputExtension";
 import {
   uploadBytesToPresignedUrl,
@@ -26,6 +28,7 @@ import {
 import { UploadService } from "../cloud/uploadService";
 import { DatabaseManager } from "../database/databaseManager";
 import { ProjectRepository } from "../database/projectRepository";
+import { LibrarySettings } from "../librarySettings";
 
 import { requireTrustedSender } from "./trustedSender";
 
@@ -82,6 +85,7 @@ export const registerCloudHandlers = (options: {
   renderSubmits: CloudRenderSubmitService;
   databaseManager: DatabaseManager;
   getLibraryRoot: () => Promise<string | null>;
+  settings: LibrarySettings;
 }): void => {
   const { links, uploads, repository, renderJobs, renderSubmits } = options;
 
@@ -116,6 +120,7 @@ export const registerCloudHandlers = (options: {
 
   ipcMain.handle(IPC_CHANNELS.cloudPrepareUpload, async (event, input) => {
     requireTrustedSender(event);
+    await requireCloudAccount(options.settings);
     const value = (input ?? {}) as Record<string, unknown>;
     const assetId = requireId(value.assetId, "assetId");
     // Resolved here rather than passed in, so the renderer never learns a path.
@@ -137,6 +142,7 @@ export const registerCloudHandlers = (options: {
 
   ipcMain.handle(IPC_CHANNELS.cloudUploadPrepared, async (event, input) => {
     requireTrustedSender(event);
+    await requireCloudAccount(options.settings);
     const value = (input ?? {}) as Record<string, unknown>;
     const assetId = requireId(value.assetId, "assetId");
     const presignedUrl = requireId(value.presignedUrl, "presignedUrl");
@@ -153,7 +159,9 @@ export const registerCloudHandlers = (options: {
       ),
       trimEndSeconds: optionalSeconds(value.trimEndSeconds, "trimEndSeconds")
     });
+    await requireCloudAccount(options.settings);
     await uploads.upload({
+      assertAccess: () => requireCloudAccount(options.settings),
       filePath: prepared.filePath,
       presignedUrl,
       onProgress: (fraction) => {
@@ -189,6 +197,7 @@ export const registerCloudHandlers = (options: {
   const byteUploads = new Map<string, AbortController>();
   ipcMain.handle(IPC_CHANNELS.cloudUploadBytes, async (event, input) => {
     requireTrustedSender(event);
+    await requireCloudAccount(options.settings);
     const value = (input ?? {}) as Record<string, unknown>;
     const uploadId = requireId(value.uploadId, "uploadId");
     const presignedUrl = requireId(value.presignedUrl, "presignedUrl");
@@ -199,6 +208,7 @@ export const registerCloudHandlers = (options: {
     byteUploads.set(uploadId, controller);
     try {
       await uploadBytesToPresignedUrl({
+        assertAccess: () => requireCloudAccount(options.settings),
         bytes,
         presignedUrl,
         contentType,
@@ -229,6 +239,7 @@ export const registerCloudHandlers = (options: {
 
   ipcMain.handle(IPC_CHANNELS.cloudUploadAsset, async (event, input) => {
     requireTrustedSender(event);
+    await requireCloudAccount(options.settings);
     const value = (input ?? {}) as Record<string, unknown>;
     const assetId = requireId(value.assetId, "assetId");
     const presignedUrl = requireId(value.presignedUrl, "presignedUrl");
@@ -264,7 +275,9 @@ export const registerCloudHandlers = (options: {
           filePath: sourcePath,
           contentType: contentTypeForExtension(info.extension)
         };
+    await requireCloudAccount(options.settings);
     await uploadFileToPresignedUrl({
+      assertAccess: () => requireCloudAccount(options.settings),
       filePath: uploadFile.filePath,
       presignedUrl,
       contentType: uploadFile.contentType,
@@ -281,6 +294,7 @@ export const registerCloudHandlers = (options: {
 
   ipcMain.handle(IPC_CHANNELS.cloudRenderRegister, async (event, input) => {
     requireTrustedSender(event);
+    await requireCloudAccount(options.settings);
     const value = (input ?? {}) as Record<string, unknown>;
     const range = value.frameRange;
     if (
@@ -326,6 +340,7 @@ export const registerCloudHandlers = (options: {
     IPC_CHANNELS.cloudImageRenderRegister,
     async (event, input) => {
       requireTrustedSender(event);
+      await requireCloudAccount(options.settings);
       const value = (input ?? {}) as Record<string, unknown>;
       const frame = value.frame;
       if (typeof frame !== "number" || !Number.isInteger(frame) || frame < 0) {
@@ -385,6 +400,7 @@ export const registerCloudHandlers = (options: {
 
   ipcMain.handle(IPC_CHANNELS.cloudRenderFinish, async (event, input) => {
     requireTrustedSender(event);
+    await requireCloudAccount(options.settings);
     const value = (input ?? {}) as Record<string, unknown>;
     const jobId = requireId(value.jobId, "jobId");
     const url = requireId(value.url, "url");
@@ -398,6 +414,10 @@ export const registerCloudHandlers = (options: {
       : undefined;
 
     const downloaded = await downloadRenderOutput({
+      cloudStorage: {
+        allowedHosts: resolveCloudConfig().cloudStorageHosts,
+        assertAccess: () => requireCloudAccount(options.settings)
+      },
       url,
       libraryRoot,
       jobId,
