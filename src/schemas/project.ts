@@ -7,6 +7,8 @@ import {
 } from "@/schemas/scriptProject";
 import { ShotSchema } from "@/schemas/shot";
 
+import { falGenerationDefaultsSchema } from "../../desktop/shared/falGenerationSettings";
+
 const LOCAL_H3_FAST_STEPS = 3;
 const LOCAL_H3_BASELINE_STEPS = 4;
 const LOCAL_H3_QUALITY_STEPS = 8;
@@ -85,9 +87,11 @@ export const ProjectSchema = z.object({
     local_h3_model: z.string().optional(),
     sheet_aspect_ratio: z.string().optional(),
     sheet_resolution: z.string().optional(),
+    fal_generation_settings: falGenerationDefaultsSchema.optional(),
     sheet_render_model: z.string().optional(),
     storyboard_render_model: z.string().optional(),
     shot_engine: z.string().optional(),
+    shot_render_provider: z.enum(["fal", "local-comfy"]).optional(),
     visual_style: z.string().nullable().optional(),
     agent_script: z.string().optional(),
     agent_script_document: AgentScriptDocumentSchema.nullable()

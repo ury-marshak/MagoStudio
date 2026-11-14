@@ -2,6 +2,8 @@ import { Dropdown } from "@components/Dropdown";
 import { Text } from "@components/Text";
 import {
   AnySheetRenderModel,
+  FAL_SHEET_MODELS,
+  isFalSheetModel,
   LocalSheetRenderModel,
   LOCAL_SHEET_RENDER_MODELS,
   SHEET_RENDER_MODELS,
@@ -17,6 +19,7 @@ type Props = {
   isLocalProject?: boolean;
   /** A local project signed in to Mago Cloud also offers the cloud models. */
   includeCloudModels?: boolean;
+  includeFalModel?: boolean;
   isLabelHidden?: boolean;
   testId?: string;
   localModels?: readonly LocalSheetRenderModel[];
@@ -29,6 +32,7 @@ export const SheetRenderModelDropdown: React.FC<Props> = ({
   onChange,
   isLocalProject = false,
   includeCloudModels = false,
+  includeFalModel = false,
   isLabelHidden = false,
   testId,
   localModels = LOCAL_SHEET_RENDER_MODELS,
@@ -44,7 +48,16 @@ export const SheetRenderModelDropdown: React.FC<Props> = ({
     label: t(`script_project.sheet_render_model_${model}.label`)
   }));
   const modelItems: Array<{ key: string; label: string }> = isLocalProject
-    ? [...localModelItems, ...(includeCloudModels ? cloudModelItems : [])]
+    ? [
+        ...FAL_SHEET_MODELS.filter(
+          (model) => includeFalModel || model === sheetRenderModel
+        ).map((model) => ({
+          key: model,
+          label: t(`script_project.sheet_render_model_${model}.label`)
+        })),
+        ...localModelItems,
+        ...(includeCloudModels ? cloudModelItems : [])
+      ]
     : cloudModelItems;
 
   return (
@@ -64,12 +77,13 @@ export const SheetRenderModelDropdown: React.FC<Props> = ({
           if (
             isLocalProject &&
             !isLocalSheetRenderModel(nextModel) &&
+            !(includeFalModel && isFalSheetModel(nextModel)) &&
             !(includeCloudModels && isSheetRenderModel(nextModel))
           )
             return;
           onChange(nextModel as AnySheetRenderModel);
         }}
-        className="w-40"
+        className="w-48"
         data-testid={testId}
       />
     </label>

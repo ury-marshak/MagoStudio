@@ -41,9 +41,61 @@ const remoteFile = z.object({
     return !url.username && !url.password;
   })
 });
-const imageResult = z.object({ images: z.array(remoteFile).min(1) });
+const falMediaFile = remoteFile.refine(({ url }) => {
+  const { hostname, port } = new URL(url);
+  return !port && (hostname === "fal.media" || hostname.endsWith(".fal.media"));
+});
+const uploadResponse = z.object({
+  file_url: remoteFile.shape.url,
+  upload_url: remoteFile.shape.url
+});
+const storageInitiate =
+  "https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3";
+const uploadTimeoutMs = 120_000;
+
+const uploadToFal = async (
+  key: string,
+  file: Blob,
+  name: string,
+  callerSignal?: AbortSignal
+): Promise<string> => {
+  const timeout = AbortSignal.timeout(uploadTimeoutMs);
+  const signal = callerSignal
+    ? AbortSignal.any([callerSignal, timeout])
+    : timeout;
+  const contentType = file.type || "application/octet-stream";
+  const initiated = await fetch(storageInitiate, {
+    method: "POST",
+    redirect: "error",
+    signal,
+    headers: {
+      Authorization: `Key ${key}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ file_name: name, content_type: contentType })
+  });
+  if (!initiated.ok) {
+    await initiated.body?.cancel();
+    throw new Error(`fal upload initiation returned HTTP ${initiated.status}`);
+  }
+  const parsed = uploadResponse.safeParse(await initiated.json());
+  if (!parsed.success) throw new Error("fal returned invalid upload URLs");
+  const uploaded = await fetch(parsed.data.upload_url, {
+    method: "PUT",
+    redirect: "error",
+    signal,
+    headers: { "Content-Type": contentType },
+    body: file
+  });
+  await uploaded.body?.cancel();
+  if (!uploaded.ok)
+    throw new Error(`fal upload returned HTTP ${uploaded.status}`);
+  return parsed.data.file_url;
+};
+
+const imageResult = z.object({ images: z.array(falMediaFile).min(1) });
 const videoResult = z.object({
-  video: remoteFile,
+  video: falMediaFile,
   seed: z.number().int().nullish(),
   reference_tokens: z.number().int().nonnegative().nullish()
 });
@@ -78,9 +130,12 @@ export class FalRenderProvider implements MediaRenderProvider {
     assertFalEndpoint(endpoint);
     const config = await this.getConfig();
     if (!config) throw new Error("Configure the fal Keychain account first");
-    const client = await this.client(config.keychainAccount);
+    const key = await this.readKey(config.keychainAccount);
+    const client = new FalQueueClient(key);
     return {
       keychainAccount: config.keychainAccount,
+      upload: (file: Blob, name: string, signal?: AbortSignal) =>
+        uploadToFal(key, file, name, signal),
       submit: async (input: Record<string, unknown>, signal?: AbortSignal) => {
         try {
           return await client.submit(endpoint, input, signal);

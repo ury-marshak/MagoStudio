@@ -5,12 +5,21 @@ import { useLocalSheetModelInstallGate } from "@app/components/LocalSetupWizard/
 import type { RequiredLocalInstall } from "@app/components/LocalSetupWizard/requiredLocalInstall";
 import { SetupMagoStudioButton } from "@app/components/LocalSetupWizard/SetupMagoStudioButton";
 import { Checkbox } from "@components/Checkbox";
+import { Dropdown } from "@components/Dropdown";
+import { FalGenerationControls } from "@components/FalGenerationControls";
+import { MainButton } from "@components/MainButton";
 import { Text } from "@components/Text";
 import { useProject } from "@domains/project/useProject";
 import {
   DEFAULT_LOCAL_H3_LEGACY_WORKFLOW,
   DEFAULT_LOCAL_H3_MODEL,
+  FAL_SHOT_PROVIDER,
+  isFalSheetModel,
+  type AnySheetRenderModel,
+  MINIMAX_H3_MAX_SHOT_RENDER_ENGINE,
   DEFAULT_LOCAL_H3_TEXT_ENCODER,
+  SELECTABLE_SHOT_RENDER_ENGINES,
+  type ShotRenderEngine,
   SKIP_REASON_DROPPED,
   SKIP_REASON_HIDDEN,
   STORYBOARD_IMAGE_SIZE,
@@ -19,6 +28,9 @@ import {
 import { isLocalSheetRenderModel } from "@domains/scriptProject/constants";
 import { useAddProjectShot } from "@domains/scriptProject/useAddProjectShot";
 import { useEditProjectShot } from "@domains/scriptProject/useEditProjectShot";
+import { useShotActionPreviews } from "@domains/scriptProject/useFalActionPreviews";
+import { useFalGenerationSettings } from "@domains/scriptProject/useFalGenerationSettings";
+import { useFalProviderConfig } from "@domains/scriptProject/useFalProviderConfigured";
 import { useGenerateProjectShots } from "@domains/scriptProject/useGenerateProjectShots";
 import { useGenerateSceneStoryboard } from "@domains/scriptProject/useGenerateSceneStoryboard";
 import { useImageRenderModel } from "@domains/scriptProject/useImageRenderModel";
@@ -30,6 +42,7 @@ import { useProjectCut } from "@domains/scriptProject/useProjectCut";
 import { useProjectOutputSize } from "@domains/scriptProject/useProjectOutputSize";
 import { useProjectShotsDryRun } from "@domains/scriptProject/useProjectShotsDryRun";
 import { useRecordShotVersionBaseline } from "@domains/scriptProject/useRecordShotVersionBaseline";
+import { useSaveProjectSettingsPatch } from "@domains/scriptProject/useSaveProjectSettingsPatch";
 import { useScriptProjectRenderAccess } from "@domains/scriptProject/useScriptProjectRenderAccess";
 import { useShotRenderEngine } from "@domains/scriptProject/useShotRenderEngine";
 import { buildCutShotByTimelineId } from "@domains/scriptProject/utils/buildCutShotByTimelineId";
@@ -50,6 +63,7 @@ import { findSequentialPredecessorShot } from "@domains/scriptProject/utils/find
 import { formatShotTitle } from "@domains/scriptProject/utils/formatShotTitle";
 import { getShotRunRefusalDescriptionKey } from "@domains/scriptProject/utils/getShotRunRefusalDescriptionKey";
 import { isPreviousListedShotThePredecessor } from "@domains/scriptProject/utils/isPreviousListedShotThePredecessor";
+import { isSelectableShotRenderEngine } from "@domains/scriptProject/utils/isSelectableShotRenderEngine";
 import { isSheetRenderModel } from "@domains/scriptProject/utils/isSheetRenderModel";
 import { isShotBlockedForNoReferenceImage } from "@domains/scriptProject/utils/isShotBlockedForNoReferenceImage";
 import { isShotDurationOutOfBounds } from "@domains/scriptProject/utils/isShotDurationOutOfBounds";
@@ -79,9 +93,15 @@ import {
   ShotState
 } from "@schemas/scriptProject";
 import { useToast } from "@store/useToast";
+import { useQuery } from "@tanstack/react-query";
 import { cn } from "@utils";
 import { Fragment, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+
+import { queryKeys } from "@/queryKeys";
+
+import { falVideoSize } from "../../../../../../desktop/shared/falGenerationSettings";
+import { FAL_SHOT_ENGINE } from "../../../../../../desktop/shared/falShotModel";
 
 import { AddShotDialog } from "./AddShotDialog";
 import { EarlierScriptVersionToggle } from "./EarlierScriptVersionToggle";
@@ -121,7 +141,6 @@ type Props = {
   renderingShotTimelineIds: Set<string>;
   failedShotTimelineIds: Set<string>;
   isRunActive: boolean;
-  canRender: boolean;
   onRunStarted: (planId: string, shotTimelineIds: string[]) => void;
 };
 
@@ -133,7 +152,6 @@ export const ShotsTab: React.FC<Props> = ({
   renderingShotTimelineIds,
   failedShotTimelineIds,
   isRunActive,
-  canRender,
   onRunStarted
 }) => {
   const { t } = useTranslation();
@@ -141,8 +159,67 @@ export const ShotsTab: React.FC<Props> = ({
   const [isSceneTimelineShown] = useSceneTimelineVisibilitySetting();
   const { data: project } = useProject(projectId);
   const isLocalProject = project?.origin === "local";
+  const fal = useFalProviderConfig(isLocalProject);
+  const isFalConfigured = isLocalProject && !!fal.data;
+  const [providerOverride, setProviderOverride] = useState<{
+    projectId: string;
+    provider: "fal" | "local-comfy";
+  }>();
+  const [cloudEngineOverride, setCloudEngineOverride] = useState<{
+    projectId: string;
+    engine: ShotRenderEngine;
+  }>();
+  const [shotModelOverrides, setShotModelOverrides] = useState<
+    Record<string, "fal" | "local-comfy" | ShotRenderEngine>
+  >({});
+  const overrideShotModel = (
+    key: string,
+    model: "fal" | "local-comfy" | ShotRenderEngine
+  ) => setShotModelOverrides((overrides) => ({ ...overrides, [key]: model }));
+  const shotOverridePrefix = `${projectId}:`;
+  const { saveProjectSettingsPatch, isSavingProjectSettings } =
+    useSaveProjectSettingsPatch(projectId);
+  const shotProvider =
+    providerOverride?.projectId === projectId
+      ? providerOverride.provider
+      : (project?.settings?.shot_render_provider ??
+        (isFalConfigured
+          ? (fal.data?.shotProvider ?? FAL_SHOT_PROVIDER)
+          : "local-comfy"));
+  const isFalSelected = isLocalProject && shotProvider === FAL_SHOT_PROVIDER;
+  const alternateProvider = isFalSelected ? "local-comfy" : FAL_SHOT_PROVIDER;
+  const hasLocalOverride =
+    isLocalProject &&
+    projectState.shots.some(
+      (shot) =>
+        shotModelOverrides[shotOverridePrefix + shot.timeline_id] ===
+        alternateProvider
+    );
+  const needsLocalShotSetup =
+    scenesView === "video" &&
+    isLocalProject &&
+    (!isFalSelected || hasLocalOverride) &&
+    (!fal.isPending ||
+      providerOverride?.projectId === projectId ||
+      project?.settings?.shot_render_provider === "local-comfy");
+  const externalText = useQuery({
+    queryKey: queryKeys.externalProviders.configuredText,
+    queryFn: () => window.mago?.vlm?.hasExternalText?.() ?? false,
+    enabled:
+      scenesView === "video" &&
+      (isFalSelected ||
+        (hasLocalOverride && alternateProvider === FAL_SHOT_PROVIDER)),
+    retry: false
+  });
+  const canRenderLegacy = useScriptProjectRenderAccess(
+    projectId,
+    undefined,
+    scenesView === "video" && (!isLocalProject || needsLocalShotSetup)
+  );
+  const canRenderFal = isFalConfigured && !externalText.isPending;
+  const canRender = isFalSelected ? canRenderFal : canRenderLegacy;
   const {
-    outputSize,
+    outputSize: projectOutputSize,
     setOutputSize,
     shotFrames,
     shotQualityRetries,
@@ -150,14 +227,21 @@ export const ShotsTab: React.FC<Props> = ({
     setLocalH3Steps,
     isSavingOutputSize
   } = useProjectOutputSize(projectId);
+  const generation = useFalGenerationSettings(projectId);
+  const falSize = (action = "batch") =>
+    falVideoSize(generation.settingsFor(FAL_SHOT_ENGINE, action)!);
+  const outputSize = isFalSelected ? falSize() : projectOutputSize;
   const isMinimalModelGroupInstalled = useIsModelGroupInstalled({
     modelGroupId: "minimal",
-    isModelGroupCheckNeeded: isLocalProject
+    isModelGroupCheckNeeded: needsLocalShotSetup
   });
-  const localReady = useLocalShotsReady(
-    isLocalProject,
+  const localSetupReady = useLocalShotsReady(
+    needsLocalShotSetup,
     resolveLocalH3QualitySteps(localH3Steps)
   );
+  const localReady =
+    (!isLocalProject || isFalSelected || needsLocalShotSetup) &&
+    localSetupReady;
   // Quality (Slow 8 / Fast 4 steps) is the only H3 choice a local project
   // shows; the rest render at their defaults, whatever an older build stored.
   const localH3VideoSettings = isLocalProject
@@ -168,16 +252,36 @@ export const ShotsTab: React.FC<Props> = ({
         local_h3_model: DEFAULT_LOCAL_H3_MODEL
       }
     : {};
-  const { shotEngine, isSavingShotRenderEngine, setShotRenderEngine } =
-    useShotRenderEngine(projectId);
-  const shotVideoSettings = {
+  const {
+    shotEngine: projectShotEngine,
+    isSavingShotRenderEngine,
+    setShotRenderEngine
+  } = useShotRenderEngine(projectId);
+  const shotEngine = isFalSelected
+    ? MINIMAX_H3_MAX_SHOT_RENDER_ENGINE
+    : !isLocalProject && cloudEngineOverride?.projectId === projectId
+      ? cloudEngineOverride.engine
+      : projectShotEngine;
+  const videoSettingsFor = (
+    useFal: boolean,
+    engine = shotEngine,
+    action = "batch"
+  ) => ({
     ...buildShotVideoSettings({
-      shotEngine,
+      shotEngine: useFal ? MINIMAX_H3_MAX_SHOT_RENDER_ENGINE : engine,
       frameRange: buildShotFrameRange(shotFrames),
       maxQualityRetries: shotQualityRetries
     }),
-    ...localH3VideoSettings
-  };
+    ...(!useFal ? localH3VideoSettings : {}),
+    ...(useFal
+      ? {
+          render_provider: FAL_SHOT_PROVIDER,
+          provider_settings: generation.settingsFor(FAL_SHOT_ENGINE, action),
+          prompt_rewrite: externalText.data ? "mago" : "raw"
+        }
+      : {})
+  });
+  const shotVideoSettings = videoSettingsFor(isFalSelected);
   const [searchQuery, setSearchQuery] = useState("");
   const shotsContentRef = useRef<HTMLDivElement>(null);
   const scrollToShot = (timelineId: string) => {
@@ -246,6 +350,60 @@ export const ShotsTab: React.FC<Props> = ({
   const staleHiddenShotTimelineIds = new Set(
     resolveWouldRunShotTimelineIds(hiddenShotsDryRun, shotsInActiveScript)
   );
+  const alternateEngine = isLocalProject
+    ? projectShotEngine
+    : (SELECTABLE_SHOT_RENDER_ENGINES.find((engine) => engine !== shotEngine) ??
+      shotEngine);
+  const alternateModel = isLocalProject ? alternateProvider : alternateEngine;
+  const alternateShotIds = shotsInActiveScript
+    .filter(
+      (shot) =>
+        shotModelOverrides[shotOverridePrefix + shot.timeline_id] ===
+        alternateModel
+    )
+    .map((shot) => shot.timeline_id);
+  const alternateUsesFal =
+    isLocalProject && alternateProvider === FAL_SHOT_PROVIDER;
+  const alternateCanRender = alternateUsesFal
+    ? canRenderFal
+    : canRenderLegacy &&
+      (!isLocalProject || (isMinimalModelGroupInstalled && localSetupReady));
+  const { data: alternateDryRun } = useProjectShotsDryRun(
+    projectId,
+    alternateUsesFal ? falSize() : projectOutputSize,
+    videoSettingsFor(alternateUsesFal, alternateEngine),
+    sequentialRunOverride,
+    scenesView === "video" && alternateShotIds.length > 0 && alternateCanRender,
+    alternateShotIds
+  );
+  const staleAlternateShotIds = new Set(
+    resolveWouldRunShotTimelineIds(alternateDryRun, shotsInActiveScript)
+  );
+  const individualFalPreviews = useShotActionPreviews(
+    shotsInActiveScript.map((shot) => ({
+      projectId,
+      isDryRun: true,
+      outputSize: falSize(shot.timeline_id),
+      videoSettings: videoSettingsFor(
+        true,
+        MINIMAX_H3_MAX_SHOT_RENDER_ENGINE,
+        shot.timeline_id
+      ),
+      timelineIds: [shot.timeline_id],
+      sequential: sequentialRunOverride,
+      enabled:
+        scenesView === "video" &&
+        canRenderFal &&
+        (shotModelOverrides[shotOverridePrefix + shot.timeline_id] ??
+          shotProvider) === FAL_SHOT_PROVIDER
+    }))
+  );
+  const falPreviewByTimeline = new Map(
+    shotsInActiveScript.map((shot, index) => [
+      shot.timeline_id,
+      individualFalPreviews[index]?.data
+    ])
+  );
   useRecordShotVersionBaseline(projectId);
   const { mutate: generateShots, isPending: isGeneratingShots } =
     useGenerateProjectShots();
@@ -288,50 +446,77 @@ export const ShotsTab: React.FC<Props> = ({
   });
   const storyboardModel = useImageRenderModel(
     projectId,
-    "storyboard_render_model"
+    "storyboard_render_model",
+    isStoryboardViewSelected
   );
+  const [storyboardOverride, setStoryboardOverride] = useState<{
+    projectId: string;
+    model: AnySheetRenderModel;
+  }>();
+  const storyboardRenderModel =
+    storyboardOverride?.projectId === projectId
+      ? storyboardOverride.model
+      : storyboardModel.renderModel;
+  const [sceneStoryboardModels, setSceneStoryboardModels] = useState<
+    Record<string, AnySheetRenderModel>
+  >({});
+  const storyboardModelForScene = (scene: ShotState) =>
+    sceneStoryboardModels[`${projectId}:${scene.timeline_id}`] ??
+    storyboardRenderModel;
   const isStoryboardRenderedLocally =
-    isLocalProject && isLocalSheetRenderModel(storyboardModel.renderModel);
+    isLocalProject && isLocalSheetRenderModel(storyboardRenderModel);
   const isStoryboardModelInstalled =
     !isStoryboardRenderedLocally ||
     storyboardModel.installedLocalModels.some(
-      (model) => model === storyboardModel.renderModel
+      (model) => model === storyboardRenderModel
     );
   const storyboardModelOptions = [
     ...new Set([
       ...storyboardModel.installedLocalModels,
-      ...(isLocalSheetRenderModel(storyboardModel.renderModel)
-        ? [storyboardModel.renderModel]
+      ...(isLocalSheetRenderModel(storyboardRenderModel)
+        ? [storyboardRenderModel]
         : [])
     ])
   ];
   const canRenderStoryboards = useScriptProjectRenderAccess(
     projectId,
-    storyboardModel.renderModel
+    storyboardRenderModel,
+    isStoryboardViewSelected && !storyboardModel.isLoadingProvider
   );
   const storyboardInstall = useLocalSheetModelInstallGate({
-    sheetRenderModel: storyboardModel.renderModel,
-    isLocalProject
+    sheetRenderModel: storyboardRenderModel,
+    isLocalProject:
+      isLocalProject &&
+      isStoryboardViewSelected &&
+      !storyboardModel.isLoadingProvider
   });
   const sceneStoryboards = useManageSceneStoryboards(
     projectId,
-    storyboardModel.renderModel
+    storyboardRenderModel
   );
   const isSubmittingSceneStoryboard = (sceneTimelineId: string) =>
     sceneStoryboards.isSubmittingSceneStoryboard(sceneTimelineId) ||
     isSubmittingSceneStoryboardFromSheets(sceneTimelineId);
-  const canGenerateStoryboardForScene = (scene: ShotState) =>
-    (!isLocalProject ||
-      (canRenderStoryboards &&
-        storyboardInstall.isLocalSheetModelInstalled &&
-        isStoryboardModelInstalled)) &&
-    (!!scene.storyboard || canGenerateSceneStoryboardsFromSheets);
+  const canGenerateStoryboardForScene = (
+    scene: ShotState,
+    model = storyboardRenderModel
+  ) =>
+    isLocalProject && isFalSheetModel(model)
+      ? storyboardModel.isFalAvailable
+      : isLocalProject && isSheetRenderModel(model)
+        ? storyboardModel.canUseCloudModels &&
+          (!!scene.storyboard || canGenerateSceneStoryboardsFromSheets)
+        : (!isLocalProject ||
+            (canRenderStoryboards &&
+              storyboardInstall.isLocalSheetModelInstalled &&
+              isStoryboardModelInstalled)) &&
+          (!!scene.storyboard || canGenerateSceneStoryboardsFromSheets);
   const resolveStoryboardCreditsForScene = (scene: ShotState) =>
     scene.storyboard?.credits_per_render ??
     (isLocalProject &&
-    isSheetRenderModel(storyboardModel.renderModel) &&
-    storyboardModel.renderModel !== "gpt_image_2_t2i"
-      ? estimateSheetImageCredits(storyboardModel.renderModel, [
+    isSheetRenderModel(storyboardRenderModel) &&
+    storyboardRenderModel !== "gpt_image_2_t2i"
+      ? estimateSheetImageCredits(storyboardRenderModel, [
           STORYBOARD_IMAGE_SIZE.width,
           STORYBOARD_IMAGE_SIZE.height
         ])
@@ -339,10 +524,14 @@ export const ShotsTab: React.FC<Props> = ({
   const generateStoryboardForScene = async ({
     scene,
     storyboardBeats,
+    model = storyboardRenderModel,
+    settingsAction,
     unsavedSceneShotEdits = {}
   }: {
     scene: ShotState;
     storyboardBeats: Beat[];
+    model?: AnySheetRenderModel;
+    settingsAction?: string;
     unsavedSceneShotEdits?: SceneShotDraftEdits;
   }) => {
     const hasUnsavedSceneShotEdits =
@@ -358,8 +547,15 @@ export const ShotsTab: React.FC<Props> = ({
         return;
       }
     }
-    if (scene.storyboard) {
-      await sceneStoryboards.generateSceneStoryboard(scene.timeline_id);
+    if (scene.storyboard || (isLocalProject && isFalSheetModel(model))) {
+      await sceneStoryboards.generateSceneStoryboard(
+        scene.timeline_id,
+        model,
+        generation.settingsFor(
+          model ?? storyboardRenderModel,
+          settingsAction ?? `storyboard:${scene.timeline_id}`
+        )
+      );
       return;
     }
     generateSceneStoryboardFromSheets({ shot: scene, storyboardBeats });
@@ -420,7 +616,9 @@ export const ShotsTab: React.FC<Props> = ({
       dialogue: ShotDialogueTurn[];
       hasUnsavedDialogue: boolean;
       durationSeconds?: number;
-    }
+    },
+    useFal: boolean,
+    engine: ShotRenderEngine
   ) => {
     const hasUnsavedSceneLength = draft.durationSeconds !== undefined;
     if (
@@ -452,10 +650,12 @@ export const ShotsTab: React.FC<Props> = ({
                   candidateShot.timeline_id === shot.timeline_id
               )
             });
-            void generateShotFromSavedPrompt(retry.shot, {
-              ...draft,
-              ...retry.draft
-            });
+            void generateShotFromSavedPrompt(
+              retry.shot,
+              { ...draft, ...retry.draft },
+              useFal,
+              engine
+            );
           }
         });
         return;
@@ -466,8 +666,8 @@ export const ShotsTab: React.FC<Props> = ({
       {
         projectId,
         isDryRun: false,
-        outputSize: outputSize,
-        videoSettings: shotVideoSettings,
+        outputSize: useFal ? falSize(shot.timeline_id) : projectOutputSize,
+        videoSettings: videoSettingsFor(useFal, engine, shot.timeline_id),
         timelineIds: [shot.timeline_id],
         sequential: sequentialRunOverride
       },
@@ -529,7 +729,8 @@ export const ShotsTab: React.FC<Props> = ({
     (shot) => !shot.dropped
   );
 
-  const isLocalShotRenderLocked = !isMinimalModelGroupInstalled || !localReady;
+  const isLocalShotRenderLocked =
+    !isFalSelected && (!isMinimalModelGroupInstalled || !localReady);
 
   const trackRunOrExplainRefusal = (result: ShotGenerateResult) => {
     if (result.plan_id) {
@@ -546,6 +747,39 @@ export const ShotsTab: React.FC<Props> = ({
     }
   };
 
+  const shotModelPicker = (
+    provider: "fal" | "local-comfy",
+    onChange: (provider: "fal" | "local-comfy") => void,
+    testId: string
+  ) => (
+    <Dropdown
+      aria-label={t("script_project.shot_provider.label")}
+      selectedKey={provider}
+      isDisabled={isRunActive || isGeneratingShots || fal.isPending}
+      items={[
+        ...(isFalConfigured || provider === FAL_SHOT_PROVIDER
+          ? [
+              {
+                key: FAL_SHOT_PROVIDER,
+                label: t("script_project.shot_fal_model.label")
+              }
+            ]
+          : []),
+        {
+          key: "local-comfy",
+          label: t("script_project.shot_comfy_model.label")
+        }
+      ]}
+      onSelectionChange={(choice) => {
+        if (
+          choice === "local-comfy" ||
+          (choice === FAL_SHOT_PROVIDER && isFalConfigured)
+        )
+          onChange(choice);
+      }}
+      data-testid={testId}
+    />
+  );
   const generateShotsButton = (
     <GenerateRunButton
       label={t("script_project.generate_shots_button.label")}
@@ -556,7 +790,7 @@ export const ShotsTab: React.FC<Props> = ({
         !project
           ? null
           : isLocalProject
-            ? { kind: "local" }
+            ? { kind: isFalSelected ? "fal-usage" : "local" }
             : { kind: "credits", amount: staleShotCredits }
       }
       isDisabled={
@@ -664,9 +898,12 @@ export const ShotsTab: React.FC<Props> = ({
               )}
             {isLocalProject && (
               <SheetRenderModelDropdown
-                sheetRenderModel={storyboardModel.renderModel}
+                sheetRenderModel={storyboardRenderModel}
                 isDisabled={storyboardModel.isSavingRenderModel || isRunActive}
-                onChange={storyboardModel.setRenderModel}
+                onChange={(model) =>
+                  setStoryboardOverride({ projectId, model })
+                }
+                includeFalModel={storyboardModel.isFalAvailable}
                 isLocalProject
                 includeCloudModels={storyboardModel.canUseCloudModels}
                 localModels={storyboardModelOptions}
@@ -674,6 +911,32 @@ export const ShotsTab: React.FC<Props> = ({
                 testId="script-project-storyboard-render-model"
               />
             )}
+            <FalGenerationControls
+              model={storyboardRenderModel}
+              settings={generation.settingsFor(storyboardRenderModel)}
+              onChange={(settings) =>
+                generation.change(storyboardRenderModel, "batch", settings)
+              }
+              onSave={() => generation.save(storyboardRenderModel)}
+              disabled={isRunActive || generation.isSaving}
+            />
+            {isLocalProject &&
+              storyboardOverride?.projectId === projectId &&
+              project?.settings?.storyboard_render_model !==
+                storyboardRenderModel && (
+                <MainButton
+                  size="sm"
+                  colorScheme="secondary"
+                  isDisabled={
+                    storyboardModel.isSavingRenderModel || isRunActive
+                  }
+                  onPress={() =>
+                    storyboardModel.setRenderModel(storyboardRenderModel)
+                  }
+                >
+                  {t("script_project.save_sheet_render_default.label")}
+                </MainButton>
+              )}
             <GenerateRunButton
               label={t("script_project.generate_storyboards_button.label")}
               countLabel={t(
@@ -683,12 +946,14 @@ export const ShotsTab: React.FC<Props> = ({
                 }
               )}
               cost={
-                isStoryboardRenderedLocally
-                  ? { kind: "local" }
-                  : {
-                      kind: "credits",
-                      amount: scenesAwaitingStoryboardCredits
-                    }
+                isFalSheetModel(storyboardRenderModel)
+                  ? { kind: "fal-usage" }
+                  : isStoryboardRenderedLocally
+                    ? { kind: "local" }
+                    : {
+                        kind: "credits",
+                        amount: scenesAwaitingStoryboardCredits
+                      }
               }
               isDisabled={
                 scenesAwaitingStoryboard.length === 0 ||
@@ -709,7 +974,11 @@ export const ShotsTab: React.FC<Props> = ({
               onPress={() =>
                 scenesAwaitingStoryboard.forEach(
                   ({ scene, storyboardBeats }) =>
-                    void generateStoryboardForScene({ scene, storyboardBeats })
+                    void generateStoryboardForScene({
+                      scene,
+                      storyboardBeats,
+                      settingsAction: "batch"
+                    })
                 )
               }
               testId="script-project-generate-storyboards"
@@ -759,7 +1028,28 @@ export const ShotsTab: React.FC<Props> = ({
                 })}
               />
             )}
-            {isLocalProject && (
+            {isLocalProject &&
+              shotModelPicker(
+                shotProvider,
+                (provider) => setProviderOverride({ projectId, provider }),
+                "script-project-shot-render-model"
+              )}
+            {isLocalProject &&
+              (isFalConfigured || isFalSelected) &&
+              project?.settings?.shot_render_provider !== shotProvider && (
+                <MainButton
+                  colorScheme="secondary"
+                  isDisabled={isRunActive || isSavingProjectSettings}
+                  onPress={() =>
+                    saveProjectSettingsPatch({
+                      shot_render_provider: shotProvider
+                    })
+                  }
+                >
+                  {t("script_project.save_sheet_render_default.label")}
+                </MainButton>
+              )}
+            {isLocalProject && !isFalSelected && (
               <LocalH3QualitySwitch
                 steps={localH3Steps}
                 isDisabled={
@@ -774,23 +1064,47 @@ export const ShotsTab: React.FC<Props> = ({
                 isDisabled={
                   isGeneratingShots || isRunActive || isSavingShotRenderEngine
                 }
-                onChange={setShotRenderEngine}
+                onChange={(engine) =>
+                  setCloudEngineOverride({ projectId, engine })
+                }
               />
             )}
-            <ProjectOutputSizeControls
-              outputSize={outputSize}
-              isAspectRatioHidden
-              isDisabled={
-                isSavingOutputSize || isGeneratingShots || isRunActive
-              }
-              onChange={setOutputSize}
-            />
-            {!isMinimalModelGroupInstalled ? (
+            {!isLocalProject &&
+              shotEngine !== project?.settings?.shot_engine && (
+                <MainButton
+                  colorScheme="secondary"
+                  isDisabled={isRunActive || isSavingShotRenderEngine}
+                  onPress={() => setShotRenderEngine(shotEngine)}
+                >
+                  {t("script_project.save_sheet_render_default.label")}
+                </MainButton>
+              )}
+            {isFalSelected ? (
+              <FalGenerationControls
+                model={FAL_SHOT_ENGINE}
+                settings={generation.settingsFor(FAL_SHOT_ENGINE)}
+                onChange={(settings) =>
+                  generation.change(FAL_SHOT_ENGINE, "batch", settings)
+                }
+                onSave={() => generation.save(FAL_SHOT_ENGINE)}
+                disabled={isRunActive || generation.isSaving}
+              />
+            ) : (
+              <ProjectOutputSizeControls
+                outputSize={outputSize}
+                isAspectRatioHidden
+                isDisabled={
+                  isSavingOutputSize || isGeneratingShots || isRunActive
+                }
+                onChange={setOutputSize}
+              />
+            )}
+            {!isFalSelected && !isMinimalModelGroupInstalled ? (
               <SetupMagoStudioButton
                 requiredLocalInstall={MINIMAL_MODEL_GROUP_INSTALL}
                 lockedRenderButton={generateShotsButton}
               />
-            ) : !localReady ? (
+            ) : !isFalSelected && !localReady ? (
               <LaunchComfyOrSetupMagoStudioButton
                 requiredLocalInstall={MINIMAL_MODEL_GROUP_INSTALL}
                 lockedRenderButton={generateShotsButton}
@@ -842,6 +1156,29 @@ export const ShotsTab: React.FC<Props> = ({
               data-testid="script-project-shots-strip"
             >
               {matchingShots.map((shot, listedIndex) => {
+                const overrideKey = shotOverridePrefix + shot.timeline_id;
+                const override = shotModelOverrides[overrideKey];
+                const actionProvider =
+                  override === FAL_SHOT_PROVIDER || override === "local-comfy"
+                    ? override
+                    : shotProvider;
+                const usesAlternate = override === alternateModel;
+                const actionUsesFal =
+                  isLocalProject && actionProvider === FAL_SHOT_PROVIDER;
+                const actionEngine = actionUsesFal
+                  ? MINIMAX_H3_MAX_SHOT_RENDER_ENGINE
+                  : isLocalProject
+                    ? projectShotEngine
+                    : isSelectableShotRenderEngine(override)
+                      ? override
+                      : shotEngine;
+                const actionDryRun = actionUsesFal
+                  ? falPreviewByTimeline.get(shot.timeline_id)
+                  : usesAlternate
+                    ? alternateDryRun
+                    : shot.hidden
+                      ? hiddenShotsDryRun
+                      : dryRun;
                 const predecessorShot = findSequentialPredecessorShot(
                   shot,
                   shotsInActiveScript
@@ -955,15 +1292,15 @@ export const ShotsTab: React.FC<Props> = ({
                         }}
                         shot={shot}
                         sequentialBlockedLabelKey={findSequentialBlockedLabelKey(
-                          dryRun,
+                          actionDryRun,
                           shot
                         )}
                         isSequentialReferenceIgnored={isShotSequentialReferenceIgnored(
-                          dryRun,
+                          actionDryRun,
                           shot
                         )}
                         isShotBlockedForNoReferenceImage={isShotBlockedForNoReferenceImage(
-                          dryRun,
+                          actionDryRun,
                           shot
                         )}
                         sheetGroups={projectState.keys}
@@ -975,18 +1312,34 @@ export const ShotsTab: React.FC<Props> = ({
                         hasFailedPlanStep={failedShotTimelineIds.has(
                           shot.timeline_id
                         )}
-                        changedPaths={resolveShotChangedPaths(dryRun, shot)}
+                        changedPaths={resolveShotChangedPaths(
+                          actionDryRun,
+                          shot
+                        )}
                         shotFrames={shotFrames}
-                        outputSize={outputSize}
-                        hasShotChangedSinceRender={(shot.hidden
-                          ? staleHiddenShotTimelineIds
-                          : staleShotTimelineIds
-                        ).has(shot.timeline_id)}
+                        outputSize={
+                          actionUsesFal
+                            ? falSize(shot.timeline_id)
+                            : projectOutputSize
+                        }
+                        renderEngine={actionEngine}
+                        hasShotChangedSinceRender={
+                          actionUsesFal
+                            ? resolveWouldRunShotTimelineIds(actionDryRun, [
+                                shot
+                              ]).includes(shot.timeline_id)
+                            : (usesAlternate
+                                ? staleAlternateShotIds
+                                : shot.hidden
+                                  ? staleHiddenShotTimelineIds
+                                  : staleShotTimelineIds
+                              ).has(shot.timeline_id)
+                        }
                         estimateRerenderCost={(sceneDurationSeconds) =>
                           !project
                             ? null
                             : isLocalProject
-                              ? { kind: "local" }
+                              ? { kind: actionUsesFal ? "fal-usage" : "local" }
                               : {
                                   kind: "credits",
                                   amount: estimateStaleShotsCredits({
@@ -996,7 +1349,7 @@ export const ShotsTab: React.FC<Props> = ({
                                         duration_s: sceneDurationSeconds
                                       }
                                     ],
-                                    shotEngine,
+                                    shotEngine: actionEngine,
                                     outputSize,
                                     projectShotFrames: shotFrames,
                                     attemptsPerShot: shotQualityRetries + 1
@@ -1009,7 +1362,51 @@ export const ShotsTab: React.FC<Props> = ({
                           editingShotRequest?.isShotLocked !== undefined &&
                           editingShotRequest.timelineId === shot.timeline_id
                         }
-                        isRenderDisabled={!canRender}
+                        isRenderDisabled={
+                          isRunActive ||
+                          isGeneratingShots ||
+                          !(actionUsesFal
+                            ? canRenderFal
+                            : canRenderLegacy &&
+                              (!isLocalProject ||
+                                (isMinimalModelGroupInstalled &&
+                                  localSetupReady)))
+                        }
+                        shotModelPicker={
+                          isLocalProject ? (
+                            <div className="flex flex-wrap gap-2">
+                              {shotModelPicker(
+                                actionProvider,
+                                (provider) =>
+                                  overrideShotModel(overrideKey, provider),
+                                `shot-render-model-${shotTestIdSuffix}`
+                              )}
+                              <FalGenerationControls
+                                model={actionUsesFal ? FAL_SHOT_ENGINE : ""}
+                                settings={generation.settingsFor(
+                                  FAL_SHOT_ENGINE,
+                                  shot.timeline_id
+                                )}
+                                onChange={(settings) =>
+                                  generation.change(
+                                    FAL_SHOT_ENGINE,
+                                    shot.timeline_id,
+                                    settings
+                                  )
+                                }
+                                disabled={isRunActive || isGeneratingShots}
+                              />
+                            </div>
+                          ) : (
+                            <ShotRenderSpeedSwitch
+                              shotEngine={actionEngine}
+                              isDisabled={isRunActive || isGeneratingShots}
+                              onChange={(engine) =>
+                                overrideShotModel(overrideKey, engine)
+                              }
+                            />
+                          )
+                        }
                         onPinVersion={(assetId) =>
                           pinShot({
                             projectId,
@@ -1031,22 +1428,77 @@ export const ShotsTab: React.FC<Props> = ({
                         scenesView={scenesView}
                         scenesLayout={scenesLayout}
                         storyboardCost={
-                          isStoryboardRenderedLocally
-                            ? { kind: "local" }
-                            : {
-                                kind: "credits",
-                                amount: resolveStoryboardCreditsForScene(shot)
-                              }
+                          isFalSheetModel(storyboardModelForScene(shot))
+                            ? { kind: "fal-usage" }
+                            : isStoryboardRenderedLocally
+                              ? { kind: "local" }
+                              : {
+                                  kind: "credits",
+                                  amount: resolveStoryboardCreditsForScene(shot)
+                                }
                         }
                         isStoryboardSubmitting={isSubmittingSceneStoryboard(
                           shot.timeline_id
                         )}
                         canGenerateStoryboard={canGenerateStoryboardForScene(
-                          shot
+                          shot,
+                          storyboardModelForScene(shot)
                         )}
+                        storyboardModelPicker={
+                          isLocalProject &&
+                          storyboardModel.isFalAvailable && (
+                            <div className="flex flex-wrap gap-2">
+                              <SheetRenderModelDropdown
+                                sheetRenderModel={storyboardModelForScene(shot)}
+                                onChange={(model) =>
+                                  setSceneStoryboardModels((previous) => ({
+                                    ...previous,
+                                    [`${projectId}:${shot.timeline_id}`]: model
+                                  }))
+                                }
+                                isDisabled={
+                                  isRunActive ||
+                                  isSubmittingSceneStoryboard(shot.timeline_id)
+                                }
+                                isLocalProject
+                                includeFalModel
+                                includeCloudModels={isSheetRenderModel(
+                                  storyboardRenderModel
+                                )}
+                                localModels={
+                                  isLocalSheetRenderModel(storyboardRenderModel)
+                                    ? [storyboardRenderModel]
+                                    : []
+                                }
+                                label={t(
+                                  "script_project.storyboard_render_model_input.label"
+                                )}
+                              />
+                              <FalGenerationControls
+                                model={storyboardModelForScene(shot)}
+                                settings={generation.settingsFor(
+                                  storyboardModelForScene(shot),
+                                  `storyboard:${shot.timeline_id}`
+                                )}
+                                onChange={(settings) =>
+                                  generation.change(
+                                    storyboardModelForScene(shot),
+                                    `storyboard:${shot.timeline_id}`,
+                                    settings
+                                  )
+                                }
+                                disabled={
+                                  isRunActive ||
+                                  isSubmittingSceneStoryboard(shot.timeline_id)
+                                }
+                              />
+                            </div>
+                          )
+                        }
                         onGenerateStoryboard={(storyboardRequest) =>
                           void generateStoryboardForScene({
                             scene: shot,
+                            model: storyboardModelForScene(shot),
                             ...storyboardRequest
                           })
                         }
@@ -1066,7 +1518,12 @@ export const ShotsTab: React.FC<Props> = ({
                           shot.timeline_id
                         )}
                         onRetryRender={(draft) =>
-                          void generateShotFromSavedPrompt(shot, draft)
+                          void generateShotFromSavedPrompt(
+                            shot,
+                            draft,
+                            actionUsesFal,
+                            actionEngine
+                          )
                         }
                         onSaveTags={(tags) =>
                           editShot({

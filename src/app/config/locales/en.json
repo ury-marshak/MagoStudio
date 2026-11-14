@@ -217,6 +217,17 @@
       "falHint": "Use a separate Keychain account for the fal API key, such as fal.",
       "checkKeychain": "Check Keychain",
       "checkingKeychain": "Checking Keychain…",
+      "referenceImageModel": "Default reference image model",
+      "storyboardImageModel": "Default storyboard model",
+      "shotProvider": "Default video shot model",
+      "appDefault": "Automatic",
+      "reasoningEffort": "Reasoning effort",
+      "reasoningDefault": "Provider default",
+      "reasoningLevels": {
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High"
+      },
       "checkKeychainPassed": "Keychain entry is readable. fal.ai was not contacted.",
       "text": "Text provider",
       "vision": "Vision provider",
@@ -3229,6 +3240,36 @@
     "sheet_render_model_gpt_image_2_t2i": {
       "label": "GPT Image 2"
     },
+    "sheet_render_model_fal_minimax_h3_image": {
+      "label": "MiniMax H3 Image (fal)"
+    },
+    "sheet_render_model_fal_nano_banana_2_1": {
+      "label": "Nano Banana 2.1 (fal)"
+    },
+    "fal_usage": {
+      "label": "Billed by fal"
+    },
+    "shot_provider": {
+      "label": "Shot rendering provider"
+    },
+    "shot_blocked_fal_sequential": {
+      "label": "Suspend sequential references to use H3 Max (fal)"
+    },
+    "shot_fal_model": {
+      "label": "H3 Max (fal)"
+    },
+    "shot_comfy_model": {
+      "label": "H3 (ComfyUI)"
+    },
+    "sheet_render_model_fal_nano_banana_2": {
+      "label": "Nano Banana 2 (fal)"
+    },
+    "save_sheet_render_default": {
+      "label": "Save as project default"
+    },
+    "sheet_fal_estimate": {
+      "label": "Est. {{amount}} on fal"
+    },
     "sheet_render_model_nanobanana_2_t2i": {
       "label": "Nano Banana 2"
     },
@@ -3629,6 +3670,20 @@
     },
     "section_group_count": {
       "label": "{{count}}"
+    },
+    "fal_settings": {
+      "resolution": "Generation resolution",
+      "aspect_ratio": "Generation aspect ratio",
+      "megapixels": "Output megapixels (approx.)",
+      "thinking_level": "Thinking effort",
+      "prompt_expansion_mode": "Provider prompt expansion",
+      "seed": "Seed",
+      "random": "Random",
+      "layout_aspect": "Use reference layout",
+      "video_fixed": "24 fps · generated audio · scene duration (5–15 s) · 1080P refines 768P",
+      "image_fixed": "One PNG",
+      "save": "Save generation settings as project default",
+      "h3_fixed": "One PNG · generation prompt expansion off"
     }
   },
   "bulk_rendering": {

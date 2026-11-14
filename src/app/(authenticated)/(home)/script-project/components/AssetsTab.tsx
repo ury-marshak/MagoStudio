@@ -1,23 +1,30 @@
-﻿import { useLocalSheetModelInstallGate } from "@app/components/LocalSetupWizard/hooks/useLocalSheetModelInstallGate";
+import { useLocalSheetModelInstallGate } from "@app/components/LocalSetupWizard/hooks/useLocalSheetModelInstallGate";
 import { SetupMagoStudioButton } from "@app/components/LocalSetupWizard/SetupMagoStudioButton";
 import { Accordion } from "@components/Accordion";
 import { Checkbox } from "@components/Checkbox";
 import { Dropdown } from "@components/Dropdown";
+import { FalGenerationControls } from "@components/FalGenerationControls";
 import { MainButton } from "@components/MainButton";
 import { Text } from "@components/Text";
 import { usePlanDetail } from "@domains/plan/usePlanDetail";
 import { useProject } from "@domains/project/useProject";
 import {
+  type AnySheetRenderModel,
+  isFalSheetModel,
+  isLocalSheetRenderModel,
   SHEET_RESOLUTION_LABEL_KEY_BY_RESOLUTION,
   SHEET_RESOLUTIONS
 } from "@domains/scriptProject/constants";
 import { useDescribeSheetGroup } from "@domains/scriptProject/useDescribeSheetGroup";
 import { useEditSheetGroup } from "@domains/scriptProject/useEditSheetGroup";
+import { useSheetActionPreviews } from "@domains/scriptProject/useFalActionPreviews";
+import { useFalGenerationSettings } from "@domains/scriptProject/useFalGenerationSettings";
 import { useGenerateProjectSheets } from "@domains/scriptProject/useGenerateProjectSheets";
 import { usePinSheetGroupImage } from "@domains/scriptProject/usePinSheetGroupImage";
 import { useProjectScriptVersions } from "@domains/scriptProject/useProjectScriptVersions";
 import { useProjectSheetsDryRun } from "@domains/scriptProject/useProjectSheetsDryRun";
 import { useRenderSheetGroup } from "@domains/scriptProject/useRenderSheetGroup";
+import { useScriptProjectRenderAccess } from "@domains/scriptProject/useScriptProjectRenderAccess";
 import { useSheetOutputSize } from "@domains/scriptProject/useSheetOutputSize";
 import { useSheetRenderModel } from "@domains/scriptProject/useSheetRenderModel";
 import { useShotsByDropped } from "@domains/scriptProject/useShotsByDropped";
@@ -63,7 +70,6 @@ type Props = {
   projectState: ProjectState;
   renderingSheetTokens: Set<string>;
   isRunActive: boolean;
-  canRender: boolean;
   onRunStarted: (planId: string, sheetTokens: string[]) => void;
 };
 
@@ -72,7 +78,6 @@ export const AssetsTab: React.FC<Props> = ({
   projectState,
   renderingSheetTokens,
   isRunActive,
-  canRender,
   onRunStarted
 }) => {
   const { t } = useTranslation();
@@ -92,13 +97,89 @@ export const AssetsTab: React.FC<Props> = ({
     isSavingSheetResolution
   } = useSheetOutputSize(projectId);
   const {
-    sheetRenderModel,
+    sheetRenderModel: defaultSheetRenderModel,
+    isFalAvailable,
+    isLoadingProvider,
     setSheetRenderModel,
     isSavingSheetRenderModel,
     canUseCloudSheetModels
   } = useSheetRenderModel(projectId);
+  const [modelOverride, setModelOverride] = useState<{
+    projectId: string;
+    model: AnySheetRenderModel;
+  }>();
+  const sheetRenderModel =
+    modelOverride?.projectId === projectId
+      ? modelOverride.model
+      : defaultSheetRenderModel;
+  const [actionModels, setActionModels] = useState<
+    Record<string, AnySheetRenderModel>
+  >({});
+  const actionModelPrefix = `${projectId}:`;
+  const actionModel = (id: string) =>
+    actionModels[actionModelPrefix + id] ?? sheetRenderModel;
+  const actionOverrides = Object.entries(actionModels)
+    .filter(([key]) => key.startsWith(actionModelPrefix))
+    .map(([, model]) => model);
+  const localOverride = actionOverrides.find(isLocalSheetRenderModel);
+  const cloudOverride = actionOverrides.find(isSheetRenderModel);
+  const canRenderLocalOverride = useScriptProjectRenderAccess(
+    projectId,
+    localOverride,
+    !!localOverride && !isLoadingProvider
+  );
+  const canRenderCloudOverride = useScriptProjectRenderAccess(
+    projectId,
+    cloudOverride,
+    !!cloudOverride && !isLoadingProvider
+  );
+  const canRenderAction = (model: AnySheetRenderModel) =>
+    model === sheetRenderModel
+      ? canRender
+      : isFalSheetModel(model)
+        ? isFalAvailable && !isLoadingProvider
+        : isLocalSheetRenderModel(model)
+          ? canRenderLocalOverride
+          : canRenderCloudOverride;
+  const generation = useFalGenerationSettings(projectId);
+  const renderActionModelPicker = (id: string, testId: string) => (
+    <div className="flex flex-wrap gap-2">
+      <SheetRenderModelDropdown
+        sheetRenderModel={actionModel(id)}
+        isDisabled={isBusy || isRunActive || isLoadingProvider}
+        onChange={(model) =>
+          setActionModels((models) => ({
+            ...models,
+            [actionModelPrefix + id]: model
+          }))
+        }
+        isLocalProject={isLocalProject}
+        includeCloudModels={canUseCloudSheetModels}
+        includeFalModel={isFalAvailable}
+        isLabelHidden
+        testId={testId}
+      />
+      <FalGenerationControls
+        model={actionModel(id)}
+        settings={generation.settingsFor(actionModel(id), id)}
+        onChange={(settings) =>
+          generation.change(actionModel(id), id, settings)
+        }
+        disabled={isBusy || isRunActive}
+      />
+    </div>
+  );
+  const isFalSelected = isFalSheetModel(sheetRenderModel);
+  const canRender = useScriptProjectRenderAccess(
+    projectId,
+    sheetRenderModel,
+    !isLoadingProvider
+  );
   const { isLocalSheetModelInstalled, requiredLocalInstall } =
-    useLocalSheetModelInstallGate({ sheetRenderModel, isLocalProject });
+    useLocalSheetModelInstallGate({
+      sheetRenderModel,
+      isLocalProject: isLocalProject && !isLoadingProvider
+    });
   const [searchQuery, setSearchQuery] = useState("");
   const [collapsedSectionKinds, setCollapsedSectionKinds] = useState<string[]>(
     []
@@ -128,7 +209,10 @@ export const AssetsTab: React.FC<Props> = ({
   const { data: dryRun, isFetching: isDryRunFetching } = useProjectSheetsDryRun(
     projectId,
     sheetOutputSize,
-    { render_model: sheetRenderModel },
+    {
+      render_model: sheetRenderModel,
+      provider_settings: generation.settingsFor(sheetRenderModel)
+    },
     canRender
   );
   const { mutate: generateSheets, isPending: isGeneratingSheets } =
@@ -156,6 +240,32 @@ export const AssetsTab: React.FC<Props> = ({
 
   const { enabledGroups, disabledGroups } = partitionSheetGroupsByEnabled(
     projectState.keys
+  );
+  const individualPreviews = useSheetActionPreviews(
+    enabledGroups.map((group) => {
+      const model = actionModel(`group:${group.token}`);
+      return {
+        projectId,
+        isDryRun: true,
+        outputSize: sheetOutputSize,
+        settings: {
+          render_model: model,
+          provider_settings: generation.settingsFor(
+            model,
+            `group:${group.token}`
+          )
+        },
+        tokens: [group.token],
+        enabled:
+          isLocalProject && isFalSheetModel(model) && canRenderAction(model)
+      };
+    })
+  );
+  const individualPreviewByToken = new Map(
+    enabledGroups.map((group, index) => [
+      group.token,
+      individualPreviews[index]?.data
+    ])
   );
   const hasDesignVersions = groupSheetGroupsByDesignFamily(enabledGroups).some(
     (family) => family.hasVersions
@@ -205,7 +315,8 @@ export const AssetsTab: React.FC<Props> = ({
         isDryRun: false,
         outputSize: sheetOutputSize,
         settings: {
-          render_model: sheetRenderModel
+          render_model: sheetRenderModel,
+          provider_settings: generation.settingsFor(sheetRenderModel)
         },
         shouldScoreImages: isLocalProject ? false : shouldScoreImages
       },
@@ -261,17 +372,22 @@ export const AssetsTab: React.FC<Props> = ({
       : [])
   ];
 
-  const discardSheetGroupDraft = (draftId: string) =>
+  const discardSheetGroupDraft = (draftId: string) => {
     setSheetGroupDrafts((drafts) =>
       drafts.filter((draft) => draft.draftId !== draftId)
     );
+    setActionModels((models) => {
+      const remainingModels = { ...models };
+      delete remainingModels[`${actionModelPrefix}draft:${draftId}`];
+      return remainingModels;
+    });
+  };
 
-  const createSheetGroupWithFirstRender = (entity: {
-    token: string;
-    name: string;
-    kind: SheetKind;
-    prompt: string;
-  }) => {
+  const createSheetGroupWithFirstRender = (
+    entity: { token: string; name: string; kind: SheetKind; prompt: string },
+    renderModel: AnySheetRenderModel,
+    actionId: string
+  ) => {
     if (!sheetsTimelineId) return;
 
     renderSheetGroup(
@@ -281,7 +397,8 @@ export const AssetsTab: React.FC<Props> = ({
         name: entity.name,
         kind: entity.kind,
         prompt: entity.prompt,
-        renderModel: sheetRenderModel,
+        renderModel,
+        providerSettings: generation.settingsFor(renderModel, actionId),
         renderMode: RenderMode.CREDITS,
         outputSize: sheetOutputSize
       },
@@ -304,7 +421,8 @@ export const AssetsTab: React.FC<Props> = ({
       hasUnsavedEdits: boolean;
       referenceAssetIds: string[];
       referenceInstruction: string;
-    }
+    },
+    renderModel: AnySheetRenderModel
   ) => {
     if (!sheetsTimelineId) return;
 
@@ -329,7 +447,11 @@ export const AssetsTab: React.FC<Props> = ({
           description: draft.description,
           token: group.token
         }),
-        renderModel: sheetRenderModel,
+        renderModel,
+        providerSettings: generation.settingsFor(
+          renderModel,
+          `group:${group.token}`
+        ),
         renderMode: RenderMode.CREDITS,
         outputSize: sheetOutputSize,
         referenceAssetIds: draft.referenceAssetIds,
@@ -343,90 +465,109 @@ export const AssetsTab: React.FC<Props> = ({
     );
   };
 
-  const renderSheetGroupRow = (group: ProjectState["keys"][number]) => (
-    <SheetGroupRow
-      key={`${group.token}:${(group.reference_asset_ids ?? []).join(",")}:${group.reference_instruction ?? ""}`}
-      group={group}
-      imageUrlsByAssetId={imageUrlsByAssetId}
-      changedPaths={dryRun?.changed?.[group.token]}
-      isRendering={isSheetGroupRendering(group, renderingSheetTokens)}
-      onUploadImage={(file) =>
-        void uploadSheetGroupImage({
-          timelineId: sheetsTimelineId,
-          token: group.token,
-          file
-        })
-      }
-      onUploadReference={uploadSheetGroupReference}
-      isBusy={isBusy}
-      isRunActive={isRunActive}
-      isRenderDisabled={!canRender}
-      renderCost={
-        !project
-          ? null
-          : isSheetRenderModel(sheetRenderModel)
-            ? { kind: "credits", amount: creditsPerSheetImage }
-            : { kind: "local" }
-      }
-      supportsImageReferences={isLocalProject || canRender}
-      shouldFetchImageInputs={!isLocalProject}
-      onPin={(assetId) => {
-        const staleShotCount = countShotsTaggingEntity(
-          shotsInActiveScript,
-          group.token
-        );
-        if (staleShotCount === 0) {
-          pinSheetImage({
+  const renderSheetGroupRow = (group: ProjectState["keys"][number]) => {
+    const modelId = `group:${group.token}`;
+    const model = actionModel(modelId);
+    return (
+      <SheetGroupRow
+        key={`${group.token}:${(group.reference_asset_ids ?? []).join(",")}:${group.reference_instruction ?? ""}`}
+        group={group}
+        imageUrlsByAssetId={imageUrlsByAssetId}
+        changedPaths={
+          isFalSheetModel(model)
+            ? individualPreviewByToken.get(group.token)?.changed?.[group.token]
+            : model === sheetRenderModel
+              ? dryRun?.changed?.[group.token]
+              : undefined
+        }
+        isRendering={isSheetGroupRendering(group, renderingSheetTokens)}
+        onUploadImage={(file) =>
+          void uploadSheetGroupImage({
             timelineId: sheetsTimelineId,
             token: group.token,
-            selectedAssetId: assetId
-          });
-          return;
+            file
+          })
         }
-        setPendingPin({
-          token: group.token,
-          entityName: group.name,
-          assetId,
-          staleShotCount
-        });
-      }}
-      onSaveFields={(fields) =>
-        editSheetGroup({
-          timelineId: sheetsTimelineId,
-          token: group.token,
-          ...fields
-        })
-      }
-      onToggleEnabled={() => {
-        if (!group.enabled) {
+        onUploadReference={uploadSheetGroupReference}
+        isBusy={isBusy}
+        isRunActive={isRunActive}
+        isRenderDisabled={!canRenderAction(model)}
+        renderModelPicker={renderActionModelPicker(
+          modelId,
+          `sheet-group-render-model-${group.token}`
+        )}
+        renderCost={
+          !project
+            ? null
+            : isSheetRenderModel(model)
+              ? {
+                  kind: "credits",
+                  amount: estimateSheetImageCredits(model, sheetOutputSize)
+                }
+              : isFalSheetModel(model)
+                ? { kind: "fal-usage" }
+                : { kind: "local" }
+        }
+        supportsImageReferences={isLocalProject || canRender}
+        shouldFetchImageInputs={!isLocalProject}
+        onPin={(assetId) => {
+          const staleShotCount = countShotsTaggingEntity(
+            shotsInActiveScript,
+            group.token
+          );
+          if (staleShotCount === 0) {
+            pinSheetImage({
+              timelineId: sheetsTimelineId,
+              token: group.token,
+              selectedAssetId: assetId
+            });
+            return;
+          }
+          setPendingPin({
+            token: group.token,
+            entityName: group.name,
+            assetId,
+            staleShotCount
+          });
+        }}
+        onSaveFields={(fields) =>
           editSheetGroup({
             timelineId: sheetsTimelineId,
             token: group.token,
-            enabled: true
-          });
-          return;
+            ...fields
+          })
         }
-        setPendingRemoval({
-          token: group.token,
-          entityName: group.name,
-          taggedShotCount: countShotsTaggingEntity(
-            shotsInActiveScript,
-            group.token
-          )
-        });
-      }}
-      onDescribeFromImage={(assetId) =>
-        describeSheetGroup({
-          timelineId: sheetsTimelineId,
-          token: group.token,
-          assetId
-        })
-      }
-      onRerender={(draft) =>
-        void rerenderSheetGroupFromSavedFields(group, draft)
-      }
-    />
-  );
+        onToggleEnabled={() => {
+          if (!group.enabled) {
+            editSheetGroup({
+              timelineId: sheetsTimelineId,
+              token: group.token,
+              enabled: true
+            });
+            return;
+          }
+          setPendingRemoval({
+            token: group.token,
+            entityName: group.name,
+            taggedShotCount: countShotsTaggingEntity(
+              shotsInActiveScript,
+              group.token
+            )
+          });
+        }}
+        onDescribeFromImage={(assetId) =>
+          describeSheetGroup({
+            timelineId: sheetsTimelineId,
+            token: group.token,
+            assetId
+          })
+        }
+        onRerender={(draft) =>
+          void rerenderSheetGroupFromSavedFields(group, draft, model)
+        }
+      />
+    );
+  };
 
   const isLocalSheetRenderLocked = !isLocalSheetModelInstalled;
 
@@ -444,7 +585,9 @@ export const AssetsTab: React.FC<Props> = ({
                 kind: "credits",
                 amount: staleKeyCount * creditsPerSheetImage
               }
-            : { kind: "local" }
+            : isFalSelected
+              ? { kind: "fal-usage" }
+              : { kind: "local" }
       }
       isDisabled={
         !canRender ||
@@ -546,31 +689,63 @@ export const AssetsTab: React.FC<Props> = ({
           <SheetRenderModelDropdown
             sheetRenderModel={sheetRenderModel}
             isDisabled={isSavingSheetRenderModel || isRunActive}
-            onChange={setSheetRenderModel}
+            onChange={(model) => {
+              setModelOverride({ projectId, model });
+            }}
             isLocalProject={isLocalProject}
             includeCloudModels={canUseCloudSheetModels}
-            isLabelHidden
+            includeFalModel={isFalAvailable}
             testId="script-project-assets-render-model"
           />
-          <Dropdown
-            aria-label={t("script_project.sheet_resolution_input.label")}
-            selectedKey={sheetResolution}
-            isDisabled={
-              isSavingSheetResolution ||
-              isGeneratingSheets ||
-              isRunActive ||
-              isBusy
+          <FalGenerationControls
+            model={sheetRenderModel}
+            settings={generation.settingsFor(sheetRenderModel)}
+            onChange={(settings) =>
+              generation.change(sheetRenderModel, "batch", settings)
             }
-            items={SHEET_RESOLUTIONS.map((resolution) => ({
-              key: resolution,
-              label: t(SHEET_RESOLUTION_LABEL_KEY_BY_RESOLUTION[resolution])
-            }))}
-            onSelectionChange={(key) => {
-              if (key === "1m" || key === "2m") setSheetResolution(key);
-            }}
-            className="w-28"
-            data-testid="script-project-sheet-resolution"
+            onSave={() => generation.save(sheetRenderModel)}
+            disabled={isRunActive || generation.isSaving}
           />
+          {project &&
+            project.settings?.sheet_render_model !== sheetRenderModel && (
+              <MainButton
+                colorScheme="secondary"
+                isDisabled={
+                  isSavingSheetRenderModel ||
+                  isRunActive ||
+                  (isFalSelected && !isFalAvailable)
+                }
+                onPress={() => setSheetRenderModel(sheetRenderModel)}
+              >
+                {t("script_project.save_sheet_render_default.label")}
+              </MainButton>
+            )}
+          {isFalSelected ? (
+            <Text variant="xs" color="glyph-secondary">
+              {generation.settingsFor(sheetRenderModel)?.resolution ??
+                `${generation.settingsFor(sheetRenderModel)?.megapixels} MP`}
+            </Text>
+          ) : (
+            <Dropdown
+              aria-label={t("script_project.sheet_resolution_input.label")}
+              selectedKey={sheetResolution}
+              isDisabled={
+                isSavingSheetResolution ||
+                isGeneratingSheets ||
+                isRunActive ||
+                isBusy
+              }
+              items={SHEET_RESOLUTIONS.map((resolution) => ({
+                key: resolution,
+                label: t(SHEET_RESOLUTION_LABEL_KEY_BY_RESOLUTION[resolution])
+              }))}
+              onSelectionChange={(key) => {
+                if (key === "1m" || key === "2m") setSheetResolution(key);
+              }}
+              className="w-28"
+              data-testid="script-project-sheet-resolution"
+            />
+          )}
           <Checkbox
             inputId="script-project-score-assets"
             isChecked={isLocalProject ? false : shouldScoreImages}
@@ -626,8 +801,21 @@ export const AssetsTab: React.FC<Props> = ({
                     )
                   )
                 }
+                isRenderUnavailable={
+                  !canRenderAction(actionModel(`draft:${draft.draftId}`))
+                }
+                renderModelPicker={renderActionModelPicker(
+                  `draft:${draft.draftId}`,
+                  `draft-sheet-group-render-model-${draft.draftId}`
+                )}
                 onRender={(newSheetGroup) => {
-                  createSheetGroupWithFirstRender(newSheetGroup);
+                  const model = actionModel(`draft:${draft.draftId}`);
+                  if (!canRenderAction(model)) return;
+                  createSheetGroupWithFirstRender(
+                    newSheetGroup,
+                    model,
+                    `draft:${draft.draftId}`
+                  );
                   discardSheetGroupDraft(draft.draftId);
                 }}
                 onUploadImage={(newSheetGroup, file) => {

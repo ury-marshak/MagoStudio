@@ -6,6 +6,8 @@ import { ProviderPreferences } from "@/platform/providerPreferences";
 import { isCloudRenderAvailable } from "@/platform/renderTarget";
 import { useProviderPreferences } from "@/platform/useProviderPreferences";
 
+import { isFalSheetModel } from "./constants";
+import { useFalProviderConfigured } from "./useFalProviderConfigured";
 import { isSheetRenderModel } from "./utils/isSheetRenderModel";
 
 const PROVIDER_READINESS_INTERVAL_MS = 10_000;
@@ -28,21 +30,29 @@ export const canRenderLocalScriptProject = (
 /** Sheets use their selected model's provider, including cloud models in local projects. */
 export const useScriptProjectRenderAccess = (
   projectId?: string,
-  sheetRenderModel?: string
+  sheetRenderModel?: string,
+  enabled = true
 ): boolean => {
   const preferences = useProviderPreferences();
   const { data: project } = useProject(projectId);
+  const isFalSelected = isFalSheetModel(sheetRenderModel);
+  const isFalAvailable = useFalProviderConfigured(
+    project?.origin === "local" && isFalSelected
+  );
   const needsComfy =
-    project?.origin === "local" && !isSheetRenderModel(sheetRenderModel);
+    project?.origin === "local" &&
+    !isFalSelected &&
+    !isSheetRenderModel(sheetRenderModel);
   const { data: comfy } = useQuery({
     queryKey: ["local-script-project-render-access", projectId],
-    enabled: !!projectId && needsComfy,
+    enabled: enabled && !!projectId && needsComfy,
     queryFn: () => getLocalDesktopApi().comfy.check(),
     staleTime: PROVIDER_READINESS_INTERVAL_MS,
     refetchInterval: needsComfy ? PROVIDER_READINESS_INTERVAL_MS : false
   });
-  if (!project) return false;
+  if (!enabled || !project) return false;
   if (project.origin === "local") {
+    if (isFalSelected) return isFalAvailable;
     return canRenderLocalScriptProject(
       comfy?.available ?? false,
       preferences,

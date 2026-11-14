@@ -122,7 +122,9 @@ export const generateOpenAiCompatible =
           { role: "user", content }
         ],
         max_completion_tokens: maxTokens,
-        temperature,
+        ...(config.reasoningEffort
+          ? { reasoning: { effort: config.reasoningEffort } }
+          : { temperature }),
         stream: false,
         ...(isOpenRouter(config)
           ? { provider: { allow_fallbacks: false, require_parameters: true } }

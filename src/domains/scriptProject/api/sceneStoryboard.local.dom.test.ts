@@ -26,15 +26,20 @@ const response = {
 };
 let origin = "local";
 const update = vi.fn();
+const getFal = vi.fn();
+const scriptSetupStatus = vi.fn();
 beforeEach(() => {
   vi.clearAllMocks();
   origin = "local";
+  getFal.mockResolvedValue(null);
   Object.defineProperty(window, "mago", {
     configurable: true,
     value: {
       account: { mode: "offline" },
       projects: { get: async () => ({ id: "p", origin, settings: {} }) },
-      scriptProjects: { update }
+      scriptProjects: { update },
+      externalProviders: { fal: { get: getFal } },
+      comfy: { scriptSetupStatus }
     }
   });
 });
@@ -84,6 +89,35 @@ describe("local Storyboard routing", () => {
       inputImageAssetIds: []
     });
     expect(backendApiClient.post).not.toHaveBeenCalled();
+  });
+  it("uses the saved fal storyboard default and honors a generation override", async () => {
+    getFal.mockResolvedValue({
+      keychainAccount: "fal",
+      storyboardImageModel: "fal_nano_banana_2_1"
+    });
+    update.mockResolvedValue({
+      timeline_id: "scene",
+      asset_id: null,
+      plan_id: "plan"
+    });
+    const request = { projectId: "p", sceneTimelineId: "scene" };
+    await postSceneStoryboardGenerate(request);
+    expect(update).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        payload: { timelineId: "scene", renderModel: "fal_nano_banana_2_1" }
+      })
+    );
+    await postSceneStoryboardGenerate({
+      ...request,
+      renderModel: "fal_minimax_h3_image"
+    });
+    expect(update).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        payload: { timelineId: "scene", renderModel: "fal_minimax_h3_image" }
+      })
+    );
+    expect(scriptSetupStatus).not.toHaveBeenCalled();
+    expect(executeCloudSheetPlan).not.toHaveBeenCalled();
   });
   it("runs a cloud sheet plan for a local project only while signed in", async () => {
     update.mockResolvedValue({

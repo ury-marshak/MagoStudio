@@ -108,6 +108,7 @@ type Props = {
   scenesView: ScenesView;
   scenesLayout: ScenesLayout;
   storyboardCost: ScriptProjectRenderCost;
+  storyboardModelPicker?: React.ReactNode;
   isStoryboardSubmitting: boolean;
   canGenerateStoryboard: boolean;
   onGenerateStoryboard: (storyboardRequest: {
@@ -123,6 +124,8 @@ type Props = {
   isBusy: boolean;
   isLockPending: boolean;
   isRenderDisabled: boolean;
+  shotModelPicker?: React.ReactNode;
+  renderEngine?: ReturnType<typeof useShotRenderEngine>["shotEngine"];
 };
 
 export const ShotRow: React.FC<Props> = ({
@@ -151,6 +154,7 @@ export const ShotRow: React.FC<Props> = ({
   scenesView,
   scenesLayout,
   storyboardCost,
+  storyboardModelPicker,
   isStoryboardSubmitting,
   canGenerateStoryboard,
   onGenerateStoryboard,
@@ -162,7 +166,9 @@ export const ShotRow: React.FC<Props> = ({
   dragHandle,
   isBusy,
   isLockPending,
-  isRenderDisabled
+  isRenderDisabled,
+  shotModelPicker,
+  renderEngine
 }) => {
   const { t } = useTranslation();
   const [outputWidthPx, outputHeightPx] = outputSize;
@@ -172,7 +178,8 @@ export const ShotRow: React.FC<Props> = ({
   const [isVersionDialogOpen, setIsVersionDialogOpen] = useState(false);
   const [isStoryboardVersionDialogOpen, setIsStoryboardVersionDialogOpen] =
     useState(false);
-  const { shotEngine } = useShotRenderEngine(projectId);
+  const { shotEngine: savedShotEngine } = useShotRenderEngine(projectId);
+  const shotEngine = renderEngine ?? savedShotEngine;
   const durationBounds = getShotDurationBounds(shotEngine);
   const { sceneShotLayout, setSceneShotLayout } = useSceneShotLayoutDraft(shot);
   const { unsavedEdits: unsavedSceneShotEdits, sceneDurationSeconds } =
@@ -552,6 +559,7 @@ export const ShotRow: React.FC<Props> = ({
                 isListLayout ? "max-w-[320px]" : "w-full"
               )}
             >
+              {isStoryboardViewSelected && storyboardModelPicker}
               {isStoryboardViewSelected && (
                 <MainButton
                   size="md"
@@ -579,6 +587,7 @@ export const ShotRow: React.FC<Props> = ({
 
               {isVideoViewSelected && (
                 <>
+                  {shotModelPicker}
                   <MainButton
                     size="md"
                     colorScheme="primary"

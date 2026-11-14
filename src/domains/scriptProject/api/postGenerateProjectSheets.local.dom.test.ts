@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { LOCAL_SHEET_RENDER_MODEL } from "../constants";
+import { FAL_SHEET_MODEL, LOCAL_SHEET_RENDER_MODEL } from "../constants";
 
 import { postGenerateProjectSheets } from "./postGenerateProjectSheets";
 
@@ -53,37 +53,40 @@ describe("postGenerateProjectSheets (local project)", () => {
     );
   });
 
-  it("preserves a supported local Flux image model", async () => {
-    const generateSheets = vi.fn().mockResolvedValue({
-      would_run: [],
-      skipped: [],
-      changed: {}
-    });
-    Object.defineProperty(window, "mago", {
-      configurable: true,
-      value: {
-        account: { mode: "local" },
-        projects: {
-          get: vi.fn().mockResolvedValue({
-            id: "project-1",
-            origin: "local",
-            type: "script_to_shots"
-          })
-        },
-        scriptProjects: { generateSheets }
-      }
-    });
+  it.each(["flux2_klein_4b_q8_local", FAL_SHEET_MODEL])(
+    "preserves %s on desktop dry runs",
+    async (renderModel) => {
+      const generateSheets = vi.fn().mockResolvedValue({
+        would_run: [],
+        skipped: [],
+        changed: {}
+      });
+      Object.defineProperty(window, "mago", {
+        configurable: true,
+        value: {
+          account: { mode: "local" },
+          projects: {
+            get: vi.fn().mockResolvedValue({
+              id: "project-1",
+              origin: "local",
+              type: "script_to_shots"
+            })
+          },
+          scriptProjects: { generateSheets }
+        }
+      });
 
-    await postGenerateProjectSheets({
-      projectId: "project-1",
-      isDryRun: true,
-      settings: { render_model: "flux2_klein_4b_q8_local" }
-    });
+      await postGenerateProjectSheets({
+        projectId: "project-1",
+        isDryRun: true,
+        settings: { render_model: renderModel }
+      });
 
-    expect(generateSheets).toHaveBeenCalledWith({
-      projectId: "project-1",
-      isDryRun: true,
-      settings: { render_model: "flux2_klein_4b_q8_local" }
-    });
-  });
+      expect(generateSheets).toHaveBeenCalledWith({
+        projectId: "project-1",
+        isDryRun: true,
+        settings: { render_model: renderModel }
+      });
+    }
+  );
 });

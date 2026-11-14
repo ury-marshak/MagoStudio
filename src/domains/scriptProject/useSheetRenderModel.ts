@@ -5,6 +5,8 @@ export const useSheetRenderModel = (projectId: string | undefined) => {
   return {
     sheetRenderModel: model.renderModel,
     isLocalProject: model.isLocalProject,
+    isFalAvailable: model.isFalAvailable,
+    isLoadingProvider: model.isLoadingProvider,
     canUseCloudSheetModels: model.canUseCloudModels && model.isLocalProject,
     isSavingSheetRenderModel: model.isSavingRenderModel,
     setSheetRenderModel: model.setRenderModel

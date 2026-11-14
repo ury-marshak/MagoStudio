@@ -60,6 +60,7 @@ type Props = {
   isBusy: boolean;
   isRenderDisabled: boolean;
   renderCost: ScriptProjectRenderCost;
+  renderModelPicker?: React.ReactNode;
   shouldFetchImageInputs: boolean;
   supportsImageReferences: boolean;
 };
@@ -79,6 +80,7 @@ export const SheetGroupRow: React.FC<Props> = ({
   isBusy,
   isRenderDisabled,
   renderCost,
+  renderModelPicker,
   shouldFetchImageInputs,
   supportsImageReferences,
   isRunActive
@@ -188,7 +190,7 @@ export const SheetGroupRow: React.FC<Props> = ({
             <RenderingBadge testId={`sheet-group-rendering-${group.token}`} />
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {renderBlockedReasonKey && (
             <Text
               variant="2xs"
@@ -209,6 +211,7 @@ export const SheetGroupRow: React.FC<Props> = ({
               ? t("script_project.disable_entity_button.label")
               : t("script_project.enable_entity_button.label")}
           </MainButton>
+          {group.enabled && renderModelPicker}
           <MainButton
             size="sm"
             colorScheme="primary"

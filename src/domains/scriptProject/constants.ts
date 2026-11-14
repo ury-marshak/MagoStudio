@@ -10,6 +10,22 @@ import {
   SequentialShotMode
 } from "@schemas/scriptProject";
 
+import type { FalSheetModel } from "../../../desktop/shared/falSheetModel";
+
+export type { FalSheetModel };
+
+export {
+  FAL_SHEET_MODEL,
+  FAL_SHEET_MODEL_21,
+  FAL_SHEET_MODEL_H3,
+  FAL_SHEET_MODELS,
+  isFalSheetModel
+} from "../../../desktop/shared/falSheetModel";
+export {
+  FAL_SHOT_PROVIDER,
+  FAL_SHOT_SIZE
+} from "../../../desktop/shared/falShotModel";
+
 export const SHEET_RENDER_MODELS = [
   "seedream_5_pro_t2i",
   "gpt_image_2_t2i",
@@ -30,7 +46,10 @@ export const LOCAL_SHEET_RENDER_MODELS = [
 
 export type LocalSheetRenderModel = (typeof LOCAL_SHEET_RENDER_MODELS)[number];
 
-export type AnySheetRenderModel = SheetRenderModel | LocalSheetRenderModel;
+export type AnySheetRenderModel =
+  | SheetRenderModel
+  | LocalSheetRenderModel
+  | FalSheetModel;
 
 export const LOCAL_SHEET_RENDER_MODEL: LocalSheetRenderModel =
   "qwen_image_2512_local";

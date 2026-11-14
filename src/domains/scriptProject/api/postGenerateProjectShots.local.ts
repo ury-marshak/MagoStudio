@@ -9,6 +9,7 @@ import { getLocalDesktopApi } from "@/platform/localDesktop";
 
 import {
   DEFAULT_LOCAL_H3_MODEL,
+  FAL_SHOT_PROVIDER,
   DEFAULT_LOCAL_H3_TEXT_ENCODER,
   DEFAULT_LOCAL_H3_STEPS,
   LOCAL_H3_MODEL_OPTIONS,
@@ -38,6 +39,10 @@ export const postGenerateProjectShots = async (
   request: GenerateProjectShotsRequest
 ): Promise<ShotGenerateResult> => {
   if (await isLocalScriptProject(request.projectId)) {
+    if (request.videoSettings?.render_provider === FAL_SHOT_PROVIDER)
+      return ShotGenerateResultSchema.parse(
+        await getLocalDesktopApi().scriptProjects.generateShots(request)
+      );
     const requestedSteps = request.videoSettings?.local_h3_steps;
     const localH3Steps: LocalH3Steps = LOCAL_H3_STEP_OPTIONS.includes(
       requestedSteps as LocalH3Steps

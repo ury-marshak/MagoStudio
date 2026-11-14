@@ -72,6 +72,30 @@ describe("OpenAI-compatible provider", () => {
     });
   });
 
+  it("sends the selected OpenRouter reasoning effort on text requests", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValueOnce(
+      Response.json({
+        model: config.model,
+        choices: [{ finish_reason: "stop", message: { content: "Ready" } }]
+      })
+    );
+    vi.stubGlobal("fetch", fetch);
+
+    await generateOpenAiCompatible(
+      { ...config, reasoningEffort: "low" },
+      "key"
+    )({
+      ...request,
+      temperature: 0.1
+    });
+
+    const body = fetch.mock.calls[0]?.[1]?.body;
+    if (typeof body !== "string") throw new Error("Expected a JSON body");
+    const payload = JSON.parse(body);
+    expect(payload.reasoning).toEqual({ effort: "low" });
+    expect(payload).not.toHaveProperty("temperature");
+  });
+
   it("surfaces a provider error without replaying or exposing its body", async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()

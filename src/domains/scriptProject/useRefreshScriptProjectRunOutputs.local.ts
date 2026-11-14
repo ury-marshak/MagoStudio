@@ -6,11 +6,10 @@ import { useEffect, useMemo, useRef } from "react";
 
 import { queryKeys } from "@/queryKeys";
 
-const shotPlanRevision = (
-  runs: ReturnType<typeof useBulkRendersRunsForProject>["data"]
+const renderPlanRevision = (
+  runs: NonNullable<ReturnType<typeof useBulkRendersRunsForProject>["data"]>
 ): string =>
-  (runs ?? [])
-    .filter((run) => (run.input_settings?.timeline_ids?.length ?? 0) > 0)
+  runs
     .map(
       (run) =>
         `${run.id}:${run.status}:${run.completed_steps}:${run.progress_pct}`
@@ -18,7 +17,7 @@ const shotPlanRevision = (
     .sort()
     .join("|");
 
-/** Refreshes the authoritative local snapshot as a background shot plan moves.
+/** Refreshes the authoritative local snapshot as a background render plan moves.
  *
  * The first non-empty revision also refreshes once on mount. That closes the
  * race where the Cut query reads just before the final video is persisted but
@@ -34,22 +33,44 @@ export const useRefreshScriptProjectRunOutputs = (
     projectId ?? undefined,
     isLocalProject
   );
-  const revision = useMemo(() => shotPlanRevision(projectRuns), [projectRuns]);
-  const observedRevisionRef = useRef<string | null>(null);
+  const revisions = useMemo(() => {
+    const runs = projectRuns ?? [];
+    return {
+      shots: renderPlanRevision(
+        runs.filter((run) => run.input_settings?.timeline_ids?.length)
+      ),
+      sheets: renderPlanRevision(
+        runs.filter((run) => !run.input_settings?.timeline_ids?.length)
+      )
+    };
+  }, [projectRuns]);
+  const observedRevisionRef = useRef<{
+    projectId: string;
+    shots: string;
+    sheets: string;
+  } | null>(null);
 
   useEffect(() => {
     if (!projectId || !isLocalProject || projectRuns === undefined) return;
 
-    const observedRevision = `${projectId}:${revision}`;
-    if (observedRevisionRef.current === observedRevision) return;
-    observedRevisionRef.current = observedRevision;
-    if (!revision) return;
-
-    void queryClient.invalidateQueries({
-      queryKey: queryKeys.projectCut.byProjectId(projectId)
-    });
-    void queryClient.invalidateQueries({
-      queryKey: queryKeys.projectState.byProjectId(projectId)
-    });
-  }, [isLocalProject, projectId, projectRuns, queryClient, revision]);
+    const observed = observedRevisionRef.current;
+    const isSameProject = observed?.projectId === projectId;
+    const shotsChanged =
+      !!revisions.shots &&
+      (!isSameProject || revisions.shots !== observed.shots);
+    const sheetsChanged =
+      !!revisions.sheets &&
+      (!isSameProject || revisions.sheets !== observed.sheets);
+    observedRevisionRef.current = { projectId, ...revisions };
+    if (shotsChanged) {
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.projectCut.byProjectId(projectId)
+      });
+    }
+    if (shotsChanged || sheetsChanged) {
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.projectState.byProjectId(projectId)
+      });
+    }
+  }, [isLocalProject, projectId, projectRuns, queryClient, revisions]);
 };

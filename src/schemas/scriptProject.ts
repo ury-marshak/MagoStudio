@@ -545,6 +545,7 @@ const ShotAnswerReferenceShape = {
 const SequentialBlockedReasonCodeSchema = z
   .enum([
     "unsupported_engine",
+    "fal_sequential_unsupported",
     "predecessor_not_rendered",
     "unsupported_sequential_mode",
     "no_prompt",

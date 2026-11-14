@@ -6,12 +6,16 @@ import { promisify } from "node:util";
 
 import { z } from "zod";
 
+import { externalReasoningEfforts } from "../../shared/contracts";
 import type {
   ExternalModelCapability,
   ExternalModelConfig,
   FalProviderConfig,
   MagoAppMode
 } from "../../shared/contracts";
+import { falGenerationDefaultsSchema } from "../../shared/falGenerationSettings";
+import { FAL_SHEET_MODELS } from "../../shared/falSheetModel";
+import { FAL_SHOT_PROVIDER } from "../../shared/falShotModel";
 
 export type {
   ExternalModelCapability,
@@ -22,7 +26,13 @@ const run = promisify(execFile);
 const keychainService = "MagoStudio.ExternalProvider";
 
 const keychainAccountSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/);
-const falSchema = z.strictObject({ keychainAccount: keychainAccountSchema });
+const falSchema = z.strictObject({
+  keychainAccount: keychainAccountSchema,
+  generationSettings: falGenerationDefaultsSchema.optional(),
+  referenceImageModel: z.enum(FAL_SHEET_MODELS).optional(),
+  storyboardImageModel: z.enum(FAL_SHEET_MODELS).optional(),
+  shotProvider: z.enum([FAL_SHOT_PROVIDER, "local-comfy"]).optional()
+});
 
 const parseFalConfig = (value: unknown): FalProviderConfig => {
   const config = falSchema.safeParse(value);
@@ -33,6 +43,7 @@ const parseFalConfig = (value: unknown): FalProviderConfig => {
 const providerSchema = z.strictObject({
   baseUrl: z.string().url(),
   model: z.string().trim().min(1),
+  reasoningEffort: z.enum(externalReasoningEfforts).optional(),
   keychainAccount: keychainAccountSchema
 });
 
@@ -59,6 +70,8 @@ const parseConfig = (
     config.data.model.startsWith("openrouter/")
   )
     throw new Error("Choose a specific OpenRouter model");
+  if (config.data.reasoningEffort && url.hostname !== "openrouter.ai")
+    throw new Error("Reasoning effort is currently supported for OpenRouter");
   return { ...config.data, baseUrl: url.href.replace(/\/+$/, "") };
 };
 

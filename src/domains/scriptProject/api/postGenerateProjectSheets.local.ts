@@ -11,6 +11,7 @@ import {
   executeCloudSheetPlan
 } from "../cloudSheetRender.local";
 import {
+  isFalSheetModel,
   resolveLocalSheetRenderModel,
   SCRIPT_PROJECT_RENDER_MODE
 } from "../constants";
@@ -30,10 +31,8 @@ export const postGenerateProjectSheets = async (
   request: GenerateProjectSheetsRequest
 ): Promise<SheetGenerateResult> => {
   if (await isLocalScriptProject(request.projectId)) {
-    // A local project renders on an explicitly supported Comfy workflow, or
-    // on a Mago Cloud model while signed in, which this renderer then runs.
-    // Build a narrow desktop request so cloud-only scoring can never leak
-    // into a local plan, even if a stale renderer sends it.
+    // The desktop owns fal and ComfyUI jobs. Mago Cloud plans are executed
+    // by the renderer while signed in.
     const isCloudModel =
       isSheetRenderModel(request.settings?.render_model) &&
       canUseCloudSheetModels();
@@ -43,9 +42,10 @@ export const postGenerateProjectSheets = async (
       ...(request.outputSize ? { outputSize: request.outputSize } : {}),
       settings: {
         ...request.settings,
-        render_model: isCloudModel
-          ? request.settings?.render_model
-          : resolveLocalSheetRenderModel(request.settings?.render_model)
+        render_model:
+          isCloudModel || isFalSheetModel(request.settings?.render_model)
+            ? request.settings?.render_model
+            : resolveLocalSheetRenderModel(request.settings?.render_model)
       },
       ...(request.tokens ? { tokens: request.tokens } : {})
     };

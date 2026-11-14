@@ -2,6 +2,7 @@ export type MediaRenderKind = "image" | "video";
 
 export interface MediaRenderOutput {
   urls: string[];
+  assetIds?: string[];
   seed?: number;
   referenceTokens?: number;
 }
@@ -24,6 +25,7 @@ export class RenderSubmissionRejected extends Error {}
 export interface MediaRenderProvider {
   prepareSubmission(endpoint: string): Promise<{
     keychainAccount: string;
+    upload?(file: Blob, name: string, signal?: AbortSignal): Promise<string>;
     submit(
       input: Record<string, unknown>,
       signal?: AbortSignal

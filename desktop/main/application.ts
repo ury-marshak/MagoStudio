@@ -47,7 +47,10 @@ import {
   resolveProviderStartupMode,
   type ExternalModelCapability
 } from "./providers/externalProviderSettings";
+import { ExternalRenderAssets } from "./providers/externalRenderAssets";
 import { ExternalRenderJobRepository } from "./providers/externalRenderJobRepository";
+import { ExternalRenderJobService } from "./providers/externalRenderJobService";
+import { FalRenderProvider } from "./providers/falRenderProvider";
 import {
   generateOpenAiCompatible,
   probeOpenAiCompatible
@@ -95,6 +98,19 @@ const scriptProjectSnapshotRepository = new ScriptProjectSnapshotRepository(
 );
 const externalProviders = createExternalProviderSettings(() =>
   app.getPath("userData")
+);
+const externalRenderJobRepository = new ExternalRenderJobRepository(
+  databaseManager
+);
+const externalRenderJobService = new ExternalRenderJobService(
+  externalRenderJobRepository,
+  new Map([["fal", new FalRenderProvider(externalProviders.getFal)]]),
+  new ExternalRenderAssets(
+    databaseManager,
+    () => librarySettings.getLibraryRoot(),
+    (assetId, projectId) =>
+      scriptProjectSnapshotRepository.resolveMediaPath(assetId, projectId)
+  )
 );
 const getExternalGenerator = async (capability: ExternalModelCapability) => {
   const config = await externalProviders.get(capability);
@@ -191,7 +207,17 @@ const localScriptProjectService = new LocalScriptProjectService(
   (sourcePath, kind) => vlmService.describeEntityImage(sourcePath, kind),
   textModelBridge.run,
   (input) => vlmService.evaluateShotVideo(input),
-  () => getExternalGenerator("text")
+  () => getExternalGenerator("text"),
+  externalRenderJobService,
+  async (sourcePath, kind) => {
+    const generate = await getExternalGenerator("vision");
+    if (!generate)
+      throw new Error(
+        "Configure an external vision provider to describe fal images"
+      );
+    return vlmService.describeEntityImage(sourcePath, kind, generate);
+  },
+  async () => (await externalProviders.getFal())?.generationSettings
 );
 const localScriptChatService = new LocalScriptChatService(
   new ScriptChatMessageRepository(databaseManager),
@@ -512,8 +538,12 @@ void app
       app.quit();
       return;
     }
-    await runBackgroundTask("Interrupted external render submission recovery", () =>
-      new ExternalRenderJobRepository(databaseManager).markInterruptedSubmissions()
+    await runBackgroundTask(
+      "Interrupted external render submission recovery",
+      () => externalRenderJobRepository.markInterruptedSubmissions()
+    );
+    await runBackgroundTask("External render plan recovery", () =>
+      localScriptProjectService.recoverExternalRenderPlans()
     );
     await createWindow();
     void runBackgroundTask("Interrupted render recovery", async () => {

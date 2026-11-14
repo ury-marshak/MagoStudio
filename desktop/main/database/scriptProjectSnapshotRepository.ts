@@ -21,7 +21,13 @@ import { atomicWriteFile, publishFile } from "../storage/atomicFile";
 import { storedObject } from "../storage/storedJson";
 
 import { DatabaseManager } from "./databaseManager";
-import { projects, scriptProjectMedia, scriptProjectSnapshots } from "./schema";
+import {
+  assets,
+  projectAssets,
+  projects,
+  scriptProjectMedia,
+  scriptProjectSnapshots
+} from "./schema";
 
 const MEDIA_URL_KEYS = new Set(["url", "thumbnail_url", "poster_url"]);
 const PROJECT_DIRECTORY_HASH_LENGTH = 32;
@@ -404,6 +410,54 @@ export class ScriptProjectSnapshotRepository {
     return { id, url, path: absolutePath };
   }
 
+  async registerGeneratedAsset(
+    projectId: string,
+    id: string,
+    useAsPreview: boolean
+  ) {
+    const database = this.manager.get();
+    const [asset] = await database
+      .select({
+        relativePath: assets.relativeSourcePath,
+        width: assets.width,
+        height: assets.height,
+        duration: assets.duration,
+        fps: assets.fps
+      })
+      .from(projectAssets)
+      .innerJoin(assets, eq(projectAssets.assetId, assets.id))
+      .where(
+        and(
+          eq(projectAssets.projectId, projectId),
+          eq(assets.id, id),
+          eq(assets.origin, "generated"),
+          eq(assets.status, "available"),
+          eq(assets.active, true)
+        )
+      );
+    if (!asset?.relativePath)
+      throw new Error("Generated library asset is unavailable");
+    await database
+      .insert(scriptProjectMedia)
+      .values({
+        id,
+        projectId,
+        sourceUrl: `local-generated:${id}`,
+        relativePath: asset.relativePath
+      })
+      .onConflictDoNothing({ target: scriptProjectMedia.id });
+    const url = `mago-media://script-project/${id}`;
+    if (useAsPreview) await this.writeSnapshot(projectId, { previewUrl: url });
+    return {
+      id,
+      url,
+      width: asset.width,
+      height: asset.height,
+      duration: asset.duration,
+      fps: asset.fps
+    };
+  }
+
   async getListSummary(projectId: string): Promise<{
     previewUrl: string | null;
     shotCount: number;
@@ -430,13 +484,23 @@ export class ScriptProjectSnapshotRepository {
     };
   }
 
-  async resolveMediaPath(mediaId: string): Promise<string | null> {
+  async resolveMediaPath(
+    mediaId: string,
+    projectId?: string
+  ): Promise<string | null> {
     if (!this.manager.isOpen()) return null;
     const [media] = await this.manager
       .get()
       .select()
       .from(scriptProjectMedia)
-      .where(eq(scriptProjectMedia.id, mediaId))
+      .where(
+        and(
+          eq(scriptProjectMedia.id, mediaId),
+          projectId === undefined
+            ? undefined
+            : eq(scriptProjectMedia.projectId, projectId)
+        )
+      )
       .limit(1);
     if (!media) return null;
     const libraryRoot = await this.getLibraryRoot();

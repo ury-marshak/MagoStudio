@@ -1,3 +1,7 @@
+import {
+  type ExternalRenderAssets,
+  RenderOutputUnavailable
+} from "./externalRenderAssets";
 import type {
   ExternalRenderJob,
   ExternalRenderJobRepository
@@ -17,7 +21,10 @@ type Submission = Pick<
   | "kind"
   | "requestJson"
   | "inputAssetIds"
->;
+> & {
+  /** Endpoint-specific array field for the ordered local input images. */
+  assetUrlField?: string;
+};
 
 const remoteRequest = (
   job: ExternalRenderJob,
@@ -29,10 +36,17 @@ const remoteRequest = (
 });
 
 export class ExternalRenderJobService {
+  private readonly ingestions = new Map<string, Promise<ExternalRenderJob>>();
+
   constructor(
     private readonly jobs: ExternalRenderJobRepository,
-    private readonly providers: ReadonlyMap<string, MediaRenderProvider>
+    private readonly providers: ReadonlyMap<string, MediaRenderProvider>,
+    private readonly assets: ExternalRenderAssets
   ) {}
+
+  get(id: string): Promise<ExternalRenderJob | null> {
+    return this.jobs.get(id);
+  }
 
   async submit(
     input: Submission,
@@ -42,14 +56,28 @@ export class ExternalRenderJobService {
     signal?.throwIfAborted();
     const provider = this.providerFor(submission.provider);
     const prepared = await provider.prepareSubmission(submission.endpoint);
+    const { assetUrlField, ...job } = submission;
+    if (assetUrlField) {
+      if (!prepared.upload)
+        throw new Error("This provider does not support input uploads");
+      if (!job.inputAssetIds.length)
+        throw new Error("Select at least one render input image");
+      const urls: string[] = [];
+      for (const assetId of job.inputAssetIds) {
+        signal?.throwIfAborted();
+        const { file, name } = await this.assets.input(job.projectId, assetId);
+        urls.push(await prepared.upload(file, name, signal));
+      }
+      job.requestJson = { ...job.requestJson, [assetUrlField]: urls };
+    }
     signal?.throwIfAborted();
     await this.jobs.beginSubmission({
-      ...submission,
+      ...job,
       keychainAccount: prepared.keychainAccount
     });
     let requestId: string;
     try {
-      requestId = await prepared.submit(submission.requestJson, signal);
+      requestId = await prepared.submit(job.requestJson, signal);
     } catch (error) {
       if (error instanceof RenderSubmissionRejected) {
         await this.jobs.settleSubmission(submission.id, {
@@ -86,6 +114,52 @@ export class ExternalRenderJobService {
     );
     if (result.status !== "PENDING")
       await this.jobs.settleRemoteJob(id, result);
+    return this.requireJob(id);
+  }
+
+  /** Materialize a finished job in the library. Safe to retry after a restart. */
+  async ingest(id: string, signal?: AbortSignal): Promise<ExternalRenderJob> {
+    const existing = this.ingestions.get(id);
+    if (existing) return existing;
+    const operation = this.ingestOutput(id, signal);
+    this.ingestions.set(id, operation);
+    try {
+      return await operation;
+    } finally {
+      this.ingestions.delete(id);
+    }
+  }
+
+  private async ingestOutput(
+    id: string,
+    signal?: AbortSignal
+  ): Promise<ExternalRenderJob> {
+    const job = await this.requireJob(id);
+    if (job.status !== "OUTPUT_READY" || !job.outputJson || !job.requestId)
+      return job;
+    let output = job.outputJson;
+    if (!output.urls.length)
+      throw new Error("The provider returned no render outputs");
+    let files: Awaited<ReturnType<ExternalRenderAssets["download"]>>;
+    try {
+      files = await this.assets.download(job, output, signal);
+    } catch (error) {
+      if (!(error instanceof RenderOutputUnavailable)) throw error;
+      const result = await this.providerFor(job.provider).refresh(
+        remoteRequest(job, job.requestId),
+        job.kind,
+        signal
+      );
+      if (
+        result.status !== "OUTPUT_READY" ||
+        result.outputJson.urls.length !== output.urls.length
+      )
+        throw error;
+      output = result.outputJson;
+      files = await this.assets.download(job, output, signal);
+    }
+    signal?.throwIfAborted();
+    await this.jobs.finishIngestion(job, output, files);
     return this.requireJob(id);
   }
 

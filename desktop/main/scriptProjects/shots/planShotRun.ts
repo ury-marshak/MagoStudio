@@ -1,3 +1,4 @@
+import { FAL_SHOT_PROVIDER } from "../../../shared/falShotModel";
 import { textOf } from "../../vlm/dialogue";
 import { changedFields, fingerprint } from "../renderSpec";
 
@@ -403,6 +404,17 @@ export const planShotRun = ({
     if (sequential && !predecessor.has(timelineId)) {
       sequentialIgnored.push({ ...reference, reason: "first shot" });
       sequential = null;
+    }
+    if (sequential && videoSettings.render_provider === FAL_SHOT_PROVIDER) {
+      blocked.push({
+        ...reference,
+        missing: [],
+        reason_code: "fal_sequential_unsupported",
+        reason:
+          "Suspend sequential references to render this shot with H3 Max (fal)"
+      });
+      blockedIds.add(timelineId);
+      continue;
     }
     let sequentialSpec: JsonRecord | null = null;
     let previousTimelineId: string | null = null;

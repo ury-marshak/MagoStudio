@@ -63,9 +63,17 @@ describe("external provider settings", () => {
     });
   });
 
-  it("stores only the fal Keychain account alongside text and vision settings", async () => {
+  it("stores fal defaults and the Keychain account alongside text and vision settings", async () => {
     const settings = createExternalProviderSettings(() => directory);
-    const fal = { keychainAccount: "fal" };
+    const fal = {
+      keychainAccount: "fal",
+      referenceImageModel: "fal_minimax_h3_image",
+      shotProvider: "local-comfy",
+      generationSettings: {
+        minimax_h3_max: { resolution: "480P", aspect_ratio: "9:16", seed: 7 },
+        fal_minimax_h3_image: { megapixels: "4" }
+      }
+    };
     await Promise.all([
       settings.save("text", vision),
       settings.save("vision", vision),
@@ -74,6 +82,15 @@ describe("external provider settings", () => {
 
     await expect(
       settings.saveFal({ ...fal, apiKey: "test-secret" })
+    ).rejects.toThrow("Invalid fal provider settings");
+    await expect(
+      settings.saveFal({ ...fal, referenceImageModel: "unknown" })
+    ).rejects.toThrow("Invalid fal provider settings");
+    await expect(
+      settings.saveFal({
+        ...fal,
+        generationSettings: { fal_minimax_h3_image: { resolution: "4K" } }
+      })
     ).rejects.toThrow("Invalid fal provider settings");
     await expect(settings.getFal()).resolves.toEqual(fal);
     const persisted = await readFile(

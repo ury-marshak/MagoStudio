@@ -348,6 +348,7 @@ export const externalRenderJobs = sqliteTable(
         "SUBMITTED",
         "CANCELLATION_REQUESTED",
         "OUTPUT_READY",
+        "INGESTED",
         "FAILED",
         "CANCELLED"
       ]

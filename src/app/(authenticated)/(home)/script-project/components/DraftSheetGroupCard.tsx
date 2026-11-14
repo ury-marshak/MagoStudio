@@ -38,6 +38,8 @@ type Props = {
   existingTokens: string[];
   isBusy: boolean;
   onChange: (draft: SheetGroupDraft) => void;
+  isRenderUnavailable?: boolean;
+  renderModelPicker?: React.ReactNode;
   onRender: (newSheetGroup: NewSheetGroup & { prompt: string }) => void;
   onUploadImage: (newSheetGroup: NewSheetGroup, file: File) => void;
   onDiscard: () => void;
@@ -49,6 +51,8 @@ export const DraftSheetGroupCard: React.FC<Props> = ({
   isBusy,
   onChange,
   onRender,
+  isRenderUnavailable,
+  renderModelPicker,
   onUploadImage,
   onDiscard
 }) => {
@@ -62,7 +66,8 @@ export const DraftSheetGroupCard: React.FC<Props> = ({
   const isTokenTaken = !!token && existingTokens.includes(token);
   const usableToken = token && !isTokenTaken ? token : null;
   const hasPrompt = draft.prompt.trim().length > 0;
-  const isRenderDisabled = isBusy || !usableToken || !hasPrompt;
+  const isRenderDisabled =
+    isBusy || isRenderUnavailable || !usableToken || !hasPrompt;
   const testIdSuffix = draft.draftId;
 
   return (
@@ -158,6 +163,7 @@ export const DraftSheetGroupCard: React.FC<Props> = ({
           className="h-auto w-48 min-h-40"
           testId={`draft-sheet-group-drop-${testIdSuffix}`}
         />
+        {renderModelPicker}
         <MainButton
           size="sm"
           colorScheme="primary"

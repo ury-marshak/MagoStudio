@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { backendApiClient } from "@/lib/backend-api-client";
 
+import { FAL_SHEET_MODEL, FAL_SHEET_MODEL_H3 } from "../constants";
+
 import { postSheetGroupRender } from "./postSheetGroupRender";
 
 vi.mock("@domains/cloud/mirrorService", () => ({
@@ -15,56 +17,63 @@ describe("postSheetGroupRender (local project)", () => {
     Reflect.deleteProperty(window, "mago");
   });
 
-  it("returns the local plan so the UI can track the in-flight image", async () => {
-    const result = {
-      would_run: ["baker"],
-      skipped: [],
-      changed: {},
-      plan_id: "plan-1"
-    };
-    const generateSheets = vi.fn().mockResolvedValue(result);
-    Object.defineProperty(window, "mago", {
-      configurable: true,
-      value: {
-        account: { mode: "local" },
-        projects: {
-          get: vi.fn().mockResolvedValue({
-            id: "project-1",
-            origin: "local",
-            type: "script_to_shots"
-          })
-        },
-        scriptProjects: { generateSheets }
-      }
-    });
+  it.each([
+    "flux2_klein_4b_q8_local",
+    FAL_SHEET_MODEL,
+    FAL_SHEET_MODEL_H3
+  ] as const)(
+    "returns the local plan for %s so the UI can track the image",
+    async (renderModel) => {
+      const result = {
+        would_run: ["baker"],
+        skipped: [],
+        changed: {},
+        plan_id: "plan-1"
+      };
+      const generateSheets = vi.fn().mockResolvedValue(result);
+      Object.defineProperty(window, "mago", {
+        configurable: true,
+        value: {
+          account: { mode: "local" },
+          projects: {
+            get: vi.fn().mockResolvedValue({
+              id: "project-1",
+              origin: "local",
+              type: "script_to_shots"
+            })
+          },
+          scriptProjects: { generateSheets }
+        }
+      });
 
-    await expect(
-      postSheetGroupRender({
+      await expect(
+        postSheetGroupRender({
+          projectId: "project-1",
+          timelineId: "sheets-1",
+          token: "baker",
+          prompt: "A baker in a hand-painted animation style",
+          renderModel,
+          renderMode: RenderMode.CREDITS,
+          outputSize: [720, 1280],
+          referenceAssetIds: ["reference-1"],
+          referenceInstruction: "Use the coat and hairstyle"
+        })
+      ).resolves.toEqual(result);
+
+      expect(generateSheets).toHaveBeenCalledWith({
         projectId: "project-1",
-        timelineId: "sheets-1",
-        token: "baker",
-        prompt: "A baker in a hand-painted animation style",
-        renderModel: "flux2_klein_4b_q8_local",
-        renderMode: RenderMode.CREDITS,
+        isDryRun: false,
         outputSize: [720, 1280],
+        settings: {
+          prompt: "A baker in a hand-painted animation style",
+          render_model: renderModel
+        },
+        tokens: ["baker"],
         referenceAssetIds: ["reference-1"],
         referenceInstruction: "Use the coat and hairstyle"
-      })
-    ).resolves.toEqual(result);
-
-    expect(generateSheets).toHaveBeenCalledWith({
-      projectId: "project-1",
-      isDryRun: false,
-      outputSize: [720, 1280],
-      settings: {
-        prompt: "A baker in a hand-painted animation style",
-        render_model: "flux2_klein_4b_q8_local"
-      },
-      tokens: ["baker"],
-      referenceAssetIds: ["reference-1"],
-      referenceInstruction: "Use the coat and hairstyle"
-    });
-  });
+      });
+    }
+  );
 
   it("asks the desktop to create the entity it renders, as the cloud does with sheet_name and sheet_kind", async () => {
     const generateSheets = vi.fn().mockResolvedValue({

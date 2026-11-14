@@ -77,7 +77,7 @@ describe("useRefreshScriptProjectRunOutputs", () => {
     await waitFor(() => expect(invalidateSpy).toHaveBeenCalledTimes(2));
   });
 
-  it("ignores sheet plans because they cannot add videos to the Cut", () => {
+  it("refreshes project state when a sheet plan lands", () => {
     projectRuns = [
       {
         ...shotRun(2),
@@ -86,7 +86,9 @@ describe("useRefreshScriptProjectRunOutputs", () => {
     ];
     const { invalidateSpy } = renderObserver();
 
-    expect(invalidateSpy).not.toHaveBeenCalled();
+    expect(invalidateSpy).toHaveBeenCalledExactlyOnceWith({
+      queryKey: queryKeys.projectState.byProjectId(PROJECT_ID)
+    });
   });
 
   it("leaves mirrored cloud projects on the production refresh lifecycle", () => {

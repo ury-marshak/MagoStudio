@@ -17,10 +17,8 @@ import { useProjectState } from "@domains/scriptProject/useProjectState";
 import { useProjectTypeRedirect } from "@domains/scriptProject/useProjectTypeRedirect";
 import { useRecoverableCastingRun } from "@domains/scriptProject/useRecoverableCastingRun";
 import { useRefreshScriptProjectRunOutputs } from "@domains/scriptProject/useRefreshScriptProjectRunOutputs";
-import { useScriptProjectRenderAccess } from "@domains/scriptProject/useScriptProjectRenderAccess";
 import { useScriptProjectRun } from "@domains/scriptProject/useScriptProjectRun";
 import { useSelectedScriptProjectTabId } from "@domains/scriptProject/useSelectedScriptProjectTabId";
-import { useSheetRenderModel } from "@domains/scriptProject/useSheetRenderModel";
 import { hasUsableScriptVersion } from "@domains/scriptProject/utils/hasUsableScriptVersion";
 import { isStoryboardSheetGroup } from "@domains/scriptProject/utils/isStoryboardSheetGroup";
 import { resolveRenderingShotTimelineIds } from "@domains/scriptProject/utils/resolveRenderingShotTimelineIds";
@@ -38,12 +36,6 @@ export default function ScriptProjectPage() {
   const { t } = useTranslation();
   const projectId = useSelectedProjectId();
   const { data: project } = useProject(projectId);
-  const canRender = useScriptProjectRenderAccess(projectId);
-  const { sheetRenderModel } = useSheetRenderModel(projectId);
-  const canRenderSheets = useScriptProjectRenderAccess(
-    projectId,
-    sheetRenderModel
-  );
   const {
     selectedScriptProjectTabId: selectedTabId,
     setSelectedScriptProjectTabId: setSelectedTabId
@@ -240,7 +232,6 @@ export default function ScriptProjectPage() {
               projectState={projectState}
               renderingSheetTokens={renderingAssetTokens}
               isRunActive={isRunActive}
-              canRender={canRenderSheets}
               onRunStarted={startSheetRunFromTab(SCRIPT_PROJECT_TAB_IDS.assets)}
             />
           )}
@@ -258,7 +249,6 @@ export default function ScriptProjectPage() {
               renderingShotTimelineIds={renderingShotTimelineIds}
               failedShotTimelineIds={failedShotTimelineIds}
               isRunActive={isRunActive}
-              canRender={canRender}
               onRunStarted={startShotRunFromTab(SCRIPT_PROJECT_TAB_IDS.shots)}
             />
           )}
@@ -276,7 +266,6 @@ export default function ScriptProjectPage() {
               renderingShotTimelineIds={renderingShotTimelineIds}
               failedShotTimelineIds={failedShotTimelineIds}
               isRunActive={isRunActive}
-              canRender={canRender}
               onRunStarted={startShotRunFromTab(SCRIPT_PROJECT_TAB_IDS.shots)}
             />
           )}

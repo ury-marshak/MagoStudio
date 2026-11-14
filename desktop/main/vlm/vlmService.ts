@@ -107,14 +107,21 @@ export class VlmService {
    * Unlike `captionAsset`, this deliberately ignores the sheet layout and
    * returns plain prose suitable for MiniMax's reference inventory.
    */
-  async describeEntityImage(sourcePath: string, kind: string): Promise<string> {
+  async describeEntityImage(
+    sourcePath: string,
+    kind: string,
+    generate?: VisionGenerator
+  ): Promise<string> {
     const request = entityDescriptionPrompt(kind);
-    const description = await this.generate({
-      userPrompt: request.prompt,
-      images: [await this.loadImage(sourcePath)],
-      maxTokens: DESCRIPTION_MAX_TOKENS,
-      temperature: 0.1
-    });
+    const description = await this.generate(
+      {
+        userPrompt: request.prompt,
+        images: [await this.loadImage(sourcePath)],
+        maxTokens: DESCRIPTION_MAX_TOKENS,
+        temperature: 0.1
+      },
+      generate
+    );
     if (!description)
       throw new Error("Vision model returned an empty description");
     return description;

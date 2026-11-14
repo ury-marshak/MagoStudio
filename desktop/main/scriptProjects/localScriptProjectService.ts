@@ -10,10 +10,18 @@ import type {
   LocalScriptSheetsInput,
   LocalScriptShotsInput
 } from "../../shared/contracts";
+import {
+  resolveFalGenerationSettings,
+  falVideoSize,
+  type FalGenerationDefaults
+} from "../../shared/falGenerationSettings";
+import { isFalSheetModel } from "../../shared/falSheetModel";
+import { FAL_SHOT_ENGINE, FAL_SHOT_PROVIDER } from "../../shared/falShotModel";
 import type { RunCloudTextModel } from "../../shared/textModelRequest";
 import { ProjectRepository } from "../database/projectRepository";
 import { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import { probeComfyRenderModel } from "../imageRenders/comfyModelValidation";
+import type { ExternalRenderJobService } from "../providers/externalRenderJobService";
 import type { ShotVideoEvaluationInput } from "../vlm/videoMetrics";
 import type { VisionGenerator } from "../vlm/visionGenerator";
 
@@ -56,6 +64,10 @@ import {
 } from "./sheets/characterSheetLayout";
 import { createRequestedSheetGroup } from "./sheets/createRequestedSheetGroup";
 import {
+  falImageReferenceLimit,
+  renderFalSheet
+} from "./sheets/falSheetRenderer";
+import {
   planSheetRun,
   resolveSheetReferences,
   SheetReferences,
@@ -63,6 +75,7 @@ import {
   sheetSpecsInFlight,
   REFERENCE_INSTRUCTION_PREFIX
 } from "./sheets/planSheetRun";
+import { FAL_SHOT_IMAGE_SLOTS, renderFalShot } from "./shots/falShotRenderer";
 import { LocalShotMetrics } from "./shots/localShotMetrics";
 import {
   planShotRun,
@@ -291,6 +304,7 @@ type RunControl = {
   planId: string;
   projectId: string;
   cancelled: boolean;
+  recovering?: boolean;
   abortController: AbortController;
 };
 
@@ -418,9 +432,10 @@ const composeSheetRenderPrompt = (
 const LOCAL_H3_IMAGE_REFERENCE_SLOTS = 9;
 const referenceImageSlotBudget = (
   sequential: JsonRecord | null,
-  hasStoryboard: boolean
+  hasStoryboard: boolean,
+  maxSlots = LOCAL_H3_IMAGE_REFERENCE_SLOTS
 ): number =>
-  LOCAL_H3_IMAGE_REFERENCE_SLOTS -
+  maxSlots -
   (sequential?.mode === "last_frame" || sequential?.mode === "key_frames"
     ? 1
     : 0) -
@@ -434,6 +449,12 @@ const CLOUD_SHEET_RENDER_MODELS = new Set([
 ]);
 /** `local_executor` of a sheet plan the renderer runs against Mago Cloud. */
 const CLOUD_SHEET_EXECUTOR = "mago-cloud-renderer";
+const recoverableExternalRenderStatuses = new Set([
+  "SUBMITTED",
+  "CANCELLATION_REQUESTED",
+  "OUTPUT_READY",
+  "INGESTED"
+]);
 
 export class LocalScriptProjectService {
   private readonly projectRuns = new Map<
@@ -467,7 +488,12 @@ export class LocalScriptProjectService {
     private readonly evaluateShotVideo?: (
       input: ShotVideoEvaluationInput
     ) => Promise<JsonRecord>,
-    private readonly getExternalTextGenerator?: () => Promise<VisionGenerator | null>
+    private readonly getExternalTextGenerator?: () => Promise<VisionGenerator | null>,
+    private readonly externalRenderJobs?: ExternalRenderJobService,
+    private readonly describeExternalEntityImage?: DescribeEntityImage,
+    private readonly getFalGenerationDefaults?: () => Promise<
+      FalGenerationDefaults | undefined
+    >
   ) {
     this.shotMetrics = new LocalShotMetrics({
       read: (id) => this.snapshots.getMediaMetrics(id),
@@ -702,6 +728,26 @@ export class LocalScriptProjectService {
     const updated = planAt(cancelled, "CANCELLED");
     await this.snapshots.putPlan(projectId, planId, updated);
     this.releaseRenderer(planId);
+    const jobs = this.externalRenderJobs;
+    if (jobs && running?.control.planId !== planId) {
+      for (const step of records(plan.steps)) {
+        if (
+          step.tool_name !== "submit_video_render" &&
+          step.tool_name !== "submit_img2img_batch"
+        )
+          continue;
+        const id = textValue(step.id, "");
+        if (id)
+          void jobs
+            .get(id)
+            .then((job) =>
+              job?.status === "SUBMITTED" ? jobs.cancel(id) : null
+            )
+            .catch((error: unknown) =>
+              console.warn("Could not cancel external render", error)
+            );
+      }
+    }
     return updated;
   }
 
@@ -743,7 +789,105 @@ export class LocalScriptProjectService {
     return paused;
   }
 
-  async resumePlan(planId: string): Promise<JsonRecord> {
+  async recoverExternalRenderPlans(): Promise<void> {
+    if (!this.externalRenderJobs) return;
+    for (const projectId of await this.snapshots.listProjectIds()) {
+      if (this.projectRuns.has(projectId)) continue;
+      const snapshot = await this.snapshots.get(projectId);
+      for (const plan of Object.values(snapshot?.planDetails ?? {})) {
+        if (
+          !["PENDING", "RUNNING", "PAUSED"].includes(textValue(plan.status, ""))
+        )
+          continue;
+        const first = records(plan.steps).find(
+          (step) =>
+            ["poll_img2img_batch", "poll_video_render"].includes(
+              textValue(step.tool_name, "")
+            ) && !completedStep(step)
+        );
+        if (!first) continue;
+        const timelineId = textValue(first.timeline_id, "") || undefined;
+        const token =
+          textValue(record(first.tool_args)?.token, "") || undefined;
+        const submit = this.findStep(
+          plan,
+          timelineId ? "submit_video_render" : "submit_img2img_batch",
+          timelineId,
+          token
+        );
+        const id = textValue(submit?.id, "");
+        const job = id ? await this.externalRenderJobs.get(id) : null;
+        if (!job) continue;
+        const planId = textValue(plan.id, "");
+        if (!planId) continue;
+        const recovered = await this.getPlan(planId);
+        if (recovered?.status !== "PAUSED") continue;
+        if (
+          job.status === "SUBMISSION_UNKNOWN" ||
+          job.status === "SUBMITTING"
+        ) {
+          await this.snapshots.putPlan(
+            projectId,
+            planId,
+            planAt(
+              recovered,
+              "PAUSED",
+              "fal may have accepted this render. Review the provider's request history before starting a new render."
+            )
+          );
+          continue;
+        }
+        if (recoverableExternalRenderStatuses.has(job.status)) {
+          await this.resumePlan(planId, true);
+          break;
+        }
+      }
+    }
+  }
+
+  private async assertNoUnsettledRenders(
+    plans: JsonRecord[],
+    tool: string,
+    targets: Set<string>
+  ): Promise<void> {
+    if (!this.externalRenderJobs) return;
+    for (const plan of plans) {
+      if (
+        !["PAUSED", "FAILED", "PENDING", "RUNNING"].includes(
+          textValue(plan.status, "")
+        )
+      )
+        continue;
+      for (const step of records(plan.steps)) {
+        if (step.tool_name !== tool) continue;
+        const target =
+          textValue(step.timeline_id, "") ||
+          textValue(record(step.tool_args)?.token, "");
+        if (!targets.has(target)) continue;
+        const id = textValue(step.id, "");
+        const job = id ? await this.externalRenderJobs.get(id) : null;
+        if (
+          job?.status === "SUBMITTING" ||
+          job?.status === "SUBMISSION_UNKNOWN"
+        )
+          throw new Error(
+            "fal may have accepted an earlier render for this item. Review fal's request history and cancel the earlier plan before starting a new render."
+          );
+        if (job && recoverableExternalRenderStatuses.has(job.status)) {
+          const poll =
+            tool === "submit_video_render"
+              ? this.findStep(plan, "poll_video_render", target)
+              : this.findStep(plan, "poll_img2img_batch", undefined, target);
+          if (!completedStep(poll))
+            throw new Error(
+              "An earlier fal render is still pending for this item. Resume or cancel its plan before starting a new render."
+            );
+        }
+      }
+    }
+  }
+
+  async resumePlan(planId: string, recovering = false): Promise<JsonRecord> {
     const plan = await this.requireLocallyRunPlan(planId);
     const projectId = String(plan.project_id);
     await this.assertLocalProject(projectId);
@@ -780,6 +924,7 @@ export class LocalScriptProjectService {
       return pending;
     }
     this.startRun(projectId, planId, async (control) => {
+      control.recovering = recovering;
       if (operation === "cast") {
         await this.runCastingPlan(
           request as unknown as LocalScriptCastInput,
@@ -1332,13 +1477,15 @@ export class LocalScriptProjectService {
 
   private async tryDescribeEntityImage(
     sourcePath: string,
-    kind: string
+    kind: string,
+    externalOnly: boolean
   ): Promise<string | null> {
-    if (!this.describeEntityImage) return null;
+    const describe = externalOnly
+      ? this.describeExternalEntityImage
+      : this.describeEntityImage;
+    if (!describe) return null;
     try {
-      const description = (
-        await this.describeEntityImage(sourcePath, kind)
-      ).trim();
+      const description = (await describe(sourcePath, kind)).trim();
       return description || null;
     } catch {
       // A caption improves a later MiniMax prompt, but must never turn an
@@ -1370,7 +1517,11 @@ export class LocalScriptProjectService {
       (await this.snapshots.resolveMediaPath(assetId)) ??
       (await this.projects.resolveMediaPath("asset", assetId));
     const description = sourcePath
-      ? await this.tryDescribeEntityImage(sourcePath, textValue(key.kind, ""))
+      ? await this.tryDescribeEntityImage(
+          sourcePath,
+          textValue(key.kind, ""),
+          record(image.render_settings)?.provider === "fal"
+        )
       : null;
     if (!description) {
       if (required) throw new Error("Could not describe this image");
@@ -1496,7 +1647,40 @@ export class LocalScriptProjectService {
           false
         );
         const token = storyboardToken(String(shot.timeline_id));
-        const prompt = buildStoryboardPrompt(shot, keys, size);
+        const renderModel =
+          payload.renderModel ??
+          record(project?.settings)?.storyboard_render_model ??
+          "qwen_image_2512_local";
+        const referenceIds = [template.id];
+        const referenceNotes: string[] = [];
+        if (isFalSheetModel(renderModel)) {
+          const limit = falImageReferenceLimit(renderModel);
+          for (const group of GROUP_ORDER) {
+            for (const reference of records(record(shot.references)?.[group])) {
+              const id = textValue(reference.asset_id, "");
+              if (
+                !id ||
+                referenceIds.includes(id) ||
+                referenceIds.length >= limit
+              )
+                continue;
+              referenceIds.push(id);
+              const key = keys.find((item) => item.token === reference.token);
+              referenceNotes.push(
+                `Image ${referenceIds.length} shows ${textValue(key?.name, String(reference.token))}.`
+              );
+            }
+          }
+        }
+        const prompt = [
+          buildStoryboardPrompt(shot, keys, size),
+          ...(referenceNotes.length
+            ? [
+                "Image 1 is the blank layout. Use the other images as visual references:",
+                ...referenceNotes
+              ]
+            : [])
+        ].join("\n");
         await this.withProjectStateWrite(projectId, async () => {
           const latest = await this.requireSnapshot(projectId);
           const state = structuredClone(latest.state!);
@@ -1512,7 +1696,7 @@ export class LocalScriptProjectService {
             selected_asset_id: null,
             images: records(oldKey?.images),
             prompt,
-            reference_asset_ids: [template.id],
+            reference_asset_ids: referenceIds,
             storyboard_scene_fingerprint: sceneFingerprint(shot, keys),
             panel_count: count
           };
@@ -1528,10 +1712,8 @@ export class LocalScriptProjectService {
           tokens: [token],
           outputSize: [1536, 864],
           settings: {
-            render_model:
-              payload.renderModel ??
-              record(project?.settings)?.storyboard_render_model ??
-              "qwen_image_2512_local"
+            render_model: renderModel,
+            provider_settings: payload.providerSettings
           }
         });
         return {
@@ -1668,9 +1850,27 @@ export class LocalScriptProjectService {
     const isCloudRender = CLOUD_SHEET_RENDER_MODELS.has(requestedModel);
     // A cloud model's spec names the text-to-image model even when it renders
     // through its edit sibling, as the backend's sheet render spec does.
-    const selectedImageModel = isCloudRender
-      ? requestedModel
-      : resolveLocalScriptImageModel(input.settings?.render_model);
+    const isFalRender = isFalSheetModel(requestedModel);
+    const selectedImageModel =
+      isCloudRender || isFalRender
+        ? requestedModel
+        : resolveLocalScriptImageModel(input.settings?.render_model);
+    const project = await this.projects.get(input.projectId);
+    const providerSettings = isFalSheetModel(selectedImageModel)
+      ? resolveFalGenerationSettings(
+          selectedImageModel,
+          input.settings?.provider_settings,
+          record(record(project?.settings)?.fal_generation_settings)?.[
+            selectedImageModel
+          ],
+          (await this.getFalGenerationDefaults?.())?.[selectedImageModel]
+        )
+      : undefined;
+    if (providerSettings)
+      input = {
+        ...input,
+        settings: { ...input.settings, provider_settings: providerSettings }
+      };
     const referenceFields =
       input.referenceAssetIds !== undefined ||
       input.referenceInstruction !== undefined
@@ -1691,6 +1891,9 @@ export class LocalScriptProjectService {
               kind: "storyboard",
               token: key.token,
               render_model: selectedImageModel,
+              ...(providerSettings
+                ? { provider_settings: providerSettings }
+                : {}),
               output_size: [1536, 864],
               storyboard_scene_fingerprint: key.storyboard_scene_fingerprint,
               panel_count: key.panel_count,
@@ -1716,6 +1919,7 @@ export class LocalScriptProjectService {
           keys: runKeys,
           request: {
             renderModel: selectedImageModel,
+            providerSettings,
             outputSize: input.outputSize,
             tokens: input.tokens,
             promptOverride:
@@ -1748,6 +1952,11 @@ export class LocalScriptProjectService {
       );
     const answer = run.preview;
     if (input.isDryRun) return answer;
+    await this.assertNoUnsettledRenders(
+      Object.values(snapshot.planDetails ?? {}),
+      "submit_img2img_batch",
+      new Set(run.planned.map(({ key }) => textValue(key.token, "")))
+    );
     if (run.requestedReferences !== null && !createdSheetGroup) {
       // Saved even when the key is skipped: sending references stores them.
       await this.saveSheetReferences(
@@ -1779,7 +1988,11 @@ export class LocalScriptProjectService {
       _local_fingerprint: planned.fingerprint
     }));
     const tokens = keys.map((key) => String(key.token));
-    if (!isCloudRender && selectedImageModel !== "qwen_image_2512_local") {
+    if (
+      !isCloudRender &&
+      !isFalRender &&
+      selectedImageModel !== "qwen_image_2512_local"
+    ) {
       const setup =
         selectedImageModel === "flux2_klein_4b_q8_local"
           ? "flux2-klein-4b-q8"
@@ -1825,7 +2038,9 @@ export class LocalScriptProjectService {
     const plan = createPlan(
       planId,
       input.projectId,
-      "Render local reference sheets",
+      isFalRender
+        ? "Render reference sheets with fal"
+        : "Render local reference sheets",
       "sheets",
       { ...input, tokens, requested_tokens: input.tokens ?? [] },
       steps
@@ -1857,6 +2072,24 @@ export class LocalScriptProjectService {
     input: LocalScriptShotsInput
   ): Promise<JsonRecord> {
     await this.assertLocalProject(input.projectId);
+    const isFalRender =
+      input.videoSettings?.render_provider === FAL_SHOT_PROVIDER;
+    if (isFalRender) {
+      const project = await this.projects.get(input.projectId);
+      const settings = resolveFalGenerationSettings(
+        FAL_SHOT_ENGINE,
+        input.videoSettings?.provider_settings,
+        record(record(project?.settings)?.fal_generation_settings)?.[
+          FAL_SHOT_ENGINE
+        ],
+        (await this.getFalGenerationDefaults?.())?.[FAL_SHOT_ENGINE]
+      );
+      input = {
+        ...input,
+        outputSize: falVideoSize(settings),
+        videoSettings: { ...input.videoSettings, provider_settings: settings }
+      };
+    }
     const snapshot = await this.requireSnapshot(input.projectId);
     const run = planShotRun({
       shots: records(snapshot.state?.shots).map((shot) => ({
@@ -1887,6 +2120,11 @@ export class LocalScriptProjectService {
     // shots, as the cloud does: the length is one field the caller can fix.
     if (run.durationError) throw new ShotRunError(run.durationError);
     if (!run.planned.length) return { ...answer, plan_id: null };
+    await this.assertNoUnsettledRenders(
+      Object.values(snapshot.planDetails ?? {}),
+      "submit_video_render",
+      new Set(run.planned.map(({ shot }) => textValue(shot.timeline_id, "")))
+    );
     const runnable: JsonRecord[] = run.planned.map((planned) => ({
       ...planned.shot,
       _local_sequential: planned.sequential,
@@ -1961,7 +2199,8 @@ export class LocalScriptProjectService {
       ).flatMap((value) => records(value)).length;
       const referenceLimit = referenceImageSlotBudget(
         sequential,
-        !!record(shot._local_storyboard)
+        !!record(shot._local_storyboard),
+        isFalRender ? FAL_SHOT_IMAGE_SLOTS : undefined
       );
       if (referenceCount > referenceLimit) {
         steps.push(
@@ -1997,7 +2236,9 @@ export class LocalScriptProjectService {
     const plan = createPlan(
       planId,
       input.projectId,
-      "Render local MiniMax H3 shots",
+      isFalRender
+        ? "Render H3 Max shots with fal"
+        : "Render local MiniMax H3 shots",
       "shots",
       input as unknown as JsonRecord,
       steps
@@ -2055,14 +2296,19 @@ export class LocalScriptProjectService {
     await this.snapshots.putPlan(input.projectId, planId, plan);
     let activeStep: JsonRecord | undefined;
     try {
-      const client = new ComfyScriptProjectClient(
-        await this.getComfyEndpoint()
-      );
+      const requestedModel = input.settings?.render_model;
+      const falModel = isFalSheetModel(requestedModel) ? requestedModel : null;
+      const isFalRender = falModel !== null;
+      const client = isFalRender
+        ? null
+        : new ComfyScriptProjectClient(await this.getComfyEndpoint());
+      if (isFalRender && !this.externalRenderJobs)
+        throw new Error("fal reference sheet rendering is unavailable");
       const initialSnapshot = await this.requireSnapshot(input.projectId);
       const visualStyle = textValue(initialSnapshot.state?.visual_style, "");
-      const imageModel = resolveLocalScriptImageModel(
-        input.settings?.render_model
-      );
+      const imageModel = isFalRender
+        ? falModel
+        : resolveLocalScriptImageModel(requestedModel);
       const explicitlyRequestedTokens = strings(
         record(basePlan.local_request)?.requested_tokens
       );
@@ -2082,34 +2328,45 @@ export class LocalScriptProjectService {
           undefined,
           token
         );
-        plan = await this.setStep(
-          input.projectId,
-          planId,
-          activeStep,
-          "RUNNING"
-        );
-        plan = await this.setStep(
-          input.projectId,
-          planId,
-          activeStep,
-          "COMPLETED",
-          {
-            token,
-            submitted: true
+        const externalJobId = textValue(activeStep?.id, "");
+        if (isFalRender && !externalJobId)
+          throw new Error("The sheet plan has no saved submission step");
+        if (!completedStep(activeStep))
+          plan = await this.setStep(
+            input.projectId,
+            planId,
+            activeStep,
+            "RUNNING"
+          );
+        const startPolling = async () => {
+          this.throwIfCancelled(control);
+          if (!completedStep(activeStep)) {
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              activeStep,
+              "COMPLETED",
+              {
+                token,
+                submitted: true,
+                ...(isFalRender ? { external_job_id: externalJobId } : {})
+              }
+            );
           }
-        );
-        activeStep = this.findStep(
-          plan,
-          "poll_img2img_batch",
-          undefined,
-          token
-        );
-        plan = await this.setStep(
-          input.projectId,
-          planId,
-          activeStep,
-          "RUNNING"
-        );
+          activeStep = this.findStep(
+            plan,
+            "poll_img2img_batch",
+            undefined,
+            token
+          );
+          plan = await this.setStep(
+            input.projectId,
+            planId,
+            activeStep,
+            "RUNNING"
+          );
+        };
+        if (client) await startPolling();
         // The planned prompt (sheet_prompt, with the reference instruction
         // when it renders from references); plans made before the planner
         // existed carry none and fall back to the key's own text.
@@ -2130,7 +2387,7 @@ export class LocalScriptProjectService {
         );
         const masterToken = designMasterToken(target);
         let masterAssetId: string | null = null;
-        const renderPrompt = textValue(
+        let renderPrompt = textValue(
           target._local_render_prompt,
           composeSheetRenderPrompt(
             target,
@@ -2139,7 +2396,15 @@ export class LocalScriptProjectService {
             input.outputSize
           )
         );
-        if (masterToken) {
+        const savedJob = isFalRender
+          ? await this.externalRenderJobs!.get(externalJobId)
+          : null;
+        if (savedJob) {
+          masterAssetId = masterToken
+            ? (savedJob.inputAssetIds[0] ?? null)
+            : null;
+          renderPrompt = textValue(savedJob.requestJson.prompt, renderPrompt);
+        } else if (masterToken) {
           const current = await this.requireSnapshot(input.projectId);
           const master = records(current.state?.keys).find(
             (key) => key.token === masterToken
@@ -2154,50 +2419,99 @@ export class LocalScriptProjectService {
         // A key with references renders through its model's edit flavour,
         // the master design (for a variant) first, as the backend
         // puts the first reference in as the source.
-        const sourceIds = [
-          ...(masterAssetId ? [masterAssetId] : []),
-          ...strings(target._local_reference_asset_ids)
-        ].filter((id, index, ids) => ids.indexOf(id) === index);
-        const sourcePaths = await Promise.all(
-          sourceIds.map(async (id) => {
-            const resolved =
-              (await this.snapshots.resolveMediaPath(id)) ??
-              (await this.projects.resolveMediaPath("asset", id));
-            if (!resolved)
-              throw new Error(
-                masterToken && id === masterAssetId
-                  ? `The master design image for ${masterToken} is unavailable locally`
-                  : `Reference image ${id} is unavailable locally`
-              );
-            return resolved;
-          })
-        );
+        const sourceIds =
+          savedJob?.inputAssetIds ??
+          [
+            ...(masterAssetId ? [masterAssetId] : []),
+            ...strings(target._local_reference_asset_ids)
+          ].filter((id, index, ids) => ids.indexOf(id) === index);
         const frame = isStoryboard(target)
           ? [1536, 864]
           : sheetOutputSize(target.kind, input.outputSize ?? []);
-        const bytes = sourcePaths.length
-          ? await client.runImageEdit({
-              sourcePath: sourcePaths[0]!,
-              ...(Number(frame[0]) > 0 && Number(frame[1]) > 0
-                ? {
-                    outputSize: [Number(frame[0]), Number(frame[1])] as [
-                      number,
-                      number
-                    ]
-                  }
-                : {}),
-              referencePaths: sourcePaths.slice(1),
-              prompt: renderPrompt,
-              model: imageModel,
-              isCancelled: () => control.cancelled
+        const useAsPreview =
+          !isStoryboard(target) &&
+          records(plan.steps).every(
+            (step) =>
+              step.tool_name !== "poll_img2img_batch" ||
+              step.status !== "COMPLETED"
+          );
+        let media: {
+          id: string;
+          url: string;
+          width?: number | null;
+          height?: number | null;
+        };
+        let falJob:
+          | Awaited<ReturnType<typeof renderFalSheet>>["job"]
+          | undefined;
+        if (client) {
+          const sourcePaths = await Promise.all(
+            sourceIds.map(async (id) => {
+              const resolved =
+                (await this.snapshots.resolveMediaPath(id)) ??
+                (await this.projects.resolveMediaPath("asset", id));
+              if (!resolved)
+                throw new Error(
+                  masterToken && id === masterAssetId
+                    ? `The master design image for ${masterToken} is unavailable locally`
+                    : `Reference image ${id} is unavailable locally`
+                );
+              return resolved;
             })
-          : await client.runImage({
-              prompt: renderPrompt,
-              model: imageModel,
-              width: Number(frame[0]) || undefined,
-              height: Number(frame[1]) || undefined,
-              isCancelled: () => control.cancelled
-            });
+          );
+          const bytes = sourcePaths.length
+            ? await client.runImageEdit({
+                sourcePath: sourcePaths[0]!,
+                ...(Number(frame[0]) > 0 && Number(frame[1]) > 0
+                  ? {
+                      outputSize: [Number(frame[0]), Number(frame[1])] as [
+                        number,
+                        number
+                      ]
+                    }
+                  : {}),
+                referencePaths: sourcePaths.slice(1),
+                prompt: renderPrompt,
+                model: resolveLocalScriptImageModel(imageModel),
+                isCancelled: () => control.cancelled
+              })
+            : await client.runImage({
+                prompt: renderPrompt,
+                model: resolveLocalScriptImageModel(imageModel),
+                width: Number(frame[0]) || undefined,
+                height: Number(frame[1]) || undefined,
+                isCancelled: () => control.cancelled
+              });
+          this.throwIfCancelled(control);
+          media = await this.snapshots.storeGeneratedMedia(
+            input.projectId,
+            bytes,
+            "png",
+            useAsPreview
+          );
+        } else {
+          const result = await renderFalSheet(this.externalRenderJobs!, {
+            jobId: externalJobId,
+            model: falModel!,
+            settings: input.settings?.provider_settings as
+              | Record<string, string | number | null>
+              | undefined,
+            recovering: control.recovering,
+            projectId: input.projectId,
+            prompt: renderPrompt,
+            frame,
+            sourceIds,
+            signal: control.abortController.signal,
+            onSubmitted: startPolling
+          });
+          falJob = result.job;
+          this.throwIfCancelled(control);
+          media = await this.snapshots.registerGeneratedAsset(
+            input.projectId,
+            result.assetId,
+            useAsPreview
+          );
+        }
         // What this image actually rendered from: a variant whose master
         // re-rendered earlier in this run edits the new master image.
         const plannedSpec = record(target._local_spec);
@@ -2208,24 +2522,17 @@ export class LocalScriptProjectService {
             }
           : null;
         this.throwIfCancelled(control);
-        const media = await this.snapshots.storeGeneratedMedia(
-          input.projectId,
-          bytes,
-          "png",
-          !isStoryboard(target) &&
-            records(plan.steps).filter(
-              (step) =>
-                step.tool_name === "poll_img2img_batch" &&
-                step.status === "COMPLETED"
-            ).length === 0
-        );
         await this.withProjectStateWrite(input.projectId, async () => {
           const snapshot = await this.requireSnapshot(input.projectId);
           const state = structuredClone(snapshot.state!);
           const key = records(state.keys).find(
             (candidate) => candidate.token === target.token
           );
-          if (key) {
+          if (
+            key &&
+            (!falJob ||
+              !records(key.images).some((image) => image.asset_id === media.id))
+          ) {
             const image = {
               asset_id: media.id,
               clip_id: randomUUID(),
@@ -2248,8 +2555,19 @@ export class LocalScriptProjectService {
               render_settings: {
                 prompt: renderPrompt,
                 render_model: imageModel,
-                width: frame[0] ?? null,
-                height: frame[1] ?? null,
+                width: falJob ? (media.width ?? null) : (frame[0] ?? null),
+                height: falJob ? (media.height ?? null) : (frame[1] ?? null),
+                ...(falJob
+                  ? {
+                      provider: falJob.provider,
+                      endpoint: falJob.endpoint,
+                      external_job_id: falJob.id,
+                      provider_settings: falJob.requestJson,
+                      aspect_ratio: falJob.requestJson.aspect_ratio,
+                      resolution: falJob.requestJson.resolution,
+                      image_size: falJob.requestJson.image_size
+                    }
+                  : {}),
                 ...(sourceIds.length ? { source_asset_id: sourceIds[0] } : {}),
                 ...(sourceIds.length > 1
                   ? { reference_images: sourceIds.slice(1) }
@@ -2293,22 +2611,31 @@ export class LocalScriptProjectService {
             token,
             asset_ids: [media.id],
             output_url: media.url,
-            ...(masterToken
+            ...(falJob
               ? {
-                  render_mode:
-                    imageModel === "qwen_image_2512_local"
-                      ? "qwen_image_edit"
-                      : "flux2_klein_image_edit",
+                  render_mode: falJob.inputAssetIds.length
+                    ? "image_edit"
+                    : "text_to_image",
                   render_model: imageModel,
-                  master_asset_id: masterAssetId
+                  external_job_id: falJob.id,
+                  ...(masterToken ? { master_asset_id: masterAssetId } : {})
                 }
-              : {
-                  render_mode:
-                    imageModel === "qwen_image_2512_local"
-                      ? "qwen_text_to_image"
-                      : "flux2_klein_text_to_image",
-                  render_model: imageModel
-                })
+              : masterToken
+                ? {
+                    render_mode:
+                      imageModel === "qwen_image_2512_local"
+                        ? "qwen_image_edit"
+                        : "flux2_klein_image_edit",
+                    render_model: imageModel,
+                    master_asset_id: masterAssetId
+                  }
+                : {
+                    render_mode:
+                      imageModel === "qwen_image_2512_local"
+                        ? "qwen_text_to_image"
+                        : "flux2_klein_text_to_image",
+                    render_model: imageModel
+                  })
           }
         );
       }
@@ -2347,6 +2674,7 @@ export class LocalScriptProjectService {
         planId,
         planAt(plan, "COMPLETED")
       );
+      if (!client) return;
       void (async () => {
         for (const target of targetKeys) {
           if (
@@ -2420,21 +2748,44 @@ export class LocalScriptProjectService {
     await this.snapshots.putPlan(input.projectId, planId, plan);
     let activeStep: JsonRecord | undefined;
     try {
-      const endpoint = await this.getComfyEndpoint();
-      const client = new ComfyScriptProjectClient(endpoint);
+      const isFalRender =
+        input.videoSettings?.render_provider === FAL_SHOT_PROVIDER;
+      const endpoint = isFalRender ? null : await this.getComfyEndpoint();
+      const client = endpoint ? new ComfyScriptProjectClient(endpoint) : null;
+      if (isFalRender && !this.externalRenderJobs)
+        throw new Error("fal shot rendering is unavailable");
       for (const target of [...targetShots].sort(
         (left, right) => Number(left.shot_index) - Number(right.shot_index)
       )) {
         this.throwIfCancelled(control);
+        activeStep = undefined;
         const timelineId = String(target.timeline_id);
         if (completedStep(this.findStep(plan, "poll_video_render", timelineId)))
           continue;
+        const submitRender = this.findStep(
+          plan,
+          "submit_video_render",
+          timelineId
+        );
+        const jobId = textValue(submitRender?.id, "");
+        if (isFalRender && !jobId)
+          throw new Error("The shot plan has no saved submission step");
+        const savedJob = isFalRender
+          ? await this.externalRenderJobs!.get(jobId)
+          : null;
+        if (control.recovering && !savedJob)
+          throw new Error("Resume the plan to submit its remaining renders");
         let snapshot = await this.requireSnapshot(input.projectId);
         const referenceItems = Object.values(
           record(target.references) ?? {}
         ).flatMap((value) => records(value));
-        await this.ensureReferenceDescriptions(input.projectId, referenceItems);
-        snapshot = await this.requireSnapshot(input.projectId);
+        if (!isFalRender) {
+          await this.ensureReferenceDescriptions(
+            input.projectId,
+            referenceItems
+          );
+          snapshot = await this.requireSnapshot(input.projectId);
+        }
         const stateKeys = new Map(
           records(snapshot.state?.keys).map((key) => [String(key.token), key])
         );
@@ -2444,7 +2795,8 @@ export class LocalScriptProjectService {
         // dropped.
         const imageSlotBudget = referenceImageSlotBudget(
           sequential,
-          !!record(target._local_storyboard)
+          !!record(target._local_storyboard),
+          isFalRender ? FAL_SHOT_IMAGE_SLOTS : undefined
         );
         const referenceSlots = planReferenceSlots(
           Object.fromEntries(
@@ -2465,7 +2817,8 @@ export class LocalScriptProjectService {
             throw new Error("Local reference image " + id + " is unavailable");
           return resolved;
         };
-        const hasOverflow = referenceSlots.some((slot) => slot.length > 1);
+        const hasOverflow =
+          !savedJob && referenceSlots.some((slot) => slot.length > 1);
         // One asset per slot: a lone reference is itself, a gridded slot's
         // asset is created below. Filled in slot order.
         const referenceIds: string[] = referenceSlots.map((slot) =>
@@ -2473,7 +2826,7 @@ export class LocalScriptProjectService {
         );
         const referencePaths: string[] = await Promise.all(
           referenceSlots.map((slot) =>
-            slot.length === 1
+            !isFalRender && slot.length === 1
               ? resolveReferencePath(slot[0]!)
               : Promise.resolve("")
           )
@@ -2552,9 +2905,9 @@ export class LocalScriptProjectService {
           );
         }
         const board = record(target._local_storyboard);
-        if (board && typeof board.asset_id === "string")
+        if (!isFalRender && board && typeof board.asset_id === "string")
           referencePaths.push(await resolveReferencePath(board.asset_id));
-        const numberedImageIds = [
+        const numberedImageIds = savedJob?.inputAssetIds ?? [
           ...referenceIds,
           ...(board ? [String(board.asset_id)] : [])
         ];
@@ -2618,6 +2971,10 @@ export class LocalScriptProjectService {
           );
         }
 
+        if (isFalRender && sequential)
+          throw new Error(
+            "Suspend sequential references to render this shot with H3 Max (fal)"
+          );
         if (sequential) {
           const previousId = String(target._local_previous_timeline_id);
           const latest = await this.requireSnapshot(input.projectId);
@@ -2778,7 +3135,9 @@ export class LocalScriptProjectService {
           "poll_shot_video_prompt",
           timelineId
         );
-        if (target._local_prompt_rewrite === "raw") {
+        if (savedJob) {
+          adaptedPrompt = textValue(savedJob.requestJson.prompt, "");
+        } else if (target._local_prompt_rewrite === "raw") {
           // prompt_rewrite "raw": the shot's own prompt goes to the model as is.
           adaptedPrompt = sequential
             ? shotPromptWithSequentialAppendix(
@@ -2837,7 +3196,7 @@ export class LocalScriptProjectService {
             continuityImage,
             continuityVideo,
             durationSeconds,
-            outputSize: input.outputSize,
+            outputSize: isFalRender ? [16, 9] : input.outputSize,
             visualStyle: textValue(
               record(record(record(target._local_render_spec)?.spec)?.settings)
                 ?.visual_style,
@@ -2846,6 +3205,10 @@ export class LocalScriptProjectService {
           });
           const generateExternal = await this.getExternalTextGenerator?.();
           this.throwIfCancelled(control);
+          if (isFalRender && !generateExternal)
+            throw new Error(
+              "Configure an external text provider for shot prompt composition or choose a raw prompt"
+            );
           const cloud = generateExternal
             ? null
             : await this.runCloudTextModel(
@@ -2861,7 +3224,7 @@ export class LocalScriptProjectService {
           if (!generateExternal && !cloud && !legacyPromptClient) {
             const scriptTextModel = await this.getScriptTextModel();
             legacyPromptClient = new ComfyScriptProjectClient(
-              endpoint,
+              endpoint!,
               scriptTextModel
             );
             legacyPromptModel = LOCAL_SCRIPT_TEXT_MODEL_FILES[scriptTextModel];
@@ -2890,6 +3253,7 @@ export class LocalScriptProjectService {
                 );
               }),
               {
+                ...(isFalRender ? { engineVersion: FAL_SHOT_ENGINE } : {}),
                 storedCaption: storedCaptionFor([...stateKeys.values()]),
                 allowFallback: !generateExternal
               }
@@ -2941,60 +3305,117 @@ export class LocalScriptProjectService {
             }
           );
         }
-        activeStep = this.findStep(plan, "submit_video_render", timelineId);
-        plan = await this.setStep(
-          input.projectId,
-          planId,
-          activeStep,
-          "RUNNING"
-        );
-        plan = await this.setStep(
-          input.projectId,
-          planId,
-          activeStep,
-          "COMPLETED",
-          {
-            submitted: true,
+        activeStep = submitRender;
+        if (!completedStep(submitRender))
+          plan = await this.setStep(
+            input.projectId,
+            planId,
+            submitRender,
+            "RUNNING"
+          );
+        const startPolling = async () => {
+          this.throwIfCancelled(control);
+          if (!completedStep(submitRender))
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              submitRender,
+              "COMPLETED",
+              {
+                submitted: true,
+                prompt: adaptedPrompt,
+                ...(isFalRender
+                  ? { external_job_id: jobId }
+                  : {
+                      local_h3_steps: localH3Steps,
+                      local_h3_legacy_workflow: useLegacyH3Workflow,
+                      local_h3_text_encoder: localH3TextEncoder,
+                      local_h3_model: localH3Model
+                    })
+              }
+            );
+          activeStep = this.findStep(plan, "poll_video_render", timelineId);
+          plan = await this.setStep(
+            input.projectId,
+            planId,
+            activeStep,
+            "RUNNING"
+          );
+        };
+        let media: {
+          id: string;
+          url: string;
+          path: string;
+          width?: number | null;
+          height?: number | null;
+          duration?: number | null;
+          fps?: number | null;
+        };
+        let falJob:
+          | Awaited<ReturnType<typeof renderFalShot>>["job"]
+          | undefined;
+        if (client) {
+          await startPolling();
+          // Deduped by asset, first position kept, as the composer numbered
+          // them: a repeated image would shift every later <Picture n>.
+          const renderedPaths = referencePaths.filter(
+            (_path, index) =>
+              numberedImageIds.indexOf(numberedImageIds[index]!) === index
+          );
+          const bytes = await client.runVideo({
             prompt: adaptedPrompt,
-            local_h3_steps: localH3Steps,
-            local_h3_legacy_workflow: useLegacyH3Workflow,
-            local_h3_text_encoder: localH3TextEncoder,
-            local_h3_model: localH3Model
-          }
-        );
-        activeStep = this.findStep(plan, "poll_video_render", timelineId);
-        plan = await this.setStep(
-          input.projectId,
-          planId,
-          activeStep,
-          "RUNNING"
-        );
-        // Deduped by asset, first position kept, as the composer numbered
-        // them: a repeated image would shift every later <Picture n>.
-        const renderedPaths = referencePaths.filter(
-          (_path, index) =>
-            numberedImageIds.indexOf(numberedImageIds[index]!) === index
-        );
-        const bytes = await client.runVideo({
-          prompt: adaptedPrompt,
-          referencePaths: renderedPaths,
-          referenceVideos,
-          width: input.outputSize?.[0],
-          height: input.outputSize?.[1],
-          durationSeconds,
-          steps: localH3Steps,
-          useLegacyWorkflow: useLegacyH3Workflow,
-          textEncoder: localH3TextEncoder,
-          videoModel: localH3Model,
-          openingFramePath,
-          isCancelled: () => control.cancelled
-        });
-        this.throwIfCancelled(control);
-        const media = await this.snapshots.storeGeneratedMedia(
-          input.projectId,
-          bytes,
-          "mp4"
-        );
+            referencePaths: renderedPaths,
+            referenceVideos,
+            width: input.outputSize?.[0],
+            height: input.outputSize?.[1],
+            durationSeconds,
+            steps: localH3Steps,
+            useLegacyWorkflow: useLegacyH3Workflow,
+            textEncoder: localH3TextEncoder,
+            videoModel: localH3Model,
+            openingFramePath,
+            isCancelled: () => control.cancelled
+          });
+          this.throwIfCancelled(control);
+          media = await this.snapshots.storeGeneratedMedia(
+            input.projectId,
+            bytes,
+            "mp4"
+          );
+        } else {
+          adaptedPrompt = (adaptedPrompt ?? "").replace(
+            /<Picture (\d+)>/gi,
+            "Image $1"
+          );
+          const result = await renderFalShot(this.externalRenderJobs!, {
+            jobId,
+            savedJob,
+            projectId: input.projectId,
+            prompt: adaptedPrompt,
+            duration: durationSeconds,
+            settings: input.videoSettings?.provider_settings as
+              | Record<string, string | number | null>
+              | undefined,
+            sourceIds: [...new Set(numberedImageIds)],
+            recovering: control.recovering,
+            signal: control.abortController.signal,
+            onSubmitted: startPolling
+          });
+          falJob = result.job;
+          this.throwIfCancelled(control);
+          const asset = await this.snapshots.registerGeneratedAsset(
+            input.projectId,
+            result.assetId,
+            false
+          );
+          const sourcePath = await this.snapshots.resolveMediaPath(
+            asset.id,
+            input.projectId
+          );
+          if (!sourcePath)
+            throw new Error("The saved fal video is unavailable");
+          media = { ...asset, path: sourcePath };
+        }
         const posterBytes = await extractFirstFrame(media.path);
         const poster = await this.snapshots.storeGeneratedMedia(
           input.projectId,
@@ -3013,7 +3434,13 @@ export class LocalScriptProjectService {
         const cutShot = records(cut.shots).find(
           (shot) => shot.timeline_id === target.timeline_id
         );
-        if (cutShot) {
+        if (
+          cutShot &&
+          (!falJob ||
+            !records(cutShot.versions).some(
+              (version) => version.asset_id === media.id
+            ))
+        ) {
           const renderSpecEnvelope = record(target._local_render_spec);
           const renderSpec = record(renderSpecEnvelope?.spec);
           const version = {
@@ -3040,11 +3467,28 @@ export class LocalScriptProjectService {
             input_settings: {
               duration_s: durationSeconds,
               output_size: input.outputSize ?? null,
+              ...(falJob
+                ? {
+                    provider: falJob.provider,
+                    endpoint: falJob.endpoint,
+                    external_job_id: falJob.id,
+                    provider_settings: falJob.requestJson,
+                    resolution: falJob.requestJson.resolution,
+                    aspect_ratio: falJob.requestJson.aspect_ratio,
+                    measured_duration_s:
+                      media.duration == null ? null : media.duration / 1000,
+                    seed: falJob.outputJson?.seed,
+                    reference_tokens: falJob.outputJson?.referenceTokens
+                  }
+                : {}),
               prompt_rewrite: target._local_prompt_rewrite ?? null,
               _local_render_spec: renderSpec
             },
             prompt_rewrite: target._local_prompt_rewrite ?? null,
-            size: input.outputSize ?? null,
+            size:
+              media.width && media.height
+                ? [media.width, media.height]
+                : (input.outputSize ?? null),
             // What this version rendered from; "already rendered with these
             // inputs" reads it back once the version has finished.
             fingerprint: renderSpecEnvelope?.fingerprint ?? null
@@ -3068,7 +3512,11 @@ export class LocalScriptProjectService {
           projectId: input.projectId,
           cut
         });
-        if (this.evaluateShotVideo && !record(target._local_storyboard)) {
+        if (
+          !isFalRender &&
+          this.evaluateShotVideo &&
+          !record(target._local_storyboard)
+        ) {
           void this.getRenderMetrics(media.id).catch((error: unknown) =>
             console.warn("Could not start local shot evaluation", error)
           );
@@ -3080,7 +3528,8 @@ export class LocalScriptProjectService {
           "COMPLETED",
           {
             render_asset_id: media.id,
-            fps: 24,
+            fps:
+              media.fps == null ? (isFalRender ? null : 24) : media.fps / 1000,
             output_url: media.url,
             poster_asset_id: poster.id,
             poster_url: poster.url,

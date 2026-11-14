@@ -1,7 +1,8 @@
 import { z } from "zod";
 
 const queueOrigin = "https://queue.fal.run";
-const endpointPattern = /^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)+$/;
+const endpointPattern =
+  /^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*)+$/;
 const requestIdSchema = z.string().regex(/^[a-zA-Z0-9_-]+$/);
 const requestTimeoutMs = 30_000;
 const badRequest = 400;

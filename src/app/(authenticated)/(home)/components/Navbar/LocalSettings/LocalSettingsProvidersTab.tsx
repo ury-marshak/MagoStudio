@@ -1,3 +1,4 @@
+import { FalGenerationControls } from "@components/FalGenerationControls";
 import { Input } from "@components/Input";
 import { MainButton } from "@components/MainButton";
 import { Text } from "@components/Text";
@@ -7,10 +8,23 @@ import { useTranslation } from "react-i18next";
 
 import { queryKeys } from "@/queryKeys";
 
+import { externalReasoningEfforts } from "../../../../../../../desktop/shared/contracts";
 import type {
   ExternalModelCapability,
-  ExternalModelConfig
+  ExternalModelConfig,
+  FalProviderConfig
 } from "../../../../../../../desktop/shared/contracts";
+import {
+  resolveFalGenerationSettings,
+  type FalGenerationModel
+} from "../../../../../../../desktop/shared/falGenerationSettings";
+import { FAL_SHEET_MODELS } from "../../../../../../../desktop/shared/falSheetModel";
+import { FAL_SHOT_ENGINE } from "../../../../../../../desktop/shared/falShotModel";
+import { FAL_SHOT_PROVIDER } from "../../../../../../../desktop/shared/falShotModel";
+
+type SavedProviderConfig = ExternalModelConfig | FalProviderConfig | null;
+type ProviderDraft = ExternalModelConfig & FalProviderConfig;
+const shotProviders = [FAL_SHOT_PROVIDER, "local-comfy"] as const;
 
 const defaultConfig: ExternalModelConfig = {
   baseUrl: "https://openrouter.ai/api/v1",
@@ -25,11 +39,11 @@ const ProviderSettings = ({
 }) => {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [draft, setDraft] = useState<Partial<ExternalModelConfig>>({});
+  const [draft, setDraft] = useState<Partial<ProviderDraft>>({});
   const queryKey = queryKeys.externalProviders.capability(capability);
   const saved = useQuery({
     queryKey,
-    queryFn: () =>
+    queryFn: (): Promise<SavedProviderConfig> =>
       capability === "fal"
         ? window.mago.externalProviders.fal.get()
         : window.mago.externalProviders.get(capability),
@@ -42,12 +56,36 @@ const ProviderSettings = ({
         : window.mago.externalProviders.check(capability)
   });
   const save = useMutation({
-    mutationFn: (config: ExternalModelConfig | null) =>
+    mutationFn: (config: ProviderDraft | null): Promise<SavedProviderConfig> =>
       capability === "fal"
         ? window.mago.externalProviders.fal.save(
-            config && { keychainAccount: config.keychainAccount }
+            config && {
+              keychainAccount: config.keychainAccount,
+              ...(config.generationSettings
+                ? { generationSettings: config.generationSettings }
+                : {}),
+              ...(config.referenceImageModel
+                ? { referenceImageModel: config.referenceImageModel }
+                : {}),
+              ...(config.storyboardImageModel
+                ? { storyboardImageModel: config.storyboardImageModel }
+                : {}),
+              ...(config.shotProvider
+                ? { shotProvider: config.shotProvider }
+                : {})
+            }
           )
-        : window.mago.externalProviders.save(capability, config),
+        : window.mago.externalProviders.save(
+            capability,
+            config && {
+              baseUrl: config.baseUrl,
+              model: config.model,
+              keychainAccount: config.keychainAccount,
+              ...(config.reasoningEffort
+                ? { reasoningEffort: config.reasoningEffort }
+                : {})
+            }
+          ),
     onSuccess: async (config) => {
       await queryClient.cancelQueries({ queryKey });
       queryClient.setQueryData(queryKey, config);
@@ -63,7 +101,7 @@ const ProviderSettings = ({
   });
 
   const heading = t(`localSettings.providers.${capability}`);
-  const config = {
+  const config: ProviderDraft = {
     ...defaultConfig,
     keychainAccount: capability === "fal" ? "" : defaultConfig.keychainAccount,
     ...saved.data,
@@ -73,6 +111,13 @@ const ProviderSettings = ({
     capability === "fal"
       ? (["keychainAccount"] as const)
       : (["baseUrl", "model", "keychainAccount"] as const);
+  const showReasoning =
+    capability !== "fal" &&
+    URL.parse(config.baseUrl.trim())?.hostname === "openrouter.ai";
+  const falImageOptions = FAL_SHEET_MODELS.map((model) => ({
+    key: model,
+    label: t(`script_project.sheet_render_model_${model}.label`)
+  }));
   const changed = Object.keys(draft).length > 0;
   const busy = saved.isPending || save.isPending || check.isPending;
   const error = save.error ?? check.error ?? saved.error;
@@ -88,7 +133,14 @@ const ProviderSettings = ({
         save.mutate({
           baseUrl: config.baseUrl.trim(),
           model: config.model.trim(),
-          keychainAccount: config.keychainAccount.trim()
+          keychainAccount: config.keychainAccount.trim(),
+          generationSettings: config.generationSettings,
+          referenceImageModel: config.referenceImageModel,
+          storyboardImageModel: config.storyboardImageModel,
+          shotProvider: config.shotProvider,
+          ...(showReasoning && config.reasoningEffort
+            ? { reasoningEffort: config.reasoningEffort }
+            : {})
         });
       }}
     >
@@ -120,6 +172,117 @@ const ProviderSettings = ({
           />
         </label>
       ))}
+      {capability === "fal" &&
+        (
+          [
+            {
+              field: "referenceImageModel",
+              options: falImageOptions
+            },
+            {
+              field: "storyboardImageModel",
+              options: falImageOptions
+            },
+            {
+              field: "shotProvider",
+              options: shotProviders.map((provider) => ({
+                key: provider,
+                label: t(
+                  provider === FAL_SHOT_PROVIDER
+                    ? "script_project.shot_fal_model.label"
+                    : "script_project.shot_comfy_model.label"
+                )
+              }))
+            }
+          ] as const
+        ).map(({ field, options }) => (
+          <label key={field} className="flex flex-col gap-1">
+            <Text component="span" variant="xs" color="glyph-secondary">
+              {t(`localSettings.providers.${field}`)}
+            </Text>
+            <select
+              className="rounded-md border border-element-primary bg-transparent p-2 text-sm"
+              value={config[field] ?? ""}
+              disabled={busy}
+              onChange={(event) => {
+                setDraft({
+                  ...draft,
+                  [field]: options.find(({ key }) => key === event.target.value)
+                    ?.key
+                });
+                save.reset();
+                check.reset();
+              }}
+            >
+              <option value="">
+                {t("localSettings.providers.appDefault")}
+              </option>
+              {options.map(({ key, label }) => (
+                <option key={key} value={key}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+        ))}
+      {capability === "fal" &&
+        [...FAL_SHEET_MODELS, FAL_SHOT_ENGINE].map((model) => (
+          <div key={model} className="flex flex-col gap-1">
+            <Text variant="xs">
+              {model === FAL_SHOT_ENGINE
+                ? "H3 Max (fal)"
+                : t(`script_project.sheet_render_model_${model}.label`)}
+            </Text>
+            <FalGenerationControls
+              model={model}
+              settings={resolveFalGenerationSettings(
+                model as FalGenerationModel,
+                config.generationSettings?.[model as FalGenerationModel]
+              )}
+              disabled={busy}
+              onChange={(settings) => {
+                setDraft({
+                  ...draft,
+                  generationSettings: {
+                    ...config.generationSettings,
+                    [model]: settings
+                  }
+                });
+                save.reset();
+                check.reset();
+              }}
+            />
+          </div>
+        ))}
+      {showReasoning && (
+        <label className="flex flex-col gap-1">
+          <Text component="span" variant="xs" color="glyph-secondary">
+            {t("localSettings.providers.reasoningEffort")}
+          </Text>
+          <select
+            className="rounded-md border border-element-primary bg-transparent p-2 text-sm"
+            value={config.reasoningEffort ?? ""}
+            disabled={busy}
+            onChange={(event) => {
+              const reasoningEffort = externalReasoningEfforts.find(
+                (effort) => effort === event.target.value
+              );
+              setDraft({ ...draft, reasoningEffort });
+              save.reset();
+              check.reset();
+            }}
+          >
+            <option value="">
+              {t("localSettings.providers.reasoningDefault")}
+            </option>
+            {externalReasoningEfforts.map((effort) => (
+              <option key={effort} value={effort}>
+                {t(`localSettings.providers.reasoningLevels.${effort}`)}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
       <div className="flex flex-wrap gap-2">
         <MainButton
           colorScheme="primary"

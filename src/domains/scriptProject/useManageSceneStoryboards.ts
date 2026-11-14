@@ -29,20 +29,24 @@ export const useManageSceneStoryboards = (
   >(() => new Set());
 
   const generateSceneStoryboard = async (
-    sceneTimelineId: string
+    sceneTimelineId: string,
+    model = renderModel,
+    providerSettings?: Record<string, string | number | null>
   ): Promise<void> => {
     setSubmittingSceneTimelineIds(withTimelineId(sceneTimelineId, true));
     try {
       await submitSceneStoryboard({
         projectId,
         sceneTimelineId,
-        ...(renderModel ? { renderModel } : {})
+        ...(model ? { renderModel: model } : {}),
+        ...(providerSettings ? { providerSettings } : {})
       });
     } catch (error) {
       reportScriptProjectFailure(
         error,
         t("script_project.generate_storyboard_failed.description"),
-        () => void generateSceneStoryboard(sceneTimelineId)
+        () =>
+          void generateSceneStoryboard(sceneTimelineId, model, providerSettings)
       );
     } finally {
       setSubmittingSceneTimelineIds(withTimelineId(sceneTimelineId, false));

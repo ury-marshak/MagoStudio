@@ -9,7 +9,12 @@ import { sceneFingerprint } from "./storyboard";
 afterEach(() => vi.restoreAllMocks());
 
 type Row = Record<string, any>;
-const setup = () => {
+const setup = (
+  externalRenderJobs?: ConstructorParameters<
+    typeof LocalScriptProjectService
+  >[8],
+  appSettings?: Record<string, unknown>
+) => {
   const stored: Row = {
     state: {
       project_id: "p",
@@ -47,6 +52,10 @@ const setup = () => {
     }),
     storeGeneratedMedia: vi.fn(async () => media()),
     storeRemoteMedia: vi.fn(async () => media()),
+    registerGeneratedAsset: vi.fn(async () => ({
+      id: "board",
+      url: "mago-media://script-project/board"
+    })),
     resolveMediaPath: async () => "C:/template.png"
   };
   const projects = {
@@ -60,7 +69,15 @@ const setup = () => {
   const service = new LocalScriptProjectService(
     projects as never,
     snapshots as never,
-    async () => "http://localhost:8188"
+    async () => "http://localhost:8188",
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    externalRenderJobs,
+    undefined,
+    async () => appSettings as never
   );
   const update = (
     operation: "storyboard" | "storyboard-generate" | "storyboard-update",
@@ -74,6 +91,114 @@ const setup = () => {
   return { stored, snapshots, projects, service, update };
 };
 describe("local Storyboard service", () => {
+  it("renders a fal storyboard with the template first and tagged images after it", async () => {
+    const submit = vi.fn(async (request: Row) => ({
+      ...request,
+      requestId: "request",
+      status: "INGESTED",
+      outputJson: { assetIds: ["board"] }
+    }));
+    const { stored, update } = setup({
+      get: vi.fn().mockResolvedValue(null),
+      submit
+    } as never);
+    const comfy = vi.spyOn(ComfyScriptProjectClient.prototype, "runImageEdit");
+    stored.state.keys = [
+      {
+        token: "cat",
+        name: "Cat",
+        kind: "character",
+        enabled: true,
+        effective_asset_id: "cat-image"
+      }
+    ];
+    Object.assign(stored.state.shots[0], {
+      tags: { characters: ["cat"] },
+      references: { characters: [{ token: "cat", asset_id: "cat-image" }] }
+    });
+    const result = await update("storyboard-generate", {
+      renderModel: "fal_minimax_h3_image",
+      providerSettings: { megapixels: "4", aspect_ratio: "1:1" }
+    });
+    await vi.waitFor(() =>
+      expect(stored.planDetails[String(result.plan_id)].status).toBe(
+        "COMPLETED"
+      )
+    );
+    expect(submit).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        endpoint: "minimax/h3-image/edit",
+        inputAssetIds: ["media-1", "cat-image"],
+        requestJson: expect.objectContaining({
+          prompt: expect.stringContaining("Image 2 shows Cat."),
+          image_size: { width: 2048, height: 2048 }
+        })
+      }),
+      expect.any(AbortSignal)
+    );
+    const plan = stored.planDetails[String(result.plan_id)];
+    expect(plan.local_request.settings.provider_settings).toMatchObject({
+      megapixels: "4",
+      aspect_ratio: "1:1"
+    });
+    expect(plan.local_targets[0]._local_spec.provider_settings).toMatchObject({
+      megapixels: "4"
+    });
+    expect(
+      stored.state.keys.find((key: Row) => key.role === "storyboard").images[0]
+        .render_settings.provider_settings.image_size
+    ).toEqual({ width: 2048, height: 2048 });
+    expect(comfy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { project: undefined, action: undefined, expected: "8" },
+    { project: { megapixels: "4" }, action: undefined, expected: "4" },
+    { project: { megapixels: "4" }, action: { megapixels: "2" }, expected: "2" }
+  ])(
+    "snapshots storyboard defaults before submission: $expected MP",
+    async ({ project, action, expected }) => {
+      const submit = vi.fn(async (request: Row) => ({
+        ...request,
+        status: "INGESTED",
+        requestId: "remote",
+        outputJson: { assetIds: ["board"] }
+      }));
+      const { stored, projects, update } = setup(
+        { get: vi.fn().mockResolvedValue(null), submit } as never,
+        { fal_minimax_h3_image: { megapixels: "8", aspect_ratio: "1:1" } }
+      );
+      projects.get = async () =>
+        ({
+          id: "p",
+          origin: "local",
+          type: "script_to_shots",
+          settings: {
+            visual_style: "Oil painting",
+            fal_generation_settings: { fal_minimax_h3_image: project }
+          }
+        }) as never;
+      const result = await update("storyboard-generate", {
+        renderModel: "fal_minimax_h3_image",
+        providerSettings: action
+      });
+      await vi.waitFor(() =>
+        expect(stored.planDetails[String(result.plan_id)].status).toBe(
+          "COMPLETED"
+        )
+      );
+      const settings =
+        stored.planDetails[String(result.plan_id)].local_request.settings
+          .provider_settings;
+      expect(settings).toEqual({ megapixels: expected, aspect_ratio: "1:1" });
+      const size = submit.mock.calls[0]![0].requestJson.image_size;
+      expect(size.width).toBe(size.height);
+      expect(
+        (size.width * size.height) / (Number(expected) * 1048576)
+      ).toBeCloseTo(1, 1);
+    }
+  );
+
   it.each(["cloud", "local"])(
     "retains a completed %s board while another Scene is being prepared",
     async (provider) => {

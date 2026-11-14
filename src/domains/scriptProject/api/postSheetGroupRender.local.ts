@@ -17,6 +17,7 @@ import { SHEET_IMAGE_EDIT_MODEL_BY_RENDER_MODEL } from "../cloudSheetRender.loca
 import {
   AnySheetRenderModel,
   DEFAULT_SHEET_IMAGE_FILE_TYPE,
+  isFalSheetModel,
   resolveLocalSheetRenderModel
 } from "../constants";
 import { isLocalScriptProject } from "../projectOrigin";
@@ -34,6 +35,7 @@ export type RenderSheetGroupRequest = {
   masterToken?: string | null;
   prompt: string;
   renderModel: AnySheetRenderModel;
+  providerSettings?: Record<string, string | number | null>;
   renderMode: RenderMode;
   outputSize: [number, number];
   referenceAssetIds?: string[];
@@ -53,9 +55,13 @@ export const postSheetGroupRender = async (
         outputSize: request.outputSize,
         settings: {
           prompt: request.prompt,
-          render_model: isCloudModel
-            ? request.renderModel
-            : resolveLocalSheetRenderModel(request.renderModel)
+          ...(request.providerSettings
+            ? { provider_settings: request.providerSettings }
+            : {}),
+          render_model:
+            isCloudModel || isFalSheetModel(request.renderModel)
+              ? request.renderModel
+              : resolveLocalSheetRenderModel(request.renderModel)
         },
         tokens: [request.token],
         ...(request.name === undefined && request.kind === undefined

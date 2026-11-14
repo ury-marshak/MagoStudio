@@ -25,6 +25,7 @@ it("saves, checks, and removes external text settings independently of vision", 
   const config = {
     baseUrl: "https://openrouter.ai/api/v1",
     model: "example/text",
+    reasoningEffort: "low",
     keychainAccount: "openrouter"
   };
   const get = vi.fn().mockResolvedValue(null);
@@ -51,6 +52,9 @@ it("saves, checks, and removes external text settings independently of vision", 
   await waitFor(() => expect(model).toBeEnabled());
   expect(checkButton).toBeDisabled();
   fireEvent.change(model, { target: { value: config.model } });
+  fireEvent.change(text.getByLabelText("Reasoning effort"), {
+    target: { value: config.reasoningEffort }
+  });
   fireEvent.click(text.getByRole("button", { name: "Save" }));
 
   await waitFor(() => expect(checkButton).toBeEnabled());
@@ -77,11 +81,15 @@ it("saves, checks, and removes external text settings independently of vision", 
   ).toHaveValue("");
 });
 
-it("configures fal using only a Keychain account and labels the local check", async () => {
+it("saves the fal account and Director defaults and labels the local check", async () => {
   const fal = falBridge();
-  fal.save
-    .mockResolvedValueOnce({ keychainAccount: "fal" })
-    .mockResolvedValueOnce(null);
+  const config = {
+    keychainAccount: "fal",
+    referenceImageModel: "fal_minimax_h3_image",
+    storyboardImageModel: "fal_nano_banana_2_1",
+    shotProvider: "local-comfy"
+  };
+  fal.save.mockResolvedValueOnce(config).mockResolvedValueOnce(null);
   const get = vi.fn().mockResolvedValue(null);
   Object.defineProperty(window, "mago", {
     configurable: true,
@@ -101,10 +109,19 @@ it("configures fal using only a Keychain account and labels the local check", as
   expect(form.queryByLabelText("Model ID")).not.toBeInTheDocument();
   expect(checkButton).toBeDisabled();
   fireEvent.change(account, { target: { value: " fal " } });
+  fireEvent.change(form.getByLabelText("Default reference image model"), {
+    target: { value: config.referenceImageModel }
+  });
+  fireEvent.change(form.getByLabelText("Default storyboard model"), {
+    target: { value: config.storyboardImageModel }
+  });
+  fireEvent.change(form.getByLabelText("Default video shot model"), {
+    target: { value: config.shotProvider }
+  });
   fireEvent.click(form.getByRole("button", { name: "Save" }));
 
   await waitFor(() => expect(checkButton).toBeEnabled());
-  expect(fal.save).toHaveBeenCalledExactlyOnceWith({ keychainAccount: "fal" });
+  expect(fal.save).toHaveBeenCalledExactlyOnceWith(config);
   expect(fal.check).not.toHaveBeenCalled();
   fireEvent.click(checkButton);
   expect(

@@ -1,3 +1,6 @@
+import type { FalGenerationDefaults } from "./falGenerationSettings";
+import type { FalSheetModel } from "./falSheetModel";
+import type { FAL_SHOT_PROVIDER } from "./falShotModel";
 import type {
   LocalModelGroupId,
   LocalModelGroupInstallState
@@ -17,9 +20,16 @@ export type ExternalModelCapability = "text" | "vision";
 
 export interface FalProviderConfig {
   keychainAccount: string;
+  generationSettings?: FalGenerationDefaults;
+  referenceImageModel?: FalSheetModel;
+  storyboardImageModel?: FalSheetModel;
+  shotProvider?: typeof FAL_SHOT_PROVIDER | "local-comfy";
 }
 
+export const externalReasoningEfforts = ["low", "medium", "high"] as const;
+
 export interface ExternalModelConfig {
+  reasoningEffort?: (typeof externalReasoningEfforts)[number];
   baseUrl: string;
   model: string;
   keychainAccount: string;
@@ -874,7 +884,9 @@ export interface MagoDesktopApi {
     }) => Promise<ComfyModelStatus>;
   };
   externalProviders: {
-    get: (capability: ExternalModelCapability) => Promise<ExternalModelConfig | null>;
+    get: (
+      capability: ExternalModelCapability
+    ) => Promise<ExternalModelConfig | null>;
     save: (
       capability: ExternalModelCapability,
       config: ExternalModelConfig | null
@@ -882,7 +894,9 @@ export interface MagoDesktopApi {
     check: (capability: ExternalModelCapability) => Promise<void>;
     fal: {
       get: () => Promise<FalProviderConfig | null>;
-      save: (config: FalProviderConfig | null) => Promise<FalProviderConfig | null>;
+      save: (
+        config: FalProviderConfig | null
+      ) => Promise<FalProviderConfig | null>;
       check: () => Promise<void>;
     };
   };

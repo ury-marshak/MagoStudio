@@ -151,6 +151,7 @@ export const sheetSpecsInFlight = (
 
 export interface SheetRunRequest {
   renderModel: string;
+  providerSettings?: Record<string, unknown>;
   outputSize?: unknown[];
   tokens?: string[];
   /** A prompt typed for this one render: renders a new version regardless. */
@@ -256,6 +257,8 @@ export const planSheetRun = ({
       masterAssetId: master?.assetId,
       visualStyle
     });
+    if (request.providerSettings)
+      spec.provider_settings = request.providerSettings;
     const value = fingerprint(spec);
     const isMasterRendering =
       !!master && planned.some((item) => item.token === master.token);

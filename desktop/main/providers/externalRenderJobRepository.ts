@@ -1,7 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 
 import type { DatabaseManager } from "../database/databaseManager";
-import { externalRenderJobs } from "../database/schema";
+import { assets, externalRenderJobs, projectAssets } from "../database/schema";
 
 export type ExternalRenderJob = typeof externalRenderJobs.$inferSelect;
 
@@ -90,6 +90,40 @@ export class ExternalRenderJobRepository {
       | { status: "CANCELLED" }
   ): Promise<void> {
     await this.update(id, activeRemoteStatuses, result);
+  }
+
+  async finishIngestion(
+    job: ExternalRenderJob,
+    output: NonNullable<ExternalRenderJob["outputJson"]>,
+    files: (typeof assets.$inferInsert)[]
+  ): Promise<void> {
+    await this.manager.transaction(async (database) => {
+      const now = new Date();
+      const [updated] = await database
+        .update(externalRenderJobs)
+        .set({
+          status: "INGESTED",
+          outputJson: { ...output, assetIds: files.map(({ id }) => id) },
+          updatedAt: now
+        })
+        .where(
+          and(
+            eq(externalRenderJobs.id, job.id),
+            eq(externalRenderJobs.status, "OUTPUT_READY")
+          )
+        )
+        .returning({ id: externalRenderJobs.id });
+      if (!updated) return;
+
+      await database.insert(assets).values(files);
+      await database.insert(projectAssets).values(
+        files.map(({ id }) => ({
+          assetId: id,
+          projectId: job.projectId,
+          createdAt: now
+        }))
+      );
+    });
   }
 
   private async update(

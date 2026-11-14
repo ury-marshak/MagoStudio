@@ -217,6 +217,17 @@
       "falHint": "Använd ett separat konto i Nyckelhanterare för fal-nyckeln, till exempel fal.",
       "checkKeychain": "Kontrollera Nyckelhanterare",
       "checkingKeychain": "Kontrollerar Nyckelhanterare…",
+      "referenceImageModel": "Standardmodell för referensbilder",
+      "storyboardImageModel": "Standardmodell för bildmanus",
+      "shotProvider": "Standardmodell för videoklipp",
+      "appDefault": "Automatiskt",
+      "reasoningEffort": "Resonemangsnivå",
+      "reasoningDefault": "Leverantörens standard",
+      "reasoningLevels": {
+        "low": "Låg",
+        "medium": "Medel",
+        "high": "Hög"
+      },
       "checkKeychainPassed": "Posten i Nyckelhanterare kan läsas. fal.ai kontaktades inte.",
       "text": "Textleverantör",
       "vision": "Bildanalysleverantör",
@@ -3231,6 +3242,36 @@
     "sheet_render_model_gpt_image_2_t2i": {
       "label": "GPT Image 2"
     },
+    "sheet_render_model_fal_minimax_h3_image": {
+      "label": "MiniMax H3 Image (fal)"
+    },
+    "sheet_render_model_fal_nano_banana_2_1": {
+      "label": "Nano Banana 2.1 (fal)"
+    },
+    "fal_usage": {
+      "label": "Debiteras av fal"
+    },
+    "shot_provider": {
+      "label": "Leverantör för bildrutor"
+    },
+    "shot_blocked_fal_sequential": {
+      "label": "Pausa sekventiella referenser för att använda H3 Max (fal)"
+    },
+    "shot_fal_model": {
+      "label": "H3 Max (fal)"
+    },
+    "shot_comfy_model": {
+      "label": "H3 (ComfyUI)"
+    },
+    "sheet_render_model_fal_nano_banana_2": {
+      "label": "Nano Banana 2 (fal)"
+    },
+    "save_sheet_render_default": {
+      "label": "Spara som projektstandard"
+    },
+    "sheet_fal_estimate": {
+      "label": "Ca {{amount}} på fal"
+    },
     "sheet_render_model_nanobanana_2_t2i": {
       "label": "Nano Banana 2"
     },
@@ -3631,6 +3672,20 @@
     },
     "section_group_count": {
       "label": "{{count}}"
+    },
+    "fal_settings": {
+      "resolution": "Upplösning för generering",
+      "aspect_ratio": "Bildförhållande för generering",
+      "megapixels": "Megapixlar (ungefär)",
+      "thinking_level": "Resonemangsnivå",
+      "prompt_expansion_mode": "Leverantörens promptutökning",
+      "seed": "Slumpfrö",
+      "random": "Slumpmässigt",
+      "layout_aspect": "Använd referensens layout",
+      "video_fixed": "24 b/s · genererat ljud · scenlängd (5–15 s) · 1080P förfinar 768P",
+      "image_fixed": "En PNG",
+      "h3_fixed": "En PNG · promptutökning avstängd vid generering",
+      "save": "Spara genereringsinställningar som projektstandard"
     }
   },
   "bulk_rendering": {
