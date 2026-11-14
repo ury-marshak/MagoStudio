@@ -220,6 +220,7 @@ export const ShotRow: React.FC<Props> = ({
     isRendering ||
     isDurationOutOfBounds ||
     isShotBlockedForNoReferenceImage ||
+    Boolean(sequentialBlockedLabelKey) ||
     !canShotGenerateNewVersion;
   const hasShotBeenRendered = !!cutShot && cutShot.versions.length > 0;
   const isGenerateDisabledForNoChangesSinceLastVersion =

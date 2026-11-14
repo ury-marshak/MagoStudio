@@ -70,6 +70,7 @@ const setup = ({
   rerenderCost = { kind: "credits", amount: 1 },
   shotUnderTest = shot,
   isShotBlockedForNoReferenceImage = false,
+  sequentialBlockedLabelKey = null,
   scenesView = "video",
   storyboard = storyboardWithoutImage,
   sceneStoryboard,
@@ -83,6 +84,7 @@ const setup = ({
   rerenderCost?: ScriptProjectRenderCost;
   shotUnderTest?: typeof shot;
   isShotBlockedForNoReferenceImage?: boolean;
+  sequentialBlockedLabelKey?: string | null;
   scenesView?: ScenesView;
   storyboard?: ShotStoryboard;
   sceneStoryboard?: SceneStoryboardView;
@@ -110,7 +112,7 @@ const setup = ({
       projectId="project"
       onSaveHeading={onSaveHeading}
       shot={{ ...shotUnderTest, heading }}
-      sequentialBlockedLabelKey={null}
+      sequentialBlockedLabelKey={sequentialBlockedLabelKey}
       isSequentialReferenceIgnored={false}
       isShotBlockedForNoReferenceImage={isShotBlockedForNoReferenceImage}
       sheetGroups={[]}
@@ -499,6 +501,22 @@ describe("scene reference image gate", () => {
     });
     expect(screen.getByText("Blocked — HERO has no pinned image")).toBeTruthy();
     expect(screen.queryByTestId("shot-no-reference-image-1")).toBeNull();
+  });
+
+  it.each([
+    "script_project.shot_blocked_sequential_unsupported_opening_frame.label",
+    "script_project.shot_blocked_sequential_no_predecessor_render.label",
+    "script_project.shot_blocked_fal_sequential.label",
+    "script_project.shot_blocked_raw_reference_overflow.label"
+  ])("disables Generate for the typed block %s", (label) => {
+    const screen = setup({
+      shotUnderTest: shotWithoutReferences,
+      sequentialBlockedLabelKey: label
+    });
+    expect(screen.getByTestId("shot-rerender-1")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("shot-rerender-1"));
+    expect(screen.onRetryRender).not.toHaveBeenCalled();
+    expect(screen.getByTestId("shot-sequential-blocked-1")).toBeTruthy();
   });
 });
 describe("scene length on Generate", () => {
