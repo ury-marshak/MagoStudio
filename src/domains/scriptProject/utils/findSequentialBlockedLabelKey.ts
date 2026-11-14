@@ -23,6 +23,8 @@ export const findSequentialBlockedLabelKey = (
   switch (blockedEntry?.reason_code) {
     case "fal_sequential_unsupported":
       return "script_project.shot_blocked_fal_sequential.label";
+    case "raw_reference_overflow":
+      return "script_project.shot_blocked_raw_reference_overflow.label";
     case "unsupported_engine":
       return UNSUPPORTED_ENGINE_LABEL_KEY;
     case "predecessor_not_rendered":

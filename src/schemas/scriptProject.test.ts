@@ -386,4 +386,18 @@ describe("ShotGenerateResultSchema", () => {
     expect(parsed.skipped[0]?.key).toBe("8");
     expect(parsed.blocked[0]?.key).toBe("9");
   });
+
+  it("preserves the raw reference-overflow block reason for the renderer", () => {
+    const parsed = ShotGenerateResultSchema.parse({
+      blocked: [
+        {
+          sequence_id: 2,
+          timeline_id: "shot-2",
+          reason_code: "raw_reference_overflow",
+          reason: "Use normal prompt composition or reduce reference images"
+        }
+      ]
+    });
+    expect(parsed.blocked[0]?.reason_code).toBe("raw_reference_overflow");
+  });
 });

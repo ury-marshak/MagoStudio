@@ -2,12 +2,15 @@ import {
   resolveFalGenerationSettings,
   type FalGenerationSettings
 } from "../../../shared/falGenerationSettings";
-import { FAL_SHOT_ENGINE } from "../../../shared/falShotModel";
+import {
+  FAL_SHOT_ENGINE,
+  FAL_SHOT_IMAGE_SLOTS
+} from "../../../shared/falShotModel";
 import type { ExternalRenderJob } from "../../providers/externalRenderJobRepository";
 import type { ExternalRenderJobService } from "../../providers/externalRenderJobService";
 import { waitForExternalRender } from "../../providers/waitForExternalRender";
 
-export const FAL_SHOT_IMAGE_SLOTS = 9;
+export { FAL_SHOT_IMAGE_SLOTS } from "../../../shared/falShotModel";
 
 export const renderFalShot = async (
   jobs: ExternalRenderJobService,

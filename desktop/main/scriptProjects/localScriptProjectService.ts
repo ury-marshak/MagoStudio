@@ -16,8 +16,13 @@ import {
   type FalGenerationDefaults
 } from "../../shared/falGenerationSettings";
 import { isFalSheetModel } from "../../shared/falSheetModel";
-import { FAL_SHOT_ENGINE, FAL_SHOT_PROVIDER } from "../../shared/falShotModel";
+import {
+  FAL_SHOT_ENGINE,
+  FAL_SHOT_PROVIDER,
+  hasRawNumberedReferenceOverflow
+} from "../../shared/falShotModel";
 import type { RunCloudTextModel } from "../../shared/textModelRequest";
+import { probeRenderedVideoMetadata } from "../cloud/probeRenderedVideoMetadata";
 import { ProjectRepository } from "../database/projectRepository";
 import { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import { probeComfyRenderModel } from "../imageRenders/comfyModelValidation";
@@ -2129,6 +2134,7 @@ export class LocalScriptProjectService {
       ...planned.shot,
       _local_sequential: planned.sequential,
       _local_previous_timeline_id: planned.previousTimelineId,
+      _local_previous_asset_id: planned.previousAssetId,
       _local_previous_in_run: planned.previousInRun,
       _local_duration_s: planned.durationSeconds,
       _local_prompt_rewrite: planned.promptRewrite,
@@ -2798,6 +2804,19 @@ export class LocalScriptProjectService {
           !!record(target._local_storyboard),
           isFalRender ? FAL_SHOT_IMAGE_SLOTS : undefined
         );
+        if (
+          isFalRender &&
+          !savedJob &&
+          target._local_prompt_rewrite === "raw" &&
+          hasRawNumberedReferenceOverflow(
+            textValue(target.video_prompt, ""),
+            referenceItems.length,
+            imageSlotBudget
+          )
+        )
+          throw new Error(
+            "Raw prompts with numbered references cannot be gridded safely; use normal prompt composition or reduce reference images"
+          );
         const referenceSlots = planReferenceSlots(
           Object.fromEntries(
             GROUP_ORDER.map((group) => [
@@ -2907,10 +2926,9 @@ export class LocalScriptProjectService {
         const board = record(target._local_storyboard);
         if (!isFalRender && board && typeof board.asset_id === "string")
           referencePaths.push(await resolveReferencePath(board.asset_id));
-        const numberedImageIds = savedJob?.inputAssetIds ?? [
-          ...referenceIds,
-          ...(board ? [String(board.asset_id)] : [])
-        ];
+        const numberedImageIds = savedJob
+          ? [...savedJob.inputAssetIds]
+          : [...referenceIds, ...(board ? [String(board.asset_id)] : [])];
         // The previous shot's reference, when this shot continues from one:
         // its own slot, appended last so it takes the highest tag.
         let continuityImage: {
@@ -2971,22 +2989,74 @@ export class LocalScriptProjectService {
           );
         }
 
-        if (isFalRender && sequential)
+        if (
+          isFalRender &&
+          sequential &&
+          (sequential.mode === "last_chunk" ||
+            (sequential.mode === "last_frame" &&
+              sequential.opening_frame === "pin"))
+        )
           throw new Error(
-            "Suspend sequential references to render this shot with H3 Max (fal)"
+            "H3 Max (fal) supports last-frame cut/off and key-frame references; video inputs and pinned opening frames are not yet supported"
           );
-        if (sequential) {
+        const frameStep = sequential
+          ? this.findStep(
+              plan,
+              sequential.mode === "key_frames"
+                ? "poll_pick_keyframes"
+                : "use_provided_reference_frame",
+              timelineId
+            )
+          : undefined;
+        const savedFrame = completedStep(frameStep)
+          ? record(frameStep?.result)
+          : null;
+        if (isFalRender && sequential && (savedJob || savedFrame)) {
+          // Accepted jobs and explicit resumes reuse the original preparation.
+          // In particular, never inspect a new predecessor pin or re-extract
+          // frames that would shift the submitted prompt's image numbering.
+          continuesFrom = record(savedFrame?.continues_from);
+          const referenceId = textValue(continuesFrom?.reference_asset_id, "");
+          if (
+            !referenceId ||
+            !textValue(continuesFrom?.asset_id, "") ||
+            continuesFrom?.timeline_id !== target._local_previous_timeline_id ||
+            continuesFrom?.mode !== sequential.mode ||
+            (savedJob && !savedJob.inputAssetIds.includes(referenceId))
+          )
+            throw new Error(
+              "The saved sequential frame provenance is unavailable"
+            );
+          continuityImage = {
+            id: referenceId,
+            description: textValue(
+              sequential.prompt_appendix,
+              SEQUENTIAL_SHOT_REFERENCE_DESCRIPTION
+            ),
+            continuation: sequentialContinuation(sequential)
+          };
+          if (!savedJob) numberedImageIds.push(referenceId);
+        } else if (sequential) {
           const previousId = String(target._local_previous_timeline_id);
           const latest = await this.requireSnapshot(input.projectId);
           const previousCut = records(latest.cut?.shots).find(
             (shot) => shot.timeline_id === previousId
           );
+          // Out-of-run pins are frozen at planning time. Same-run continuation
+          // uses that plan's actual output, even if the user changes its pin.
+          const previousRender = record(
+            this.findStep(plan, "poll_video_render", previousId)?.result
+          );
           const previousAssetId =
-            typeof previousCut?.asset_id === "string"
-              ? previousCut.asset_id
-              : "";
+            target._local_previous_in_run === true
+              ? textValue(previousRender?.render_asset_id, "")
+              : textValue(target._local_previous_asset_id, "") ||
+                textValue(previousCut?.asset_id, "");
           const previousPath = previousAssetId
-            ? await this.snapshots.resolveMediaPath(previousAssetId)
+            ? await this.snapshots.resolveMediaPath(
+                previousAssetId,
+                input.projectId
+              )
             : null;
           if (!previousPath)
             throw new Error("The preceding shot render is unavailable locally");
@@ -3086,15 +3156,32 @@ export class LocalScriptProjectService {
                 "RUNNING"
               );
             }
+            // Sample the predecessor's decoded frame count/rate, not the new
+            // shot's requested length (which can be entirely different).
+            const source = isGrid
+              ? await probeRenderedVideoMetadata(
+                  previousPath,
+                  control.abortController.signal
+                )
+              : null;
+            this.throwIfCancelled(control);
+            if (isGrid && (!source || !source.fps))
+              throw new Error("Could not read the preceding shot frame count");
             const frame = isGrid
               ? await extractKeyframeGrid(
                   previousPath,
-                  durationSeconds,
+                  source!.frameCount / source!.fps!,
                   typeof sequential.num_select === "number"
                     ? sequential.num_select
-                    : 1
+                    : 1,
+                  control.abortController.signal,
+                  source!.fps!
                 )
-              : await extractLastFrame(previousPath);
+              : await extractLastFrame(
+                  previousPath,
+                  control.abortController.signal
+                );
+            this.throwIfCancelled(control);
             const continuity = await this.snapshots.storeGeneratedMedia(
               input.projectId,
               frame,
@@ -3109,6 +3196,12 @@ export class LocalScriptProjectService {
               continuation
             };
             if (continuation === "pin") openingFramePath = continuity.path;
+            continuesFrom = {
+              timeline_id: previousId,
+              asset_id: previousAssetId,
+              mode: sequential.mode,
+              reference_asset_id: continuity.id
+            };
             plan = await this.setStep(
               input.projectId,
               planId,
@@ -3117,15 +3210,13 @@ export class LocalScriptProjectService {
               {
                 shot_reference_image_id: continuity.id,
                 output_url: continuity.url,
-                mode: sequential.mode
+                mode: sequential.mode,
+                selection: structuredClone(sequential),
+                source_frame_count: source?.frameCount ?? null,
+                source_fps: source?.fps ?? null,
+                continues_from: continuesFrom
               }
             );
-            continuesFrom = {
-              timeline_id: previousId,
-              asset_id: previousAssetId,
-              mode: sequential.mode,
-              reference_asset_id: continuity.id
-            };
           }
         }
 
@@ -3196,7 +3287,14 @@ export class LocalScriptProjectService {
             continuityImage,
             continuityVideo,
             durationSeconds,
-            outputSize: isFalRender ? [16, 9] : input.outputSize,
+            outputSize: isFalRender
+              ? textValue(
+                  record(input.videoSettings?.provider_settings)?.aspect_ratio,
+                  "16:9"
+                )
+                  .split(":")
+                  .map(Number)
+              : input.outputSize,
             visualStyle: textValue(
               record(record(record(target._local_render_spec)?.spec)?.settings)
                 ?.visual_style,
@@ -3442,7 +3540,17 @@ export class LocalScriptProjectService {
             ))
         ) {
           const renderSpecEnvelope = record(target._local_render_spec);
-          const renderSpec = record(renderSpecEnvelope?.spec);
+          const plannedSpec = record(renderSpecEnvelope?.spec);
+          const renderSpec =
+            plannedSpec && continuesFrom
+              ? {
+                  ...plannedSpec,
+                  sequential: {
+                    ...record(plannedSpec.sequential),
+                    prev_asset_id: continuesFrom.asset_id
+                  }
+                }
+              : plannedSpec;
           const version = {
             layer_id: layerId,
             asset_id: media.id,
@@ -3491,7 +3599,10 @@ export class LocalScriptProjectService {
                 : (input.outputSize ?? null),
             // What this version rendered from; "already rendered with these
             // inputs" reads it back once the version has finished.
-            fingerprint: renderSpecEnvelope?.fingerprint ?? null
+            fingerprint:
+              renderSpec && continuesFrom
+                ? fingerprint(renderSpec)
+                : (renderSpecEnvelope?.fingerprint ?? null)
           };
           cutShot.versions = [...records(cutShot.versions), version];
           // Every render wins the pin, except on

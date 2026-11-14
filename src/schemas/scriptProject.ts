@@ -540,12 +540,13 @@ const ShotAnswerReferenceShape = {
   timeline_id: z.string().nullable().optional()
 };
 
-/** Present only on a sequential block, never on a missing-references one. Classify on this,
- * never on the free-text `reason` sentence — that is for logs/support and can reword. */
+/** A typed block reason, never present on a missing-references block. Classify on
+ * this, not the free-text sentence, which is for logs/support and can reword. */
 const SequentialBlockedReasonCodeSchema = z
   .enum([
     "unsupported_engine",
     "fal_sequential_unsupported",
+    "raw_reference_overflow",
     "predecessor_not_rendered",
     "unsupported_sequential_mode",
     "no_prompt",

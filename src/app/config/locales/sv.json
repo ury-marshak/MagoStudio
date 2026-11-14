@@ -3255,7 +3255,10 @@
       "label": "Leverantör för bildrutor"
     },
     "shot_blocked_fal_sequential": {
-      "label": "Pausa sekventiella referenser för att använda H3 Max (fal)"
+      "label": "Video från föregående tagning kan inte användas med H3 Max (fal); använd sista bildrutan eller nyckelbildrutor"
+    },
+    "shot_blocked_raw_reference_overflow": {
+      "label": "För många bilder för numrerade referenser i råa promptar med H3 Max (fal); använd vanlig promptkomposition eller minska antalet referensbilder"
     },
     "shot_fal_model": {
       "label": "H3 Max (fal)"

@@ -3253,7 +3253,10 @@
       "label": "Shot rendering provider"
     },
     "shot_blocked_fal_sequential": {
-      "label": "Suspend sequential references to use H3 Max (fal)"
+      "label": "Previous-shot video inputs are unavailable with H3 Max (fal); use last frame or key frames"
+    },
+    "shot_blocked_raw_reference_overflow": {
+      "label": "Too many images for raw numbered references with H3 Max (fal); use normal prompt composition or reduce reference images"
     },
     "shot_fal_model": {
       "label": "H3 Max (fal)"

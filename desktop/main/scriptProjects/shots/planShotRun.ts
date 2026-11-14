@@ -1,4 +1,8 @@
-import { FAL_SHOT_PROVIDER } from "../../../shared/falShotModel";
+import {
+  FAL_SHOT_IMAGE_SLOTS,
+  FAL_SHOT_PROVIDER,
+  hasRawNumberedReferenceOverflow
+} from "../../../shared/falShotModel";
 import { textOf } from "../../vlm/dialogue";
 import { changedFields, fingerprint } from "../renderSpec";
 
@@ -6,6 +10,7 @@ import {
   defaultSequentialAppendix,
   isDefaultSequentialAppendix,
   OPENING_FRAME_CUT,
+  OPENING_FRAME_PIN,
   OPENING_FRAMES,
   sequentialFingerprint
 } from "./sequentialContinuation";
@@ -242,6 +247,8 @@ export interface PlannedShot {
   shot: JsonRecord;
   sequential: JsonRecord | null;
   previousTimelineId: string | null;
+  /** The ready predecessor pin captured when it is not rendering in this run. */
+  previousAssetId: string | null;
   /** The predecessor renders earlier in this same run, so this shot waits for it. */
   previousInRun: boolean;
   durationSeconds: number;
@@ -353,7 +360,6 @@ export const planShotRun = ({
   const durationBlocked: JsonRecord[] = [];
   const changed: Record<string, string[]> = {};
   const changedByTimelineId: Record<string, string[]> = {};
-  const blockedIds = new Set<string>();
   const runIds = new Set<string>();
   const planned: PlannedShot[] = [];
 
@@ -382,7 +388,6 @@ export const planShotRun = ({
     const missing = records(shot.missing_references);
     if (missing.length) {
       blocked.push({ ...reference, missing });
-      blockedIds.add(timelineId);
       continue;
     }
     if (!textOf(shot.video_prompt ?? "").trim()) {
@@ -392,7 +397,6 @@ export const planShotRun = ({
         reason_code: "no_prompt",
         reason: "this shot has no video prompt"
       });
-      blockedIds.add(timelineId);
       continue;
     }
     let [sequential, seqError] = sequentialShotConfig(
@@ -405,27 +409,56 @@ export const planShotRun = ({
       sequentialIgnored.push({ ...reference, reason: "first shot" });
       sequential = null;
     }
-    if (sequential && videoSettings.render_provider === FAL_SHOT_PROVIDER) {
+    if (
+      sequential?.mode === "last_chunk" &&
+      videoSettings.render_provider === FAL_SHOT_PROVIDER
+    ) {
       blocked.push({
         ...reference,
         missing: [],
         reason_code: "fal_sequential_unsupported",
         reason:
-          "Suspend sequential references to render this shot with H3 Max (fal)"
+          "Previous-shot video inputs (last_chunk) are unavailable with H3 Max (fal); " +
+          "use last_frame or key_frames instead"
       });
-      blockedIds.add(timelineId);
+      continue;
+    }
+    // fal's start image also sets the canvas; this slice supports references only.
+    if (
+      videoSettings.render_provider === FAL_SHOT_PROVIDER &&
+      sequential?.mode === "last_frame" &&
+      sequential.opening_frame === OPENING_FRAME_PIN
+    ) {
+      blocked.push({
+        ...reference,
+        missing: [],
+        reason_code: "unsupported_opening_frame",
+        reason:
+          "Pinned opening frames are unavailable with H3 Max (fal): the start image also " +
+          "determines the canvas; use last_frame cut/off or key_frames instead"
+      });
       continue;
     }
     let sequentialSpec: JsonRecord | null = null;
     let previousTimelineId: string | null = null;
+    let previousAssetId: string | null = null;
     let previousInRun = false;
     if (sequential) {
       const previous = predecessor.get(timelineId)!;
       previousTimelineId = String(previous.timeline_id);
-      const previousPin = shotPin(cutByTimeline.get(previousTimelineId));
-      const previousWanted =
-        wanted(previous) && !blockedIds.has(previousTimelineId);
-      if (!previousPin && !previousWanted) {
+      previousInRun = runIds.has(previousTimelineId);
+      if (!previousInRun) {
+        const previousCut = cutByTimeline.get(previousTimelineId);
+        const previousPin = shotPin(previousCut);
+        if (
+          records(previousCut?.versions).some(
+            (version) =>
+              version.asset_id === previousPin && version.ready === true
+          )
+        )
+          previousAssetId = previousPin;
+      }
+      if (!previousAssetId && !previousInRun) {
         blocked.push({
           ...reference,
           missing: [],
@@ -434,14 +467,12 @@ export const planShotRun = ({
             "sequential: the previous shot has no finished render to continue from — " +
             "render it first, or pin one of its versions"
         });
-        blockedIds.add(timelineId);
         continue;
       }
-      previousInRun = runIds.has(previousTimelineId);
       sequentialSpec = {
         ...sequentialFingerprint(sequential),
         prev_key: previous.key ?? previous.sequence_id,
-        ...(previousWanted ? {} : { prev_asset_id: previousPin })
+        ...(previousInRun ? {} : { prev_asset_id: previousAssetId })
       };
     }
 
@@ -457,7 +488,6 @@ export const planShotRun = ({
         reason: boundError
       };
       blocked.push(entry);
-      blockedIds.add(timelineId);
       durationBlocked.push(entry);
       continue;
     }
@@ -481,9 +511,41 @@ export const planShotRun = ({
       ...shot,
       _local_storyboard: shotRewrite === "raw" ? null : shot._local_storyboard
     };
+    const referenceCapacity =
+      FAL_SHOT_IMAGE_SLOTS -
+      (sequential?.mode === "last_frame" || sequential?.mode === "key_frames"
+        ? 1
+        : 0) -
+      Number(isRecord(renderShot._local_storyboard));
+    if (
+      videoSettings.render_provider === FAL_SHOT_PROVIDER &&
+      shotRewrite === "raw" &&
+      hasRawNumberedReferenceOverflow(
+        textOf(shot.video_prompt),
+        Object.values(isRecord(shot.references) ? shot.references : {}).flatMap(
+          (value) => records(value)
+        ).length,
+        referenceCapacity
+      )
+    ) {
+      blocked.push({
+        ...reference,
+        missing: [],
+        reason_code: "raw_reference_overflow",
+        reason:
+          "Raw numbered image references cannot be preserved when reference images exceed " +
+          `the ${referenceCapacity} available slots with H3 Max (fal); ` +
+          "use normal prompt composition or reduce reference images"
+      });
+      continue;
+    }
     const spec = shotSpec(renderShot, shotSettings, outputSize, sequentialSpec);
     const value = fingerprint(spec);
-    if (renderedFingerprints(cutByTimeline.get(timelineId)).has(value)) {
+    // A matching old spec cannot represent the new predecessor render.
+    if (
+      !previousInRun &&
+      renderedFingerprints(cutByTimeline.get(timelineId)).has(value)
+    ) {
       skipped.push({
         ...reference,
         reason: "already rendered with these inputs"
@@ -507,7 +569,6 @@ export const planShotRun = ({
         reason_code: "no_reference_image",
         reason: "this shot has no reference image"
       });
-      blockedIds.add(timelineId);
       continue;
     }
     const fields = changedFields(shot.last_spec, spec);
@@ -520,6 +581,7 @@ export const planShotRun = ({
       shot: renderShot,
       sequential,
       previousTimelineId,
+      previousAssetId,
       previousInRun,
       durationSeconds,
       promptRewrite: shotRewrite,

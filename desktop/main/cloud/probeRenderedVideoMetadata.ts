@@ -45,12 +45,15 @@ const createFramecrcPacketLineCounter = () => {
 };
 
 export const probeRenderedVideoMetadata = (
-  filePath: string
+  filePath: string,
+  signal?: AbortSignal
 ): Promise<RenderedVideoMetadata | null> => {
+  if (signal?.aborted) return Promise.resolve(null);
   const executablePath = ffmpegExecutablePath();
   if (!executablePath) return Promise.resolve(null);
   return new Promise((resolve) => {
     const child = spawn(executablePath, buildPacketListingArgs(filePath), {
+      ...(signal ? { signal, killSignal: "SIGKILL" as const } : {}),
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });

@@ -88,6 +88,47 @@ describe("findSequentialBlockedLabelKey", () => {
     );
   });
 
+  it("names raw numbered reference overflow from its reason code", () => {
+    const dryRun = buildDryRun([
+      {
+        sequence_id: 1,
+        timeline_id: "t1",
+        missing: [],
+        reason_code: "raw_reference_overflow",
+        reason: "Any backend wording"
+      }
+    ]);
+    expect(findSequentialBlockedLabelKey(dryRun, shot)).toBe(
+      "script_project.shot_blocked_raw_reference_overflow.label"
+    );
+  });
+
+  it("does not show another shot's raw reference overflow", () => {
+    const dryRun = buildDryRun([
+      {
+        sequence_id: 2,
+        timeline_id: "t2",
+        missing: [],
+        reason_code: "raw_reference_overflow"
+      }
+    ]);
+    expect(findSequentialBlockedLabelKey(dryRun, shot)).toBeNull();
+  });
+
+  it("keeps the fal previous-video-input label", () => {
+    const dryRun = buildDryRun([
+      {
+        sequence_id: 1,
+        timeline_id: "t1",
+        missing: [],
+        reason_code: "fal_sequential_unsupported"
+      }
+    ]);
+    expect(findSequentialBlockedLabelKey(dryRun, shot)).toBe(
+      "script_project.shot_blocked_fal_sequential.label"
+    );
+  });
+
   it("returns nothing for a reason it does not recognise, rather than guessing from the sentence", () => {
     const dryRun = buildDryRun([
       {

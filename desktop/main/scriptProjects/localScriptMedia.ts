@@ -6,6 +6,8 @@ import path from "node:path";
 
 import ffmpegPath from "ffmpeg-static";
 
+import { probeRenderedVideoMetadata } from "../cloud/probeRenderedVideoMetadata";
+
 const FFMPEG_TIMEOUT_MS = 120_000;
 const MAX_IMAGE_BYTES = 128 * 1024 * 1024;
 const MAX_ERROR_LENGTH = 4000;
@@ -15,9 +17,15 @@ const executablePath = (): string => {
   return ffmpegPath.replace("app.asar", "app.asar.unpacked");
 };
 
-const runImagePipe = async (args: string[]): Promise<Buffer> =>
-  new Promise((resolve, reject) => {
+const runImagePipe = async (
+  args: string[],
+  signal?: AbortSignal
+): Promise<Buffer> => {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
     const child = spawn(executablePath(), args, {
+      signal,
+      killSignal: "SIGKILL",
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -37,6 +45,7 @@ const runImagePipe = async (args: string[]): Promise<Buffer> =>
       finish(new Error("FFmpeg timed out extracting a continuity frame"));
     }, FFMPEG_TIMEOUT_MS);
     child.stdout.on("data", (chunk: Buffer) => {
+      if (settled) return;
       size += chunk.length;
       if (size > MAX_IMAGE_BYTES) {
         child.kill();
@@ -61,6 +70,7 @@ const runImagePipe = async (args: string[]): Promise<Buffer> =>
       finish();
     });
   });
+};
 
 const outputArgs = [
   "-frames:v",
@@ -111,27 +121,63 @@ export const extractMetricsFrameGrid = (
   ]);
 };
 
-export const extractLastFrame = (filename: string): Promise<Buffer> =>
-  runImagePipe([
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-sseof",
-    "-0.15",
-    "-i",
-    filename,
-    "-map",
-    "0:v:0",
-    ...outputArgs
-  ]);
+/** Try the bounded tail first; sparse video may end well before container EOF. */
+export const extractLastFrame = async (
+  filename: string,
+  signal?: AbortSignal
+): Promise<Buffer> => {
+  try {
+    return await runImagePipe(
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-sseof",
+        "-1",
+        "-i",
+        filename,
+        "-map",
+        "0:v:0",
+        "-vf",
+        "reverse",
+        ...outputArgs
+      ],
+      signal
+    );
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    const metadata = await probeRenderedVideoMetadata(filename, signal);
+    signal?.throwIfAborted();
+    if (!metadata) throw error;
+    // Decode from the start, retaining only the selected frame rather than
+    // reversing the full video or buffering every decoded PNG.
+    return runImagePipe(
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        filename,
+        "-map",
+        "0:v:0",
+        "-vf",
+        `select=eq(n\\,${metadata.frameCount - 1})`,
+        ...outputArgs
+      ],
+      signal
+    );
+  }
+};
 
 export const extractKeyframeGrid = (
   filename: string,
   durationSeconds: number,
-  count: number
+  count: number,
+  signal?: AbortSignal,
+  fps = 24
 ): Promise<Buffer> => {
   const selected = Math.max(1, Math.min(4, Math.floor(count)));
-  const frameCount = Math.max(5, Math.round(durationSeconds * 24));
+  const frameCount = Math.max(1, Math.round(durationSeconds * fps));
   const indices = Array.from({ length: selected }, (_, index) =>
     Math.min(
       frameCount - 1,
@@ -144,18 +190,21 @@ export const extractKeyframeGrid = (
     "scale=512:-2:force_original_aspect_ratio=decrease",
     `tile=${selected}x1:nb_frames=${selected}:padding=4:margin=0`
   ].join(",");
-  return runImagePipe([
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-i",
-    filename,
-    "-map",
-    "0:v:0",
-    "-vf",
-    filter,
-    ...outputArgs
-  ]);
+  return runImagePipe(
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      filename,
+      "-map",
+      "0:v:0",
+      "-vf",
+      filter,
+      ...outputArgs
+    ],
+    signal
+  );
 };
 
 export const createReferenceGrid = (filenames: string[]): Promise<Buffer> => {
