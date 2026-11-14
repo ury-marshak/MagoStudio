@@ -17,6 +17,12 @@ import type { ExternalRenderJob } from "../../providers/externalRenderJobReposit
 import type { ExternalRenderJobService } from "../../providers/externalRenderJobService";
 import { waitForExternalRender } from "../../providers/waitForExternalRender";
 
+import {
+  assertPreparedShotJob,
+  assertPreparedShotOwner,
+  parsePreparedFalShot
+} from "./preparedFalShot";
+
 export { FAL_SHOT_IMAGE_SLOTS } from "../../../shared/falShotModel";
 
 export const renderFalShot = async (
@@ -111,4 +117,45 @@ export const renderFalShot = async (
     );
   }
   return waitForExternalRender(jobs, job, input.signal, input.onSubmitted);
+};
+
+/** Submission-only entry point: all composition/media work must already be persisted. */
+export const renderPreparedFalShot = async (
+  jobs: ExternalRenderJobService,
+  input: {
+    preparation: unknown;
+    projectId: string;
+    timelineId: string;
+    jobId: string;
+    savedJob: ExternalRenderJob | null;
+    recovering?: boolean;
+    signal: AbortSignal;
+    onSubmitted: () => Promise<void>;
+  }
+) => {
+  input.signal.throwIfAborted();
+  const prepared = parsePreparedFalShot(input.preparation);
+  assertPreparedShotOwner(
+    prepared,
+    input.projectId,
+    input.timelineId,
+    input.jobId
+  );
+  if (input.savedJob) assertPreparedShotJob(prepared, input.savedJob);
+  return renderFalShot(jobs, {
+    jobId: prepared.job_id,
+    projectId: prepared.project_id,
+    savedJob: input.savedJob,
+    prompt: prepared.prompt,
+    duration: prepared.duration,
+    settings: prepared.settings,
+    sourceIds: prepared.image_ids,
+    videoInputs: prepared.video_inputs.map((video) => ({
+      assetId: video.asset_id,
+      provenance: video.provenance
+    })),
+    recovering: input.recovering,
+    signal: input.signal,
+    onSubmitted: input.onSubmitted
+  });
 };

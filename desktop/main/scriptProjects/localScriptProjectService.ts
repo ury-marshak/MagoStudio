@@ -93,13 +93,25 @@ import {
   sheetSpecsInFlight,
   REFERENCE_INSTRUCTION_PREFIX
 } from "./sheets/planSheetRun";
-import { FAL_SHOT_IMAGE_SLOTS, renderFalShot } from "./shots/falShotRenderer";
+import {
+  FAL_SHOT_IMAGE_SLOTS,
+  renderFalShot,
+  renderPreparedFalShot
+} from "./shots/falShotRenderer";
 import { LocalShotMetrics } from "./shots/localShotMetrics";
 import {
   planShotRun,
   ShotRunError,
   shotSpecsInFlight
 } from "./shots/planShotRun";
+import {
+  assertPreparedShotJob,
+  assertPreparedShotOwner,
+  createPreparedFalShot,
+  parsePreparedFalShot,
+  preparedShotCost,
+  type PreparedFalShot
+} from "./shots/preparedFalShot";
 import { buildProjectCutView, emptyCutShotEntry } from "./shots/projectCutView";
 import { shotReadView, withProjectReadViews } from "./shots/projectReadViews";
 import { SEQUENTIAL_SHOT_REFERENCE_DESCRIPTION } from "./shots/sequentialContinuation";
@@ -2500,6 +2512,7 @@ export class LocalScriptProjectService {
       steps
     );
     plan.local_targets = runnable;
+    if (isFalRender) plan.local_shot_preparation_version = 1;
     // `last_spec` is what the user last asked for, so the next dry run can say
     // what changed since; whether it rendered is the version's fingerprint.
     const lastSpecs = new Map(
@@ -3060,431 +3073,429 @@ export class LocalScriptProjectService {
           : null;
         if (control.recovering && !savedJob)
           throw new Error("Resume the plan to submit its remaining renders");
-        let snapshot = await this.requireSnapshot(input.projectId);
-        const referenceItems = Object.values(
-          record(target.references) ?? {}
-        ).flatMap((value) => records(value));
-        if (!isFalRender) {
-          await this.ensureReferenceDescriptions(
-            input.projectId,
-            referenceItems,
-            descriptionSignal
-          );
-          snapshot = await this.requireSnapshot(input.projectId);
-        }
-        const stateKeys = new Map(
-          records(snapshot.state?.keys).map((key) => [String(key.token), key])
-        );
-        const sequential = record(target._local_sequential);
-        // The engine's image slots, one of them taken by an image-mode
-        // continuity reference; over-budget groups are gridded rather than
-        // dropped.
-        const imageSlotBudget = referenceImageSlotBudget(
-          sequential,
-          !!record(target._local_storyboard),
-          isFalRender ? FAL_SHOT_IMAGE_SLOTS : undefined
-        );
+        activeStep = submitRender;
         if (
-          isFalRender &&
-          !savedJob &&
-          target._local_prompt_rewrite === "raw" &&
-          hasRawNumberedReferenceOverflow(
-            textValue(target.video_prompt, ""),
-            referenceItems.length,
-            imageSlotBudget
-          )
+          savedJob &&
+          ["SUBMITTING", "SUBMISSION_UNKNOWN"].includes(savedJob.status)
         )
           throw new Error(
-            "Raw prompts with numbered references cannot be gridded safely; use normal prompt composition or reduce reference images"
+            "fal may have accepted this render. Check the provider's request history before starting a new render."
           );
-        const referenceSlots = planReferenceSlots(
-          Object.fromEntries(
-            GROUP_ORDER.map((group) => [
-              group,
-              records(record(target.references)?.[group])
-                .map((entry) => textValue(entry.asset_id, ""))
-                .filter(Boolean)
-            ])
-          ),
-          imageSlotBudget
-        );
-        const resolveReferencePath = async (id: string) => {
-          const resolved =
-            (await this.snapshots.resolveMediaPath(id)) ??
-            (await this.projects.resolveMediaPath("asset", id));
-          if (!resolved)
-            throw new Error("Local reference image " + id + " is unavailable");
-          return resolved;
-        };
-        const hasOverflow =
-          !savedJob && referenceSlots.some((slot) => slot.length > 1);
-        // One asset per slot: a lone reference is itself, a gridded slot's
-        // asset is created below. Filled in slot order.
-        const referenceIds: string[] = referenceSlots.map((slot) =>
-          slot.length === 1 ? slot[0]! : ""
-        );
-        const referencePaths: string[] = await Promise.all(
-          referenceSlots.map((slot) =>
-            !isFalRender && slot.length === 1
-              ? resolveReferencePath(slot[0]!)
-              : Promise.resolve("")
-          )
-        );
-        const frameRange = Array.isArray(input.videoSettings?.frame_range)
-          ? input.videoSettings.frame_range
-          : null;
-        const durationSetting =
-          typeof input.videoSettings?.duration_s === "number"
-            ? input.videoSettings.duration_s
-            : frameRange?.length === 2 &&
-                typeof frameRange[0] === "number" &&
-                typeof frameRange[1] === "number"
-              ? (frameRange[1] - frameRange[0]) / 24
-              : undefined;
-        const durationSeconds =
-          typeof target._local_duration_s === "number"
-            ? target._local_duration_s
-            : typeof target.duration_s === "number"
-              ? target.duration_s
-              : typeof durationSetting === "number"
-                ? durationSetting
-                : 5;
-        if (hasOverflow) {
-          const griddedIds = referenceSlots.filter((slot) => slot.length > 1);
-          activeStep = this.findStep(plan, "submit_stitch_refs", timelineId);
-          plan = await this.setStep(
+        const savedPreparation = record(plan.local_prepared_shots)?.[
+          timelineId
+        ];
+        let preparedShot =
+          isFalRender && savedPreparation !== undefined
+            ? parsePreparedFalShot(savedPreparation)
+            : null;
+        if (preparedShot) {
+          assertPreparedShotOwner(
+            preparedShot,
             input.projectId,
-            planId,
-            activeStep,
-            "RUNNING"
+            timelineId,
+            jobId
           );
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            activeStep,
-            "COMPLETED",
-            { asset_ids: griddedIds.flat() }
-          );
-          activeStep = this.findStep(plan, "poll_stitch_refs", timelineId);
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            activeStep,
-            "RUNNING"
-          );
-          const grids: JsonRecord[] = [];
-          for (const [index, slot] of referenceSlots.entries()) {
-            if (slot.length < 2) continue;
-            const grid = await this.snapshots.storeGeneratedMedia(
-              input.projectId,
-              await createReferenceGrid(
-                await Promise.all(slot.map(resolveReferencePath)),
-                control.abortController.signal
-              ),
-              "png"
+          if (submitRender?.local_preparation_digest !== preparedShot.digest)
+            throw new Error(
+              "The saved shot preparation checkpoint is inconsistent"
             );
-            referenceIds[index] = grid.id;
-            referencePaths[index] = grid.path;
-            grids.push({
-              asset_id: grid.id,
-              output_url: grid.url,
-              members: slot
-            });
-          }
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            activeStep,
-            "COMPLETED",
-            {
-              asset_id: grids[0]?.asset_id ?? null,
-              output_url: grids[0]?.output_url ?? null,
-              members: griddedIds.flat(),
-              grids
-            }
+          if (savedJob) assertPreparedShotJob(preparedShot, savedJob);
+        } else if (
+          submitRender?.local_preparation_digest ||
+          (savedJob && plan.local_shot_preparation_version === 1)
+        ) {
+          throw new Error(
+            "The shot preparation checkpoint is missing its saved request"
           );
         }
-        const board = record(target._local_storyboard);
-        if (!isFalRender && board && typeof board.asset_id === "string")
-          referencePaths.push(await resolveReferencePath(board.asset_id));
-        const numberedImageIds = savedJob
-          ? savedJob.inputAssetIds.slice(
-              0,
-              Array.isArray(savedJob.requestJson.reference_image_urls)
-                ? savedJob.requestJson.reference_image_urls.length
-                : 0
-            )
-          : [...referenceIds, ...(board ? [String(board.asset_id)] : [])];
-        // The previous shot's reference, when this shot continues from one:
-        // its own slot, appended last so it takes the highest tag.
-        let continuityImage: {
-          id: string;
-          description: string;
-          continuation: Continuation | null;
-        } | null = null;
+        let durationSeconds = preparedShot?.duration ?? 5;
+        let numberedImageIds = preparedShot?.image_ids ?? [];
+        const numberedVideoIds: string[] =
+          preparedShot?.video_inputs.map((video) => video.asset_id) ?? [];
+        let tailProvenance: VideoTailProvenance | null =
+          preparedShot?.video_inputs[0]?.provenance ?? null;
+        let continuesFrom: JsonRecord | null =
+          preparedShot?.continues_from ?? null;
+        let adaptedPrompt: string | undefined = preparedShot?.prompt;
+        let referencePaths: string[] = [];
         let openingFramePath: string | undefined;
-        let continuityVideo: { id: string; description: string } | null = null;
-        let tailProvenance: VideoTailProvenance | null = null;
-        const numberedVideoIds: string[] = [];
         const referenceVideos: Array<{
           path: string;
           skipFrames: number;
           frameCount: number;
         }> = [];
-        let continuesFrom: JsonRecord | null = null;
-
-        const barrier = this.findStep(
-          plan,
-          "poll_prev_shot_complete",
-          timelineId
-        );
-        if (barrier && !completedStep(barrier)) {
-          activeStep = barrier;
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            barrier,
-            "RUNNING"
+        // A complete preparation is authoritative. Do not re-read mutable keys,
+        // pins, source media, reference grids, prompt composers or defaults.
+        if (!preparedShot) {
+          let snapshot = await this.requireSnapshot(input.projectId);
+          const referenceItems = Object.values(
+            record(target.references) ?? {}
+          ).flatMap((value) => records(value));
+          if (!isFalRender) {
+            await this.ensureReferenceDescriptions(
+              input.projectId,
+              referenceItems,
+              descriptionSignal
+            );
+            snapshot = await this.requireSnapshot(input.projectId);
+          }
+          const stateKeys = new Map(
+            records(snapshot.state?.keys).map((key) => [String(key.token), key])
           );
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            barrier,
-            "COMPLETED",
-            {
-              prev_timeline_id: target._local_previous_timeline_id
-            }
+          const sequential = record(target._local_sequential);
+          // The engine's image slots, one of them taken by an image-mode
+          // continuity reference; over-budget groups are gridded rather than
+          // dropped.
+          const imageSlotBudget = referenceImageSlotBudget(
+            sequential,
+            !!record(target._local_storyboard),
+            isFalRender ? FAL_SHOT_IMAGE_SLOTS : undefined
           );
-        }
-
-        activeStep = this.findStep(plan, "shot_context", timelineId);
-        if (!completedStep(activeStep)) {
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            activeStep,
-            "RUNNING"
-          );
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            activeStep,
-            "COMPLETED",
-            {
-              reference_image_ids: referenceIds,
-              raw_video_prompt: target.video_prompt
-            }
-          );
-        }
-
-        if (
-          isFalRender &&
-          sequential &&
-          sequential.mode === "last_frame" &&
-          sequential.opening_frame === "pin"
-        )
-          throw new Error(
-            "H3 Max (fal) pinned opening frames are not yet supported"
-          );
-        if (
-          isFalRender &&
-          !savedJob &&
-          sequential?.mode === "last_chunk" &&
-          record(record(record(target._local_render_spec)?.spec)?.sequential)
-            ?.tail_preparation !== FAL_VIDEO_TAIL_PROFILE
-        )
-          throw new Error(
-            "This video-tail plan predates bounded preparation; create a new plan"
-          );
-        const frameStep = sequential
-          ? this.findStep(
-              plan,
-              sequential.mode === "key_frames"
-                ? "poll_pick_keyframes"
-                : sequential.mode === "last_chunk"
-                  ? "shot_video_source"
-                  : "use_provided_reference_frame",
-              timelineId
-            )
-          : undefined;
-        const savedFrame = completedStep(frameStep)
-          ? record(frameStep?.result)
-          : null;
-        if (isFalRender && sequential && (savedJob || savedFrame)) {
-          // Accepted jobs and explicit resumes reuse the original preparation.
-          // In particular, never inspect a new predecessor pin or re-extract
-          // frames that would shift the submitted prompt's image numbering.
-          continuesFrom = record(savedFrame?.continues_from);
-          const referenceId = textValue(continuesFrom?.reference_asset_id, "");
           if (
-            !referenceId ||
-            !textValue(continuesFrom?.asset_id, "") ||
-            continuesFrom?.timeline_id !== target._local_previous_timeline_id ||
-            continuesFrom?.mode !== sequential.mode ||
-            (savedJob && !savedJob.inputAssetIds.includes(referenceId))
+            isFalRender &&
+            !savedJob &&
+            target._local_prompt_rewrite === "raw" &&
+            hasRawNumberedReferenceOverflow(
+              textValue(target.video_prompt, ""),
+              referenceItems.length,
+              imageSlotBudget
+            )
           )
             throw new Error(
-              "The saved sequential frame provenance is unavailable"
+              "Raw prompts with numbered references cannot be gridded safely; use normal prompt composition or reduce reference images"
             );
-          if (sequential.mode === "last_chunk") {
-            tailProvenance = videoTailProvenanceSchema.parse(
-              continuesFrom?.tail_provenance
-            );
-            const expectedSource =
-              target._local_previous_in_run === true
-                ? record(
-                    this.findStep(
-                      plan,
-                      "poll_video_render",
-                      String(target._local_previous_timeline_id)
-                    )?.result
-                  )?.render_asset_id
-                : target._local_previous_asset_id;
-            if (
-              tailProvenance.requested_seconds !== sequential.chunk_seconds ||
-              fingerprint(record(savedFrame?.selection) ?? {}) !==
-                fingerprint(sequential) ||
-              continuesFrom?.asset_id !== expectedSource ||
-              (savedJob &&
-                (!Array.isArray(savedJob.requestJson.reference_video_urls) ||
-                  savedJob.requestJson.reference_video_urls.length !== 1 ||
-                  savedJob.inputAssetIds.at(-1) !== referenceId ||
-                  numberedImageIds.length + 1 !==
-                    savedJob.inputAssetIds.length))
-            )
+          const referenceSlots = planReferenceSlots(
+            Object.fromEntries(
+              GROUP_ORDER.map((group) => [
+                group,
+                records(record(target.references)?.[group])
+                  .map((entry) => textValue(entry.asset_id, ""))
+                  .filter(Boolean)
+              ])
+            ),
+            imageSlotBudget
+          );
+          const resolveReferencePath = async (id: string) => {
+            const resolved =
+              (await this.snapshots.resolveMediaPath(id)) ??
+              (await this.projects.resolveMediaPath("asset", id));
+            if (!resolved)
               throw new Error(
-                "The saved sequential video provenance is unavailable"
+                "Local reference image " + id + " is unavailable"
               );
-            numberedVideoIds.push(referenceId);
-            continuityVideo = {
-              id: referenceId,
-              description: textValue(sequential.prompt_appendix, "")
-            };
-          } else {
-            continuityImage = {
-              id: referenceId,
-              description: textValue(
-                sequential.prompt_appendix,
-                SEQUENTIAL_SHOT_REFERENCE_DESCRIPTION
-              ),
-              continuation: sequentialContinuation(sequential)
-            };
-            if (!savedJob) numberedImageIds.push(referenceId);
-          }
-        } else if (sequential) {
-          const previousId = String(target._local_previous_timeline_id);
-          const latest = await this.requireSnapshot(input.projectId);
-          const previousCut = records(latest.cut?.shots).find(
-            (shot) => shot.timeline_id === previousId
+            return resolved;
+          };
+          const hasOverflow =
+            !savedJob && referenceSlots.some((slot) => slot.length > 1);
+          // One asset per slot: a lone reference is itself, a gridded slot's
+          // asset is created below. Filled in slot order.
+          const referenceIds: string[] = referenceSlots.map((slot) =>
+            slot.length === 1 ? slot[0]! : ""
           );
-          // Out-of-run pins are frozen at planning time. Same-run continuation
-          // uses that plan's actual output, even if the user changes its pin.
-          const previousRender = record(
-            this.findStep(plan, "poll_video_render", previousId)?.result
+          referencePaths = await Promise.all(
+            referenceSlots.map((slot) =>
+              !isFalRender && slot.length === 1
+                ? resolveReferencePath(slot[0]!)
+                : Promise.resolve("")
+            )
           );
-          const previousAssetId =
-            target._local_previous_in_run === true
-              ? textValue(previousRender?.render_asset_id, "")
-              : textValue(target._local_previous_asset_id, "") ||
-                textValue(previousCut?.asset_id, "");
-          const previousPath = previousAssetId
-            ? await this.snapshots.resolveMediaPath(
-                previousAssetId,
-                input.projectId
-              )
+          const frameRange = Array.isArray(input.videoSettings?.frame_range)
+            ? input.videoSettings.frame_range
             : null;
-          if (!previousPath)
-            throw new Error("The preceding shot render is unavailable locally");
-          const appendix = textValue(
-            sequential.prompt_appendix,
-            SEQUENTIAL_SHOT_REFERENCE_DESCRIPTION
-          );
-          if (isFalRender && sequential.mode === "last_chunk") {
-            activeStep = this.findStep(plan, "shot_video_source", timelineId);
+          const durationSetting =
+            typeof input.videoSettings?.duration_s === "number"
+              ? input.videoSettings.duration_s
+              : frameRange?.length === 2 &&
+                  typeof frameRange[0] === "number" &&
+                  typeof frameRange[1] === "number"
+                ? (frameRange[1] - frameRange[0]) / 24
+                : undefined;
+          durationSeconds =
+            typeof target._local_duration_s === "number"
+              ? target._local_duration_s
+              : typeof target.duration_s === "number"
+                ? target.duration_s
+                : typeof durationSetting === "number"
+                  ? durationSetting
+                  : 5;
+          if (hasOverflow) {
+            const griddedIds = referenceSlots.filter((slot) => slot.length > 1);
+            activeStep = this.findStep(plan, "submit_stitch_refs", timelineId);
             plan = await this.setStep(
               input.projectId,
               planId,
               activeStep,
               "RUNNING"
             );
-            const tail = await prepareVideoTail(
-              previousPath,
-              Number(sequential.chunk_seconds),
-              control.abortController.signal
-            );
-            this.throwIfCancelled(control);
-            const prepared = await this.snapshots.storeGeneratedMedia(
+            plan = await this.setStep(
               input.projectId,
-              tail.bytes,
-              "mp4"
+              planId,
+              activeStep,
+              "COMPLETED",
+              { asset_ids: griddedIds.flat() }
             );
-            this.throwIfCancelled(control);
-            tailProvenance = videoTailProvenanceSchema.parse(tail.provenance);
-            numberedVideoIds.push(prepared.id);
-            continuityVideo = { id: prepared.id, description: appendix };
-            continuesFrom = {
-              timeline_id: previousId,
-              asset_id: previousAssetId,
-              mode: "last_chunk",
-              reference_asset_id: prepared.id,
-              tail_provenance: tailProvenance
-            };
+            activeStep = this.findStep(plan, "poll_stitch_refs", timelineId);
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              activeStep,
+              "RUNNING"
+            );
+            const grids: JsonRecord[] = [];
+            for (const [index, slot] of referenceSlots.entries()) {
+              if (slot.length < 2) continue;
+              const grid = await this.snapshots.storeGeneratedMedia(
+                input.projectId,
+                await createReferenceGrid(
+                  await Promise.all(slot.map(resolveReferencePath)),
+                  control.abortController.signal
+                ),
+                "png"
+              );
+              referenceIds[index] = grid.id;
+              referencePaths[index] = grid.path;
+              grids.push({
+                asset_id: grid.id,
+                output_url: grid.url,
+                members: slot
+              });
+            }
             plan = await this.setStep(
               input.projectId,
               planId,
               activeStep,
               "COMPLETED",
               {
-                source_asset_id: previousAssetId,
-                shot_reference_video_id: prepared.id,
-                output_url: prepared.url,
-                mode: "last_chunk",
-                selection: structuredClone(sequential),
-                cost_example: falVideoTailEstimate(
-                  timelineId,
-                  record(input.videoSettings?.provider_settings)?.resolution,
-                  durationSeconds,
-                  tailProvenance.output_duration_seconds
-                ),
-                continues_from: continuesFrom
+                asset_id: grids[0]?.asset_id ?? null,
+                output_url: grids[0]?.output_url ?? null,
+                members: griddedIds.flat(),
+                grids
               }
             );
-          } else if (sequential.mode === "last_chunk") {
-            activeStep = this.findStep(plan, "shot_video_source", timelineId);
-            const previousStateShot = records(latest.state?.shots).find(
+          }
+          const board = record(target._local_storyboard);
+          if (!isFalRender && board && typeof board.asset_id === "string")
+            referencePaths.push(await resolveReferencePath(board.asset_id));
+          numberedImageIds = savedJob
+            ? savedJob.inputAssetIds.slice(
+                0,
+                Array.isArray(savedJob.requestJson.reference_image_urls)
+                  ? savedJob.requestJson.reference_image_urls.length
+                  : 0
+              )
+            : [...referenceIds, ...(board ? [String(board.asset_id)] : [])];
+          // The previous shot's reference, when this shot continues from one:
+          // its own slot, appended last so it takes the highest tag.
+          let continuityImage: {
+            id: string;
+            description: string;
+            continuation: Continuation | null;
+          } | null = null;
+          let continuityVideo: { id: string; description: string } | null =
+            null;
+
+          const barrier = this.findStep(
+            plan,
+            "poll_prev_shot_complete",
+            timelineId
+          );
+          if (barrier && !completedStep(barrier)) {
+            activeStep = barrier;
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              barrier,
+              "RUNNING"
+            );
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              barrier,
+              "COMPLETED",
+              {
+                prev_timeline_id: target._local_previous_timeline_id
+              }
+            );
+          }
+
+          activeStep = this.findStep(plan, "shot_context", timelineId);
+          if (!completedStep(activeStep)) {
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              activeStep,
+              "RUNNING"
+            );
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              activeStep,
+              "COMPLETED",
+              {
+                reference_image_ids: referenceIds,
+                raw_video_prompt: target.video_prompt
+              }
+            );
+          }
+
+          if (
+            isFalRender &&
+            sequential &&
+            sequential.mode === "last_frame" &&
+            sequential.opening_frame === "pin"
+          )
+            throw new Error(
+              "H3 Max (fal) pinned opening frames are not yet supported"
+            );
+          if (
+            isFalRender &&
+            !savedJob &&
+            sequential?.mode === "last_chunk" &&
+            record(record(record(target._local_render_spec)?.spec)?.sequential)
+              ?.tail_preparation !== FAL_VIDEO_TAIL_PROFILE
+          )
+            throw new Error(
+              "This video-tail plan predates bounded preparation; create a new plan"
+            );
+          const frameStep = sequential
+            ? this.findStep(
+                plan,
+                sequential.mode === "key_frames"
+                  ? "poll_pick_keyframes"
+                  : sequential.mode === "last_chunk"
+                    ? "shot_video_source"
+                    : "use_provided_reference_frame",
+                timelineId
+              )
+            : undefined;
+          const savedFrame = completedStep(frameStep)
+            ? record(frameStep?.result)
+            : null;
+          if (isFalRender && sequential && (savedJob || savedFrame)) {
+            // Accepted jobs and explicit resumes reuse the original preparation.
+            // In particular, never inspect a new predecessor pin or re-extract
+            // frames that would shift the submitted prompt's image numbering.
+            continuesFrom = record(savedFrame?.continues_from);
+            const referenceId = textValue(
+              continuesFrom?.reference_asset_id,
+              ""
+            );
+            if (
+              !referenceId ||
+              !textValue(continuesFrom?.asset_id, "") ||
+              continuesFrom?.timeline_id !==
+                target._local_previous_timeline_id ||
+              continuesFrom?.mode !== sequential.mode ||
+              (savedJob && !savedJob.inputAssetIds.includes(referenceId))
+            )
+              throw new Error(
+                "The saved sequential frame provenance is unavailable"
+              );
+            if (sequential.mode === "last_chunk") {
+              tailProvenance = videoTailProvenanceSchema.parse(
+                continuesFrom?.tail_provenance
+              );
+              const expectedSource =
+                target._local_previous_in_run === true
+                  ? record(
+                      this.findStep(
+                        plan,
+                        "poll_video_render",
+                        String(target._local_previous_timeline_id)
+                      )?.result
+                    )?.render_asset_id
+                  : target._local_previous_asset_id;
+              if (
+                tailProvenance.requested_seconds !== sequential.chunk_seconds ||
+                fingerprint(record(savedFrame?.selection) ?? {}) !==
+                  fingerprint(sequential) ||
+                continuesFrom?.asset_id !== expectedSource ||
+                (savedJob &&
+                  (!Array.isArray(savedJob.requestJson.reference_video_urls) ||
+                    savedJob.requestJson.reference_video_urls.length !== 1 ||
+                    savedJob.inputAssetIds.at(-1) !== referenceId ||
+                    numberedImageIds.length + 1 !==
+                      savedJob.inputAssetIds.length))
+              )
+                throw new Error(
+                  "The saved sequential video provenance is unavailable"
+                );
+              numberedVideoIds.push(referenceId);
+              continuityVideo = {
+                id: referenceId,
+                description: textValue(sequential.prompt_appendix, "")
+              };
+            } else {
+              continuityImage = {
+                id: referenceId,
+                description: textValue(
+                  sequential.prompt_appendix,
+                  SEQUENTIAL_SHOT_REFERENCE_DESCRIPTION
+                ),
+                continuation: sequentialContinuation(sequential)
+              };
+              if (!savedJob) numberedImageIds.push(referenceId);
+            }
+          } else if (sequential) {
+            const previousId = String(target._local_previous_timeline_id);
+            const latest = await this.requireSnapshot(input.projectId);
+            const previousCut = records(latest.cut?.shots).find(
               (shot) => shot.timeline_id === previousId
             );
-            const previousDuration =
-              typeof previousStateShot?.duration_s === "number"
-                ? previousStateShot.duration_s
-                : durationSeconds;
-            const seconds =
-              typeof sequential.chunk_seconds === "number"
-                ? sequential.chunk_seconds
-                : 2;
-            const frameCount = Math.max(5, Math.round(seconds * 24));
-            referenceVideos.push({
-              path: previousPath,
-              skipFrames: Math.max(
-                0,
-                Math.round(previousDuration * 24) - frameCount
-              ),
-              frameCount
-            });
-            continuityVideo = { id: previousAssetId, description: appendix };
-            continuesFrom = {
-              timeline_id: previousId,
-              asset_id: previousAssetId,
-              mode: "last_chunk",
-              reference_asset_id: previousAssetId
-            };
-            if (!completedStep(activeStep)) {
+            // Out-of-run pins are frozen at planning time. Same-run continuation
+            // uses that plan's actual output, even if the user changes its pin.
+            const previousRender = record(
+              this.findStep(plan, "poll_video_render", previousId)?.result
+            );
+            const previousAssetId =
+              target._local_previous_in_run === true
+                ? textValue(previousRender?.render_asset_id, "")
+                : textValue(target._local_previous_asset_id, "") ||
+                  textValue(previousCut?.asset_id, "");
+            const previousPath = previousAssetId
+              ? await this.snapshots.resolveMediaPath(
+                  previousAssetId,
+                  input.projectId
+                )
+              : null;
+            if (!previousPath)
+              throw new Error(
+                "The preceding shot render is unavailable locally"
+              );
+            const appendix = textValue(
+              sequential.prompt_appendix,
+              SEQUENTIAL_SHOT_REFERENCE_DESCRIPTION
+            );
+            if (isFalRender && sequential.mode === "last_chunk") {
+              activeStep = this.findStep(plan, "shot_video_source", timelineId);
               plan = await this.setStep(
                 input.projectId,
                 planId,
                 activeStep,
                 "RUNNING"
               );
+              const tail = await prepareVideoTail(
+                previousPath,
+                Number(sequential.chunk_seconds),
+                control.abortController.signal
+              );
+              this.throwIfCancelled(control);
+              const prepared = await this.snapshots.storeGeneratedMedia(
+                input.projectId,
+                tail.bytes,
+                "mp4"
+              );
+              this.throwIfCancelled(control);
+              tailProvenance = videoTailProvenanceSchema.parse(tail.provenance);
+              numberedVideoIds.push(prepared.id);
+              continuityVideo = { id: prepared.id, description: appendix };
+              continuesFrom = {
+                timeline_id: previousId,
+                asset_id: previousAssetId,
+                mode: "last_chunk",
+                reference_asset_id: prepared.id,
+                tail_provenance: tailProvenance
+              };
               plan = await this.setStep(
                 input.projectId,
                 planId,
@@ -3492,278 +3503,469 @@ export class LocalScriptProjectService {
                 "COMPLETED",
                 {
                   source_asset_id: previousAssetId,
+                  shot_reference_video_id: prepared.id,
+                  output_url: prepared.url,
                   mode: "last_chunk",
-                  frame_count: frameCount
+                  selection: structuredClone(sequential),
+                  cost_example: falVideoTailEstimate(
+                    timelineId,
+                    record(input.videoSettings?.provider_settings)?.resolution,
+                    durationSeconds,
+                    tailProvenance.output_duration_seconds
+                  ),
+                  continues_from: continuesFrom
                 }
               );
-            }
-          } else {
-            const isGrid = sequential.mode === "key_frames";
-            const submitKeyframes = this.findStep(
-              plan,
-              isGrid ? "submit_pick_keyframes" : "use_provided_reference_frame",
-              timelineId
-            );
-            activeStep = submitKeyframes;
-            if (isGrid) {
-              plan = await this.setStep(
-                input.projectId,
-                planId,
-                submitKeyframes,
-                "RUNNING"
+            } else if (sequential.mode === "last_chunk") {
+              activeStep = this.findStep(plan, "shot_video_source", timelineId);
+              const previousStateShot = records(latest.state?.shots).find(
+                (shot) => shot.timeline_id === previousId
               );
-              plan = await this.setStep(
-                input.projectId,
-                planId,
-                submitKeyframes,
-                "COMPLETED",
-                {
-                  video_asset_id: previousAssetId,
-                  candidates: 4
-                }
-              );
-              activeStep = this.findStep(
+              const previousDuration =
+                typeof previousStateShot?.duration_s === "number"
+                  ? previousStateShot.duration_s
+                  : durationSeconds;
+              const seconds =
+                typeof sequential.chunk_seconds === "number"
+                  ? sequential.chunk_seconds
+                  : 2;
+              const frameCount = Math.max(5, Math.round(seconds * 24));
+              referenceVideos.push({
+                path: previousPath,
+                skipFrames: Math.max(
+                  0,
+                  Math.round(previousDuration * 24) - frameCount
+                ),
+                frameCount
+              });
+              continuityVideo = { id: previousAssetId, description: appendix };
+              continuesFrom = {
+                timeline_id: previousId,
+                asset_id: previousAssetId,
+                mode: "last_chunk",
+                reference_asset_id: previousAssetId
+              };
+              if (!completedStep(activeStep)) {
+                plan = await this.setStep(
+                  input.projectId,
+                  planId,
+                  activeStep,
+                  "RUNNING"
+                );
+                plan = await this.setStep(
+                  input.projectId,
+                  planId,
+                  activeStep,
+                  "COMPLETED",
+                  {
+                    source_asset_id: previousAssetId,
+                    mode: "last_chunk",
+                    frame_count: frameCount
+                  }
+                );
+              }
+            } else {
+              const isGrid = sequential.mode === "key_frames";
+              const submitKeyframes = this.findStep(
                 plan,
-                "poll_pick_keyframes",
+                isGrid
+                  ? "submit_pick_keyframes"
+                  : "use_provided_reference_frame",
                 timelineId
               );
-              plan = await this.setStep(
+              activeStep = submitKeyframes;
+              if (isGrid) {
+                plan = await this.setStep(
+                  input.projectId,
+                  planId,
+                  submitKeyframes,
+                  "RUNNING"
+                );
+                plan = await this.setStep(
+                  input.projectId,
+                  planId,
+                  submitKeyframes,
+                  "COMPLETED",
+                  {
+                    video_asset_id: previousAssetId,
+                    candidates: 4
+                  }
+                );
+                activeStep = this.findStep(
+                  plan,
+                  "poll_pick_keyframes",
+                  timelineId
+                );
+                plan = await this.setStep(
+                  input.projectId,
+                  planId,
+                  activeStep,
+                  "RUNNING"
+                );
+              } else {
+                plan = await this.setStep(
+                  input.projectId,
+                  planId,
+                  activeStep,
+                  "RUNNING"
+                );
+              }
+              // Sample the predecessor's decoded frame count/rate, not the new
+              // shot's requested length (which can be entirely different).
+              const source = isGrid
+                ? await probeRenderedVideoMetadata(
+                    previousPath,
+                    control.abortController.signal
+                  )
+                : null;
+              this.throwIfCancelled(control);
+              if (isGrid && (!source || !source.fps))
+                throw new Error(
+                  "Could not read the preceding shot frame count"
+                );
+              const frame = isGrid
+                ? await extractKeyframeGrid(
+                    previousPath,
+                    source!.frameCount / source!.fps!,
+                    typeof sequential.num_select === "number"
+                      ? sequential.num_select
+                      : 1,
+                    control.abortController.signal,
+                    source!.fps!
+                  )
+                : await extractLastFrame(
+                    previousPath,
+                    control.abortController.signal
+                  );
+              this.throwIfCancelled(control);
+              const continuity = await this.snapshots.storeGeneratedMedia(
                 input.projectId,
-                planId,
-                activeStep,
-                "RUNNING"
+                frame,
+                "png"
               );
-            } else {
+              referencePaths.push(continuity.path);
+              numberedImageIds.push(continuity.id);
+              const continuation = sequentialContinuation(sequential);
+              continuityImage = {
+                id: continuity.id,
+                description: appendix,
+                continuation
+              };
+              if (continuation === "pin") openingFramePath = continuity.path;
+              continuesFrom = {
+                timeline_id: previousId,
+                asset_id: previousAssetId,
+                mode: sequential.mode,
+                reference_asset_id: continuity.id
+              };
               plan = await this.setStep(
                 input.projectId,
                 planId,
                 activeStep,
-                "RUNNING"
+                "COMPLETED",
+                {
+                  shot_reference_image_id: continuity.id,
+                  output_url: continuity.url,
+                  mode: sequential.mode,
+                  selection: structuredClone(sequential),
+                  source_frame_count: source?.frameCount ?? null,
+                  source_fps: source?.fps ?? null,
+                  continues_from: continuesFrom
+                }
               );
             }
-            // Sample the predecessor's decoded frame count/rate, not the new
-            // shot's requested length (which can be entirely different).
-            const source = isGrid
-              ? await probeRenderedVideoMetadata(
-                  previousPath,
-                  control.abortController.signal
+          }
+
+          const promptPoll = this.findStep(
+            plan,
+            "poll_shot_video_prompt",
+            timelineId
+          );
+          if (savedJob) {
+            adaptedPrompt = textValue(savedJob.requestJson.prompt, "");
+          } else if (target._local_prompt_rewrite === "raw") {
+            // prompt_rewrite "raw": the shot's own prompt goes to the model as is.
+            adaptedPrompt = sequential
+              ? shotPromptWithSequentialAppendix(
+                  textValue(target.video_prompt, ""),
+                  `${isFalRender && sequential.mode === "last_chunk" ? "Video 1: " : ""}${textValue(sequential.prompt_appendix, "")}`
                 )
-              : null;
-            this.throwIfCancelled(control);
-            if (isGrid && (!source || !source.fps))
-              throw new Error("Could not read the preceding shot frame count");
-            const frame = isGrid
-              ? await extractKeyframeGrid(
-                  previousPath,
-                  source!.frameCount / source!.fps!,
-                  typeof sequential.num_select === "number"
-                    ? sequential.num_select
-                    : 1,
-                  control.abortController.signal,
-                  source!.fps!
-                )
-              : await extractLastFrame(
-                  previousPath,
-                  control.abortController.signal
-                );
-            this.throwIfCancelled(control);
-            const continuity = await this.snapshots.storeGeneratedMedia(
-              input.projectId,
-              frame,
-              "png"
+              : textValue(target.video_prompt, "");
+            adaptedPrompt = applyVisualStyle(
+              adaptedPrompt,
+              record(record(record(target._local_render_spec)?.spec)?.settings)
+                ?.visual_style
             );
-            referencePaths.push(continuity.path);
-            numberedImageIds.push(continuity.id);
-            const continuation = sequentialContinuation(sequential);
-            continuityImage = {
-              id: continuity.id,
-              description: appendix,
-              continuation
-            };
-            if (continuation === "pin") openingFramePath = continuity.path;
-            continuesFrom = {
-              timeline_id: previousId,
-              asset_id: previousAssetId,
-              mode: sequential.mode,
-              reference_asset_id: continuity.id
-            };
+          } else if (completedStep(promptPoll)) {
+            adaptedPrompt = textValue(
+              record(promptPoll?.result)?.adapted_video_prompt,
+              ""
+            );
+          } else {
+            activeStep = this.findStep(
+              plan,
+              "submit_shot_video_prompt",
+              timelineId
+            );
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              activeStep,
+              "RUNNING"
+            );
             plan = await this.setStep(
               input.projectId,
               planId,
               activeStep,
               "COMPLETED",
               {
-                shot_reference_image_id: continuity.id,
-                output_url: continuity.url,
-                mode: sequential.mode,
-                selection: structuredClone(sequential),
-                source_frame_count: source?.frameCount ?? null,
-                source_fps: source?.fps ?? null,
-                continues_from: continuesFrom
+                job_id: `${planId}:${timelineId}`,
+                reference_image_ids: numberedImageIds
               }
             );
-          }
-        }
-
-        let adaptedPrompt: string | undefined;
-        const promptPoll = this.findStep(
-          plan,
-          "poll_shot_video_prompt",
-          timelineId
-        );
-        if (savedJob) {
-          adaptedPrompt = textValue(savedJob.requestJson.prompt, "");
-        } else if (target._local_prompt_rewrite === "raw") {
-          // prompt_rewrite "raw": the shot's own prompt goes to the model as is.
-          adaptedPrompt = sequential
-            ? shotPromptWithSequentialAppendix(
-                textValue(target.video_prompt, ""),
-                `${isFalRender && sequential.mode === "last_chunk" ? "Video 1: " : ""}${textValue(sequential.prompt_appendix, "")}`
+            activeStep = this.findStep(
+              plan,
+              "poll_shot_video_prompt",
+              timelineId
+            );
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              activeStep,
+              "RUNNING"
+            );
+            const body = buildShotVideoPromptBody({
+              shot: target,
+              keys: [...stateKeys.values()],
+              referenceSlots,
+              imageAssetIds: referenceIds,
+              continuityImage,
+              continuityVideo,
+              durationSeconds,
+              outputSize: isFalRender
+                ? textValue(
+                    record(input.videoSettings?.provider_settings)
+                      ?.aspect_ratio,
+                    "16:9"
+                  )
+                    .split(":")
+                    .map(Number)
+                : input.outputSize,
+              visualStyle: textValue(
+                record(
+                  record(record(target._local_render_spec)?.spec)?.settings
+                )?.visual_style,
+                ""
               )
-            : textValue(target.video_prompt, "");
-          adaptedPrompt = applyVisualStyle(
-            adaptedPrompt,
-            record(record(record(target._local_render_spec)?.spec)?.settings)
-              ?.visual_style
-          );
-        } else if (completedStep(promptPoll)) {
-          adaptedPrompt = textValue(
-            record(promptPoll?.result)?.adapted_video_prompt,
-            ""
-          );
-        } else {
-          activeStep = this.findStep(
-            plan,
-            "submit_shot_video_prompt",
-            timelineId
-          );
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            activeStep,
-            "RUNNING"
-          );
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            activeStep,
-            "COMPLETED",
-            {
-              job_id: `${planId}:${timelineId}`,
-              reference_image_ids: numberedImageIds
-            }
-          );
-          activeStep = this.findStep(
-            plan,
-            "poll_shot_video_prompt",
-            timelineId
-          );
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            activeStep,
-            "RUNNING"
-          );
-          const body = buildShotVideoPromptBody({
-            shot: target,
-            keys: [...stateKeys.values()],
-            referenceSlots,
-            imageAssetIds: referenceIds,
-            continuityImage,
-            continuityVideo,
-            durationSeconds,
-            outputSize: isFalRender
-              ? textValue(
-                  record(input.videoSettings?.provider_settings)?.aspect_ratio,
-                  "16:9"
-                )
-                  .split(":")
-                  .map(Number)
-              : input.outputSize,
-            visualStyle: textValue(
-              record(record(record(target._local_render_spec)?.spec)?.settings)
-                ?.visual_style,
-              ""
-            )
-          });
-          const generateExternal = await this.getExternalTextGenerator?.();
-          this.throwIfCancelled(control);
-          if (isFalRender && !generateExternal)
-            throw new Error(
-              "Configure an external text provider for shot prompt composition or choose a raw prompt"
-            );
-          const cloud = generateExternal
-            ? null
-            : await this.runCloudTextModel(
-                "video-prompt",
-                { ...body, prompt_version: "minimax_h3_ref" },
-                () => control.cancelled
+            });
+            const generateExternal = await this.getExternalTextGenerator?.();
+            this.throwIfCancelled(control);
+            if (isFalRender && !generateExternal)
+              throw new Error(
+                "Configure an external text provider for shot prompt composition or choose a raw prompt"
               );
-          const textModelRoute = generateExternal
-            ? "external"
-            : cloud
-              ? "cloud"
-              : "local";
-          if (!generateExternal && !cloud && !legacyPromptClient) {
-            const scriptTextModel = await this.getScriptTextModel();
-            legacyPromptClient = new ComfyScriptProjectClient(
-              endpoint!,
-              scriptTextModel
-            );
-            legacyPromptModel = LOCAL_SCRIPT_TEXT_MODEL_FILES[scriptTextModel];
-          }
-          let model = cloud ? "cloud" : legacyPromptModel;
-          const composed =
-            cloud ??
-            (await generateVideoPrompt(
-              body,
-              createQwenVideoPromptCall(async (prompt) => {
-                this.throwIfCancelled(control);
-                if (generateExternal) {
-                  const result = await generateExternal({
-                    systemPrompt: "Return one valid JSON object only.",
-                    userPrompt: prompt,
-                    maxTokens: 8000,
-                    temperature: 0.1,
-                    signal: control.abortController.signal
-                  });
-                  model = result.model;
-                  return result.text;
-                }
-                return legacyPromptClient!.runVideoPrompt(
-                  prompt,
+            const cloud = generateExternal
+              ? null
+              : await this.runCloudTextModel(
+                  "video-prompt",
+                  { ...body, prompt_version: "minimax_h3_ref" },
                   () => control.cancelled
                 );
-              }),
-              {
-                ...(isFalRender ? { engineVersion: FAL_SHOT_ENGINE } : {}),
-                storedCaption: storedCaptionFor([...stateKeys.values()]),
-                allowFallback: !generateExternal
-              }
-            ));
-          this.throwIfCancelled(control);
-          adaptedPrompt = textValue(composed.prompt, "");
-          if (!adaptedPrompt)
-            throw new Error("Video prompt returned no prompt");
-          plan = await this.setStep(
-            input.projectId,
-            planId,
-            activeStep,
-            "COMPLETED",
-            {
-              adapted_video_prompt: adaptedPrompt,
-              prompt_template: composed.prompt_template,
-              model,
-              text_model_route: textModelRoute,
-              numbered_ref_asset_ids: numberedImageIds,
-              numbered_video_asset_ids: continuityVideo
-                ? [continuityVideo.id]
-                : [],
-              speakers: composed.speakers,
-              warnings: composed.warnings,
-              fallback: composed.fallback
+            const textModelRoute = generateExternal
+              ? "external"
+              : cloud
+                ? "cloud"
+                : "local";
+            if (!generateExternal && !cloud && !legacyPromptClient) {
+              const scriptTextModel = await this.getScriptTextModel();
+              legacyPromptClient = new ComfyScriptProjectClient(
+                endpoint!,
+                scriptTextModel
+              );
+              legacyPromptModel =
+                LOCAL_SCRIPT_TEXT_MODEL_FILES[scriptTextModel];
             }
-          );
+            let model = cloud ? "cloud" : legacyPromptModel;
+            const composed =
+              cloud ??
+              (await generateVideoPrompt(
+                body,
+                createQwenVideoPromptCall(async (prompt) => {
+                  this.throwIfCancelled(control);
+                  if (generateExternal) {
+                    const result = await generateExternal({
+                      systemPrompt: "Return one valid JSON object only.",
+                      userPrompt: prompt,
+                      maxTokens: 8000,
+                      temperature: 0.1,
+                      signal: control.abortController.signal
+                    });
+                    model = result.model;
+                    return result.text;
+                  }
+                  return legacyPromptClient!.runVideoPrompt(
+                    prompt,
+                    () => control.cancelled
+                  );
+                }),
+                {
+                  ...(isFalRender ? { engineVersion: FAL_SHOT_ENGINE } : {}),
+                  storedCaption: storedCaptionFor([...stateKeys.values()]),
+                  allowFallback: !generateExternal
+                }
+              ));
+            this.throwIfCancelled(control);
+            adaptedPrompt = textValue(composed.prompt, "");
+            if (!adaptedPrompt)
+              throw new Error("Video prompt returned no prompt");
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              activeStep,
+              "COMPLETED",
+              {
+                adapted_video_prompt: adaptedPrompt,
+                prompt_template: composed.prompt_template,
+                model,
+                text_model_route: textModelRoute,
+                numbered_ref_asset_ids: numberedImageIds,
+                numbered_video_asset_ids: continuityVideo
+                  ? [continuityVideo.id]
+                  : [],
+                speakers: composed.speakers,
+                warnings: composed.warnings,
+                fallback: composed.fallback
+              }
+            );
+          }
+          if (isFalRender && !savedJob) {
+            this.throwIfCancelled(control);
+            adaptedPrompt = (adaptedPrompt ?? "")
+              .replace(/<Picture (\d+)>/gi, "Image $1")
+              .replace(/<Video (\d+)>/gi, "Video $1");
+            const effectiveSettings = resolveFalGenerationSettings(
+              FAL_SHOT_ENGINE,
+              input.videoSettings?.provider_settings
+            ) as PreparedFalShot["settings"];
+            const plannedSpec = record(record(target._local_render_spec)?.spec);
+            if (!plannedSpec)
+              throw new Error(
+                "The shot plan has no saved render specification; create a new plan"
+              );
+            const renderSpec =
+              plannedSpec && continuesFrom
+                ? {
+                    ...plannedSpec,
+                    sequential: {
+                      ...record(plannedSpec.sequential),
+                      prev_asset_id: continuesFrom.asset_id,
+                      ...(tailProvenance
+                        ? {
+                            prepared_video: {
+                              asset_id: continuesFrom.reference_asset_id,
+                              provenance: tailProvenance
+                            }
+                          }
+                        : {})
+                    }
+                  }
+                : plannedSpec;
+            preparedShot = createPreparedFalShot({
+              version: 1,
+              project_id: input.projectId,
+              timeline_id: timelineId,
+              job_id: jobId,
+              provider: "fal",
+              endpoint: "minimax/h3-max/reference-to-video",
+              prompt: adaptedPrompt,
+              duration: durationSeconds,
+              settings: effectiveSettings,
+              image_ids: numberedImageIds,
+              video_inputs: numberedVideoIds.map((asset_id) => ({
+                asset_id,
+                provenance: tailProvenance!
+              })),
+              image_slots: [
+                ...referenceSlots.map((members, index) => ({
+                  asset_id: referenceIds[index]!,
+                  members,
+                  role: "entity" as const
+                })),
+                ...(board
+                  ? [
+                      {
+                        asset_id: String(board.asset_id),
+                        members: [String(board.asset_id)],
+                        role: "storyboard" as const
+                      }
+                    ]
+                  : []),
+                ...(continuityImage
+                  ? [
+                      {
+                        asset_id: continuityImage.id,
+                        members: [String(continuesFrom?.asset_id)],
+                        role: "continuity" as const
+                      }
+                    ]
+                  : [])
+              ],
+              predecessor: {
+                timeline_id: continuesFrom
+                  ? String(continuesFrom.timeline_id)
+                  : null,
+                asset_id: continuesFrom ? String(continuesFrom.asset_id) : null,
+                in_run: target._local_previous_in_run === true,
+                selection:
+                  sequential as PreparedFalShot["predecessor"]["selection"]
+              },
+              continues_from:
+                continuesFrom as PreparedFalShot["continues_from"],
+              prompt_provenance: {
+                rewrite:
+                  target._local_prompt_rewrite === "raw" ? "raw" : "mago",
+                raw_prompt: textValue(target.video_prompt, ""),
+                composition: record(
+                  this.findStep(plan, "poll_shot_video_prompt", timelineId)
+                    ?.result
+                )
+              },
+              media_provenance: {
+                continuity: record(
+                  records(plan.steps).find((step) => step.id === frameStep?.id)
+                    ?.result
+                ),
+                grids: record(
+                  this.findStep(plan, "poll_stitch_refs", timelineId)?.result
+                )
+              },
+              render_spec: renderSpec,
+              render_fingerprint: fingerprint(renderSpec),
+              cost: preparedShotCost(
+                timelineId,
+                effectiveSettings.resolution,
+                durationSeconds,
+                tailProvenance?.output_duration_seconds
+              )
+            });
+            // Persist in full before the first upload. An interrupted upload may
+            // be retried, but cannot silently rebuild/recompose this request.
+            const latestPlan = await this.requirePlan(planId);
+            plan = {
+              ...latestPlan,
+              steps: records(latestPlan.steps).map((step) =>
+                step.id === jobId
+                  ? { ...step, local_preparation_digest: preparedShot!.digest }
+                  : step
+              ),
+              local_prepared_shots: {
+                ...record(plan.local_prepared_shots),
+                [timelineId]: preparedShot
+              }
+            };
+            await this.snapshots.putPlan(input.projectId, planId, plan);
+            this.throwIfCancelled(control);
+          }
         }
 
         activeStep = this.findStep(plan, "create_render_layer", timelineId);
@@ -3846,7 +4048,7 @@ export class LocalScriptProjectService {
               numberedImageIds.indexOf(numberedImageIds[index]!) === index
           );
           const bytes = await client.runVideo({
-            prompt: adaptedPrompt,
+            prompt: adaptedPrompt ?? "",
             referencePaths: renderedPaths,
             referenceVideos,
             width: input.outputSize?.[0],
@@ -3869,24 +4071,35 @@ export class LocalScriptProjectService {
           adaptedPrompt = (adaptedPrompt ?? "")
             .replace(/<Picture (\d+)>/gi, "Image $1")
             .replace(/<Video (\d+)>/gi, "Video $1");
-          const result = await renderFalShot(this.externalRenderJobs!, {
-            jobId,
-            savedJob,
-            projectId: input.projectId,
-            prompt: adaptedPrompt,
-            duration: durationSeconds,
-            settings: input.videoSettings?.provider_settings as
-              | Record<string, string | number | null>
-              | undefined,
-            sourceIds: [...new Set(numberedImageIds)],
-            videoInputs: numberedVideoIds.map((assetId) => ({
-              assetId,
-              provenance: tailProvenance!
-            })),
-            recovering: control.recovering,
-            signal: control.abortController.signal,
-            onSubmitted: startPolling
-          });
+          const result = preparedShot
+            ? await renderPreparedFalShot(this.externalRenderJobs!, {
+                preparation: preparedShot,
+                jobId,
+                savedJob,
+                projectId: input.projectId,
+                timelineId,
+                recovering: control.recovering,
+                signal: control.abortController.signal,
+                onSubmitted: startPolling
+              })
+            : await renderFalShot(this.externalRenderJobs!, {
+                jobId,
+                savedJob,
+                projectId: input.projectId,
+                prompt: adaptedPrompt,
+                duration: durationSeconds,
+                settings: input.videoSettings?.provider_settings as
+                  | Record<string, string | number | null>
+                  | undefined,
+                sourceIds: [...new Set(numberedImageIds)],
+                videoInputs: numberedVideoIds.map((assetId) => ({
+                  assetId,
+                  provenance: tailProvenance!
+                })),
+                recovering: control.recovering,
+                signal: control.abortController.signal,
+                onSubmitted: startPolling
+              });
           falJob = result.job;
           this.throwIfCancelled(control);
           const asset = await this.snapshots.registerGeneratedAsset(
@@ -3932,7 +4145,9 @@ export class LocalScriptProjectService {
             ))
         ) {
           const renderSpecEnvelope = record(target._local_render_spec);
-          const plannedSpec = record(renderSpecEnvelope?.spec);
+          const plannedSpec = preparedShot
+            ? preparedShot.render_spec
+            : record(renderSpecEnvelope?.spec);
           const renderSpec =
             plannedSpec && continuesFrom
               ? {
@@ -3977,7 +4192,9 @@ export class LocalScriptProjectService {
             render_spec: renderSpec,
             input_settings: {
               duration_s: durationSeconds,
-              output_size: input.outputSize ?? null,
+              output_size: preparedShot
+                ? falVideoSize(preparedShot.settings)
+                : (input.outputSize ?? null),
               ...(falJob
                 ? {
                     provider: falJob.provider,
@@ -3997,13 +4214,15 @@ export class LocalScriptProjectService {
                     ...(tailProvenance
                       ? {
                           reference_video_cost_example:
+                            preparedShot?.cost.video_scenario ??
                             record(
                               this.findStep(
                                 plan,
                                 "shot_video_source",
                                 timelineId
                               )?.result
-                            )?.cost_example ?? null
+                            )?.cost_example ??
+                            null
                         }
                       : {}),
                     resolution: falJob.requestJson.resolution,
@@ -4014,18 +4233,25 @@ export class LocalScriptProjectService {
                     reference_tokens: falJob.outputJson?.referenceTokens
                   }
                 : {}),
-              prompt_rewrite: target._local_prompt_rewrite ?? null,
+              prompt_rewrite:
+                preparedShot?.prompt_provenance.rewrite ??
+                target._local_prompt_rewrite ??
+                null,
               _local_render_spec: renderSpec
             },
-            prompt_rewrite: target._local_prompt_rewrite ?? null,
+            prompt_rewrite:
+              preparedShot?.prompt_provenance.rewrite ??
+              target._local_prompt_rewrite ??
+              null,
             size:
               media.width && media.height
                 ? [media.width, media.height]
                 : (input.outputSize ?? null),
             // What this version rendered from; "already rendered with these
             // inputs" reads it back once the version has finished.
-            fingerprint:
-              renderSpec && continuesFrom
+            fingerprint: preparedShot
+              ? preparedShot.render_fingerprint
+              : renderSpec && continuesFrom
                 ? fingerprint(renderSpec)
                 : (renderSpecEnvelope?.fingerprint ?? null)
           };

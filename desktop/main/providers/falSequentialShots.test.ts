@@ -14,6 +14,7 @@ import * as media from "../scriptProjects/localScriptMedia";
 import { LocalScriptProjectService } from "../scriptProjects/localScriptProjectService";
 import * as tails from "../scriptProjects/prepareVideoTail";
 import { fingerprint } from "../scriptProjects/renderSpec";
+import { parsePreparedFalShot } from "../scriptProjects/shots/preparedFalShot";
 import { defaultSequentialAppendix } from "../scriptProjects/shots/sequentialContinuation";
 import { sceneFingerprint } from "../scriptProjects/storyboards/storyboard";
 
@@ -436,121 +437,130 @@ describe("fal sequential frame integration", () => {
     }
   );
 
-  it("recovers an accepted request without rereading a changed pin, extracting, uploading or composing again", async () => {
-    await seed({ mode: "key_frames", num_select: 4 }, [shot(3)]);
-    const extract = vi.spyOn(media, "extractKeyframeGrid");
-    offline = true;
-    const generated = await director.generateShots(
-      request("mago", ["shot-2", "shot-3"])
-    );
-    const planId = String(generated.plan_id);
-    const paused = await waitPlan(planId, "PAUSED");
-    const frame = structuredClone(
-      row(step(paused, "poll_pick_keyframes").result)
-    );
-    const accepted = await jobFor(paused);
-    expect(accepted).toMatchObject({
-      status: "SUBMITTED",
-      requestId: "mock-request-1"
-    });
-    expect(external).toHaveBeenCalledTimes(1);
-    expect(extract).toHaveBeenCalledTimes(1);
-    expect(frame).toMatchObject({ source_frame_count: 12, source_fps: 12 });
+  it.each([false, true])(
+    "recovers an accepted request without rereading a changed pin, extracting, uploading or composing again (legacy: %s)",
+    async (legacy) => {
+      await seed({ mode: "key_frames", num_select: 4 }, [shot(3)]);
+      const extract = vi.spyOn(media, "extractKeyframeGrid");
+      offline = true;
+      const generated = await director.generateShots(
+        request("mago", ["shot-2", "shot-3"])
+      );
+      const planId = String(generated.plan_id);
+      const paused = await waitPlan(planId, "PAUSED");
+      const frame = structuredClone(
+        row(step(paused, "poll_pick_keyframes").result)
+      );
+      const accepted = await jobFor(paused);
+      expect(accepted).toMatchObject({
+        status: "SUBMITTED",
+        requestId: "mock-request-1"
+      });
+      expect(external).toHaveBeenCalledTimes(1);
+      expect(extract).toHaveBeenCalledTimes(1);
+      expect(frame).toMatchObject({ source_frame_count: 12, source_fps: 12 });
 
-    const replacement = await snapshots.storeGeneratedMedia(
-      projectId,
-      Buffer.concat([video, Buffer.from("changed pin")]),
-      "mp4"
-    );
-    const snapshot = (await snapshots.get(projectId))!;
-    const previous = rows(snapshot.cut!.shots)[0]!;
-    previous.asset_id = replacement.id;
-    previous.pinned_asset_id = replacement.id;
-    rows(previous.versions).push({
-      asset_id: replacement.id,
-      url: replacement.url,
-      ready: true
-    });
-    await snapshots.put({ projectId, cut: snapshot.cut! });
-    await rm(source.path);
-    await rm(
-      (await snapshots.resolveMediaPath(
-        String(frame.shot_reference_image_id),
-        projectId
-      ))!
-    );
-    // Even reference images are no longer needed once the provider accepted.
-    await rm(hero.path);
-    const beforeRecovery = fetchMock.mock.calls.length;
-    manager.close();
-    await manager.open(directory);
-    director = makeDirector();
-    offline = false;
-    await director.recoverExternalRenderPlans();
-    await vi.waitFor(
-      async () => {
-        expect(await director.getPlan(planId)).toMatchObject({
-          status: "PAUSED",
-          steps: expect.arrayContaining([
-            expect.objectContaining({
-              timeline_id: "shot-2",
-              tool_name: "poll_video_render",
-              status: "COMPLETED"
-            }),
-            expect.objectContaining({
-              timeline_id: "shot-3",
-              tool_name: "submit_video_render",
-              status: "PENDING"
-            })
-          ])
-        });
-      },
-      { timeout: 10000, interval: 20 }
-    );
-    const recovered = (await director.getPlan(planId))!;
-    expect(
-      fetchMock.mock.calls
-        .slice(beforeRecovery)
-        .map(([target, options]) => [target, options?.method ?? "GET"])
-    ).toEqual([
-      [`${requestRoot}${accepted.requestId}/status`, "GET"],
-      [`${requestRoot}${accepted.requestId}`, "GET"],
-      [`${cdn}/output/${accepted.requestId}.mp4`, "GET"]
-    ]);
-    expect(await jobFor(recovered)).toMatchObject({
-      status: "INGESTED",
-      requestId: accepted.requestId,
-      inputAssetIds: accepted.inputAssetIds,
-      requestJson: accepted.requestJson
-    });
-    expect(row(step(recovered, "poll_pick_keyframes").result)).toEqual(frame);
-    expect(external).toHaveBeenCalledTimes(1);
-    expect(extract).toHaveBeenCalledTimes(1);
-    expect(submissions).toHaveLength(1);
-    const rendered = await version();
-    expect(rendered).toMatchObject({
-      continues_from: frame.continues_from,
-      sent_prompt: accepted.requestJson.prompt,
-      metrics_input: {
-        prompt: accepted.requestJson.prompt,
-        duration_s: 5,
-        reference_asset_ids: accepted.inputAssetIds
-      },
-      render_spec: { sequential: { prev_asset_id: source.id } },
-      input_settings: {
-        provider_settings: accepted.requestJson,
-        seed: 42,
-        reference_tokens: 12
+      const replacement = await snapshots.storeGeneratedMedia(
+        projectId,
+        Buffer.concat([video, Buffer.from("changed pin")]),
+        "mp4"
+      );
+      const snapshot = (await snapshots.get(projectId))!;
+      const previous = rows(snapshot.cut!.shots)[0]!;
+      previous.asset_id = replacement.id;
+      previous.pinned_asset_id = replacement.id;
+      rows(previous.versions).push({
+        asset_id: replacement.id,
+        url: replacement.url,
+        ready: true
+      });
+      await snapshots.put({ projectId, cut: snapshot.cut! });
+      await rm(source.path);
+      await rm(
+        (await snapshots.resolveMediaPath(
+          String(frame.shot_reference_image_id),
+          projectId
+        ))!
+      );
+      // Even reference images are no longer needed once the provider accepted.
+      await rm(hero.path);
+      if (legacy) {
+        delete paused.local_prepared_shots;
+        delete paused.local_shot_preparation_version;
+        delete step(paused, "submit_video_render").local_preparation_digest;
+        await snapshots.putPlan(projectId, planId, paused);
       }
-    });
-    expect(rendered.fingerprint).toBe(fingerprint(row(rendered.render_spec)));
-    expect(rows((await cutShots())[2]!.versions)).toEqual([]);
-    expect(
-      await jobs.get(
-        String(step(recovered, "submit_video_render", "shot-3").id)
-      )
-    ).toBeNull();
-  });
+      const beforeRecovery = fetchMock.mock.calls.length;
+      manager.close();
+      await manager.open(directory);
+      director = makeDirector();
+      offline = false;
+      await director.recoverExternalRenderPlans();
+      await vi.waitFor(
+        async () => {
+          expect(await director.getPlan(planId)).toMatchObject({
+            status: "PAUSED",
+            steps: expect.arrayContaining([
+              expect.objectContaining({
+                timeline_id: "shot-2",
+                tool_name: "poll_video_render",
+                status: "COMPLETED"
+              }),
+              expect.objectContaining({
+                timeline_id: "shot-3",
+                tool_name: "submit_video_render",
+                status: "PENDING"
+              })
+            ])
+          });
+        },
+        { timeout: 10000, interval: 20 }
+      );
+      const recovered = (await director.getPlan(planId))!;
+      expect(
+        fetchMock.mock.calls
+          .slice(beforeRecovery)
+          .map(([target, options]) => [target, options?.method ?? "GET"])
+      ).toEqual([
+        [`${requestRoot}${accepted.requestId}/status`, "GET"],
+        [`${requestRoot}${accepted.requestId}`, "GET"],
+        [`${cdn}/output/${accepted.requestId}.mp4`, "GET"]
+      ]);
+      expect(await jobFor(recovered)).toMatchObject({
+        status: "INGESTED",
+        requestId: accepted.requestId,
+        inputAssetIds: accepted.inputAssetIds,
+        requestJson: accepted.requestJson
+      });
+      expect(row(step(recovered, "poll_pick_keyframes").result)).toEqual(frame);
+      expect(external).toHaveBeenCalledTimes(1);
+      expect(extract).toHaveBeenCalledTimes(1);
+      expect(submissions).toHaveLength(1);
+      const rendered = await version();
+      expect(rendered).toMatchObject({
+        continues_from: frame.continues_from,
+        sent_prompt: accepted.requestJson.prompt,
+        metrics_input: {
+          prompt: accepted.requestJson.prompt,
+          duration_s: 5,
+          reference_asset_ids: accepted.inputAssetIds
+        },
+        render_spec: { sequential: { prev_asset_id: source.id } },
+        input_settings: {
+          provider_settings: accepted.requestJson,
+          seed: 42,
+          reference_tokens: 12
+        }
+      });
+      expect(rendered.fingerprint).toBe(fingerprint(row(rendered.render_spec)));
+      expect(rows((await cutShots())[2]!.versions)).toEqual([]);
+      expect(
+        await jobs.get(
+          String(step(recovered, "submit_video_render", "shot-3").id)
+        )
+      ).toBeNull();
+    }
+  );
 
   it("grids overflowing references without dropping any and numbers storyboard before continuity within nine slots", async () => {
     await seed({ mode: "last_frame", opening_frame: "cut" });
@@ -1124,6 +1134,14 @@ describe("fal sequential video-tail integration", () => {
     const paused = await waitPlan(planId, "PAUSED");
     const prepared = structuredClone(tailStep(paused));
     const accepted = await jobFor(paused);
+    row(row(paused.local_request).videoSettings).provider_settings = {
+      resolution: "invalid"
+    };
+    rows(paused.local_targets)[0]!._local_sequential = {
+      mode: "last_frame",
+      opening_frame: "pin"
+    };
+    await snapshots.putPlan(projectId, planId, paused);
     const snapshot = (await snapshots.get(projectId))!;
     rows(snapshot.cut!.shots)[0]!.pinned_asset_id = "new-pin";
     await snapshots.put({ projectId, cut: snapshot.cut! });
@@ -1219,7 +1237,8 @@ describe("fal sequential video-tail integration", () => {
     const generated = await director.generateShots(request());
     const planId = String(generated.plan_id);
     const paused = await waitPlan(planId, "PAUSED");
-    delete row(tailStep(paused).continues_from).tail_provenance;
+    delete row(row(row(paused.local_prepared_shots)["shot-2"]).continues_from)
+      .tail_provenance;
     await snapshots.putPlan(projectId, planId, paused);
     const before = fetchMock.mock.calls.length;
     offline = false;
@@ -1321,8 +1340,33 @@ describe("fal sequential video-tail integration", () => {
       ]
     });
     await snapshots.put({ projectId, state: snapshot.state! });
+    const grids = vi.spyOn(media, "createReferenceGrid");
+    fetchMock.mockRejectedValueOnce(new Error("upload interrupted"));
     const generated = await director.generateShots(request("mago"));
-    const plan = await waitPlan(String(generated.plan_id), "COMPLETED");
+    const planId = String(generated.plan_id);
+    const paused = await waitPlan(planId, "PAUSED");
+    const frozen = parsePreparedFalShot(
+      row(paused.local_prepared_shots)["shot-2"]
+    );
+    expect(frozen.image_slots.at(-1)).toEqual({
+      asset_id: board.id,
+      members: [board.id],
+      role: "storyboard"
+    });
+    expect(
+      frozen.image_slots.filter((slot) => slot.members.length > 1)
+    ).not.toEqual([]);
+    await rm(source.path);
+    for (const item of props)
+      if (!frozen.image_ids.includes(item.asset_id))
+        await rm((await snapshots.resolveMediaPath(item.asset_id, projectId))!);
+    await director.resumePlan(planId);
+    const plan = await waitPlan(planId, "COMPLETED");
+    expect(grids).toHaveBeenCalledTimes(
+      frozen.image_slots.filter((slot) => slot.members.length > 1).length
+    );
+    expect(external).toHaveBeenCalledTimes(1);
+    expect(row(plan.local_prepared_shots)["shot-2"]).toEqual(frozen);
     const job = await jobFor(plan);
     const tailId = String(tailStep(plan).shot_reference_video_id);
     expect(job.requestJson.reference_image_urls).toHaveLength(9);
@@ -1369,6 +1413,9 @@ describe("fal sequential video-tail integration", () => {
     const paused = await waitPlan(planId, "PAUSED");
     const target = rows(paused.local_targets)[0]!;
     delete row(row(target._local_render_spec).spec).sequential;
+    delete paused.local_prepared_shots;
+    delete paused.local_shot_preparation_version;
+    delete step(paused, "submit_video_render").local_preparation_digest;
     await snapshots.putPlan(projectId, planId, paused);
     const before = fetchMock.mock.calls.length;
     await director.resumePlan(planId);
@@ -1380,5 +1427,210 @@ describe("fal sequential video-tail integration", () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(before);
     expect(submissions).toHaveLength(0);
+  });
+});
+
+describe("persisted shot preparation boundary", () => {
+  it.each(["raw", "mago"])(
+    "persists %s preparation before any upload and reuses it after reopening with changed inputs",
+    async (rewrite) => {
+      await seed({ mode: "key_frames", num_select: 4 });
+      const extract = vi.spyOn(media, "extractKeyframeGrid");
+      const transport = fetchMock.getMockImplementation()!;
+      let frozen: Row | undefined;
+      fetchMock.mockImplementation(async (url, options) => {
+        if (!frozen && url === storage) {
+          const current = (await snapshots.get(projectId))!;
+          const plan = Object.values(current.planDetails!)[0]!;
+          frozen = structuredClone(
+            row(row(plan.local_prepared_shots)["shot-2"])
+          );
+          const prepared = parsePreparedFalShot(frozen);
+          expect(prepared).toMatchObject({
+            version: 1,
+            project_id: projectId,
+            timeline_id: "shot-2",
+            settings: { resolution: "768P", aspect_ratio: "16:9" },
+            predecessor: {
+              asset_id: source.id,
+              selection: { mode: "key_frames", num_select: 4 }
+            },
+            cost: { output_base_usd: 0.4, video_scenario: null }
+          });
+          expect(prepared.image_slots.at(-1)).toMatchObject({
+            role: "continuity",
+            members: [source.id]
+          });
+          expect(prepared.render_fingerprint).toBe(
+            fingerprint(prepared.render_spec!)
+          );
+          expect(await jobs.get(prepared.job_id)).toBeNull();
+          throw new Error("upload interrupted after preparation");
+        }
+        return transport(url, options);
+      });
+      const generated = await director.generateShots(request(rewrite));
+      const planId = String(generated.plan_id);
+      const paused = await waitPlan(planId, "PAUSED");
+      expect(frozen).toBeDefined();
+      expect(await jobFor(paused)).toBeNull();
+      expect(submissions).toEqual([]);
+      await rm(source.path);
+      const target = rows(paused.local_targets)[0]!;
+      target.references = {};
+      target._local_sequential = { mode: "last_frame", opening_frame: "pin" };
+      target._local_previous_asset_id = "replacement-pin";
+      target.video_prompt = "MUTATED PROMPT";
+      target._local_render_spec = {};
+      row(row(paused.local_request).videoSettings).provider_settings = {
+        resolution: "invalid"
+      };
+      await snapshots.putPlan(projectId, planId, paused);
+      manager.close();
+      await manager.open(directory);
+      director = makeDirector();
+      await director.resumePlan(planId);
+      const completed = await waitPlan(planId, "COMPLETED");
+      const prepared = parsePreparedFalShot(frozen);
+      expect(row(completed.local_prepared_shots)["shot-2"]).toEqual(frozen);
+      expect(extract).toHaveBeenCalledTimes(1);
+      expect(external).toHaveBeenCalledTimes(rewrite === "raw" ? 0 : 1);
+      expect(submissions).toHaveLength(1);
+      expect(submissions[0]!.body).toMatchObject({
+        prompt: prepared.prompt,
+        duration: prepared.duration,
+        ...prepared.settings
+      });
+      expect(uploadIds).toEqual(prepared.image_ids);
+      expect(await version()).toMatchObject({
+        sent_prompt: prepared.prompt,
+        render_spec: prepared.render_spec,
+        fingerprint: prepared.render_fingerprint
+      });
+    }
+  );
+
+  it.each([
+    "version",
+    "prompt",
+    "image_ids",
+    "settings",
+    "image_slots",
+    "predecessor",
+    "digest",
+    "cost",
+    "missing-record",
+    "checkpoint"
+  ])(
+    "refuses corrupted %s before credentials, upload, composition or submission",
+    async (field) => {
+      await seed({ mode: "last_frame", opening_frame: "off" });
+      fetchMock.mockRejectedValueOnce(new Error("upload offline"));
+      const generated = await director.generateShots(request("mago"));
+      const planId = String(generated.plan_id);
+      const paused = await waitPlan(planId, "PAUSED");
+      const prepared = row(row(paused.local_prepared_shots)["shot-2"]);
+      if (field === "missing-record") delete paused.local_prepared_shots;
+      else if (field === "checkpoint")
+        delete step(paused, "submit_video_render").local_preparation_digest;
+      else delete prepared[field];
+      await snapshots.putPlan(projectId, planId, paused);
+      const before = fetchMock.mock.calls.length;
+      await director.resumePlan(planId);
+      await waitPlan(planId, "PAUSED");
+      expect(fetchMock).toHaveBeenCalledTimes(before);
+      expect(external).toHaveBeenCalledTimes(1);
+      expect(submissions).toEqual([]);
+    }
+  );
+
+  it("never uploads when the complete preparation cannot be persisted", async () => {
+    await seed({ mode: "last_frame", opening_frame: "off" });
+    const put = snapshots.putPlan.bind(snapshots);
+    let refused = false;
+    vi.spyOn(snapshots, "putPlan").mockImplementation(
+      async (project, id, plan) => {
+        if (!refused && plan.local_prepared_shots) {
+          refused = true;
+          throw new Error("disk unavailable");
+        }
+        return put(project, id, plan);
+      }
+    );
+    const generated = await director.generateShots(request("mago"));
+    const paused = await waitPlan(String(generated.plan_id), "PAUSED");
+    expect(refused).toBe(true);
+    expect(paused.local_prepared_shots).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await jobFor(paused)).toBeNull();
+  });
+
+  it.each(["SUBMITTING", "SUBMISSION_UNKNOWN"])(
+    "does not prepare, upload or resubmit a %s job even with missing preparation",
+    async (status) => {
+      await seed({ mode: "last_frame", opening_frame: "off" });
+      offline = true;
+      const generated = await director.generateShots(request("mago"));
+      const planId = String(generated.plan_id);
+      const paused = await waitPlan(planId, "PAUSED");
+      const accepted = await jobFor(paused);
+      // Model a crash during acknowledgement persistence; do not call a provider.
+      await manager
+        .get()
+        .run(
+          `UPDATE external_render_jobs SET status = '${status}', request_id = NULL WHERE id = '${accepted.id}'`
+        );
+      delete paused.local_prepared_shots;
+      await snapshots.putPlan(projectId, planId, paused);
+      const before = fetchMock.mock.calls.length;
+      await director.resumePlan(planId);
+      const result = await waitPlan(planId, "PAUSED");
+      expect(result).toMatchObject({
+        error: { message: expect.stringContaining("may have accepted") }
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(before);
+      expect(external).toHaveBeenCalledTimes(1);
+      expect(submissions).toHaveLength(1);
+    }
+  );
+});
+
+describe("prepared shot library ownership", () => {
+  it("drains an issued preparation save on teardown without uploading or cancelling provider work", async () => {
+    await seed({ mode: "last_frame", opening_frame: "off" });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const put = snapshots.putPlan.bind(snapshots);
+    let writing = false;
+    vi.spyOn(snapshots, "putPlan").mockImplementation(
+      async (project, id, plan) => {
+        if (plan.local_prepared_shots) {
+          writing = true;
+          await gate;
+        }
+        return put(project, id, plan);
+      }
+    );
+    const generated = await director.generateShots(request("mago"));
+    const planId = String(generated.plan_id);
+    await vi.waitFor(() => expect(writing).toBe(true));
+    let drained = false;
+    const suspension = director.suspendPlans().then(() => {
+      drained = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(drained).toBe(false);
+    release();
+    await suspension;
+    const plan = (await snapshots.get(projectId))!.planDetails![planId]!;
+    expect(
+      parsePreparedFalShot(row(plan.local_prepared_shots)["shot-2"])
+    ).toMatchObject({ job_id: step(plan, "submit_video_render").id });
+    expect(plan.status).not.toBe("CANCELLED");
+    expect(await jobFor(plan)).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+    director.resetPlans();
   });
 });
