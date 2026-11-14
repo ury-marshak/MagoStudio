@@ -21,6 +21,8 @@ export const findSequentialBlockedLabelKey = (
   );
 
   switch (blockedEntry?.reason_code) {
+    case "fal_video_tail_invalid":
+      return "script_project.shot_blocked_fal_video_tail.label";
     case "fal_sequential_unsupported":
       return "script_project.shot_blocked_fal_sequential.label";
     case "raw_reference_overflow":

@@ -168,7 +168,7 @@ describe("ProjectStateSchema", () => {
     expect(parsed.shots).toEqual([]);
   });
 
-  it("reads a Shot stored with the removed Video ending mode as Last frame", () => {
+  it("preserves a saved predecessor video-tail mode", () => {
     const parsed = ProjectStateSchema.parse({
       project_id: "project-1",
       keys: [],
@@ -182,7 +182,7 @@ describe("ProjectStateSchema", () => {
       ]
     });
 
-    expect(parsed.shots[0]?.sequential?.mode).toBe("last_frame");
+    expect(parsed.shots[0]?.sequential?.mode).toBe("last_chunk");
   });
 });
 

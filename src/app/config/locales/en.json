@@ -3380,6 +3380,20 @@
     "sequential_mode_key_frames": {
       "label": "Key frames"
     },
+    "sequential_mode_last_chunk": { "label": "Previous video tail" },
+    "sequential_chunk_seconds": { "label": "Tail length (seconds)" },
+    "sequential_video_tail_hint": {
+      "label": "fal tails use 2–10 seconds of a constant-frame-rate predecessor, converted to a silent 24 fps video up to 1280×720. Short or variable-rate sources fail before submission. Video references can add a surcharge."
+    },
+    "shot_blocked_fal_video_tail": {
+      "label": "H3 Max (fal) requires a predecessor video tail of 2–10 seconds"
+    },
+    "fal_video_tail_estimate": {
+      "label": "Tail-shot output base: {{base}} est. Video-only reference examples: {{min}}–{{max}} for {{from}}–{{to}}s at 24 fps and 16:9/9:16. Images add usage and share the allowance. Other shapes, frame counts and shorter sources vary; this is not a total or a price bound."
+    },
+    "fal_video_tail_pricing_source": {
+      "label": "fal pricing examples (checked Nov 14, 2026)"
+    },
     "sequential_key_frame_count": {
       "label": "Frames to pick (1–4)"
     },

@@ -22,8 +22,14 @@ type Submission = Pick<
   | "requestJson"
   | "inputAssetIds"
 > & {
-  /** Endpoint-specific array field for the ordered local input images. */
+  /** Legacy image-only mapping, retained for existing callers. */
   assetUrlField?: string;
+  /** Ordered modality groups; their flattened IDs must match inputAssetIds. */
+  assetInputs?: Array<{
+    field: string;
+    kind: "image" | "video";
+    assetIds: string[];
+  }>;
 };
 
 const remoteRequest = (
@@ -54,21 +60,64 @@ export class ExternalRenderJobService {
   ): Promise<ExternalRenderJob> {
     const submission = structuredClone(input);
     signal?.throwIfAborted();
+    const { assetUrlField, assetInputs, ...job } = submission;
+    if (assetUrlField && assetInputs)
+      throw new Error("Choose either legacy or typed render inputs");
+    if (assetInputs && !assetInputs.length)
+      throw new Error("Select at least one typed render input group");
+    const groups =
+      assetInputs ??
+      (assetUrlField
+        ? [
+            {
+              field: assetUrlField,
+              kind: "image" as const,
+              assetIds: job.inputAssetIds
+            }
+          ]
+        : []);
+    const fields = groups.map((group) => group.field);
+    if (
+      fields.some(
+        (field) =>
+          !/^[a-z][a-z0-9_]*$/.test(field) ||
+          field === "constructor" ||
+          field === "prototype"
+      ) ||
+      new Set(fields).size !== fields.length
+    )
+      throw new Error("Render input fields must be unique safe array fields");
+    if (
+      groups.length &&
+      (groups.some((group) => !group.assetIds.length) ||
+        JSON.stringify(groups.flatMap((group) => group.assetIds)) !==
+          JSON.stringify(job.inputAssetIds))
+    )
+      throw new Error(
+        "Render input groups must match the ordered input asset IDs"
+      );
     const provider = this.providerFor(submission.provider);
     const prepared = await provider.prepareSubmission(submission.endpoint);
-    const { assetUrlField, ...job } = submission;
-    if (assetUrlField) {
-      if (!prepared.upload)
-        throw new Error("This provider does not support input uploads");
-      if (!job.inputAssetIds.length)
-        throw new Error("Select at least one render input image");
-      const urls: string[] = [];
-      for (const assetId of job.inputAssetIds) {
+    // Resolve every local input before starting any upload. Validation/upload
+    // failures leave no uncertain paid generation job behind.
+    const resolved = [];
+    for (const group of groups) {
+      const files = [];
+      for (const id of group.assetIds) {
         signal?.throwIfAborted();
-        const { file, name } = await this.assets.input(job.projectId, assetId);
-        urls.push(await prepared.upload(file, name, signal));
+        files.push(await this.assets.input(job.projectId, id, group.kind));
       }
-      job.requestJson = { ...job.requestJson, [assetUrlField]: urls };
+      resolved.push({ field: group.field, files });
+    }
+    if (resolved.length && !prepared.upload)
+      throw new Error("This provider does not support input uploads");
+    for (const group of resolved) {
+      const urls: string[] = [];
+      for (const { file, name } of group.files) {
+        signal?.throwIfAborted();
+        urls.push(await prepared.upload!(file, name, signal));
+      }
+      job.requestJson = { ...job.requestJson, [group.field]: urls };
     }
     signal?.throwIfAborted();
     await this.jobs.beginSubmission({

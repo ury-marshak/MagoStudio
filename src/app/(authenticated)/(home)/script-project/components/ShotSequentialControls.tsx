@@ -1,3 +1,5 @@
+const LEGACY_MIN_TAIL_SECONDS = 0.5;
+const TAIL_SECONDS_STEP = 0.5;
 import { Text } from "@components/Text";
 import { Textarea } from "@components/Textarea";
 import {
@@ -26,6 +28,7 @@ type Props = {
   isDisabled: boolean;
   onChange: (sequential: ResolvedSequentialShotConfig) => void;
   testIdSuffix: string | number;
+  allowVideoTail?: boolean;
 };
 
 export const ShotSequentialControls: React.FC<Props> = ({
@@ -34,7 +37,8 @@ export const ShotSequentialControls: React.FC<Props> = ({
   predecessorShot,
   isDisabled,
   onChange,
-  testIdSuffix
+  testIdSuffix,
+  allowVideoTail = false
 }) => {
   const { t } = useTranslation();
   const hasOwnAppendix = sequential.prompt_appendix.trim() !== "";
@@ -89,6 +93,7 @@ export const ShotSequentialControls: React.FC<Props> = ({
           sequential.enabled ? sequential.mode : SEQUENTIAL_CONTINUATION_OFF
         }
         isDisabled={isDisabled}
+        allowVideoTail={allowVideoTail}
         onChange={(continuation) =>
           onChange(withSequentialContinuation(sequential, continuation))
         }
@@ -105,6 +110,25 @@ export const ShotSequentialControls: React.FC<Props> = ({
 
       {sequential.enabled && (
         <>
+          {sequential.mode === "last_chunk" && (
+            <>
+              <ShotSequentialNumberInput
+                label={t("script_project.sequential_chunk_seconds.label")}
+                value={sequential.chunk_seconds ?? 2}
+                min={allowVideoTail ? 2 : LEGACY_MIN_TAIL_SECONDS}
+                max={10}
+                step={TAIL_SECONDS_STEP}
+                isDisabled={isDisabled}
+                onSave={(chunk_seconds) =>
+                  onChange({ ...sequential, chunk_seconds })
+                }
+                testId={`shot-sequential-tail-seconds-${testIdSuffix}`}
+              />
+              <Text variant="xs" color="glyph-tertiary">
+                {t("script_project.sequential_video_tail_hint.label")}
+              </Text>
+            </>
+          )}
           {showsKeyFrameCount && (
             <ShotSequentialNumberInput
               label={t("script_project.sequential_key_frame_count.label")}

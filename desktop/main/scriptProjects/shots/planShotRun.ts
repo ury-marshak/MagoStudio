@@ -3,6 +3,12 @@ import {
   FAL_SHOT_PROVIDER,
   hasRawNumberedReferenceOverflow
 } from "../../../shared/falShotModel";
+import {
+  FAL_VIDEO_TAIL_PROFILE,
+  FAL_VIDEO_TAIL_MIN_SECONDS,
+  videoTailProvenanceSchema
+} from "../../../shared/falVideoTail";
+import { falVideoTailEstimate } from "../../../shared/falVideoTailPricing";
 import { textOf } from "../../vlm/dialogue";
 import { changedFields, fingerprint } from "../renderSpec";
 
@@ -411,15 +417,14 @@ export const planShotRun = ({
     }
     if (
       sequential?.mode === "last_chunk" &&
-      videoSettings.render_provider === FAL_SHOT_PROVIDER
+      videoSettings.render_provider === FAL_SHOT_PROVIDER &&
+      Number(sequential.chunk_seconds) < FAL_VIDEO_TAIL_MIN_SECONDS
     ) {
       blocked.push({
         ...reference,
         missing: [],
-        reason_code: "fal_sequential_unsupported",
-        reason:
-          "Previous-shot video inputs (last_chunk) are unavailable with H3 Max (fal); " +
-          "use last_frame or key_frames instead"
+        reason_code: "fal_video_tail_invalid",
+        reason: "H3 Max (fal) requires a 2–10 second predecessor tail"
       });
       continue;
     }
@@ -471,6 +476,10 @@ export const planShotRun = ({
       }
       sequentialSpec = {
         ...sequentialFingerprint(sequential),
+        ...(videoSettings.render_provider === FAL_SHOT_PROVIDER &&
+        sequential.mode === "last_chunk"
+          ? { tail_preparation: FAL_VIDEO_TAIL_PROFILE }
+          : {}),
         prev_key: previous.key ?? previous.sequence_id,
         ...(previousInRun ? {} : { prev_asset_id: previousAssetId })
       };
@@ -540,6 +549,44 @@ export const planShotRun = ({
       continue;
     }
     const spec = shotSpec(renderShot, shotSettings, outputSize, sequentialSpec);
+    if (
+      videoSettings.render_provider === FAL_SHOT_PROVIDER &&
+      sequential?.mode === "last_chunk" &&
+      !previousInRun
+    ) {
+      // Reuse an immutable prepared binding only if all unprepared inputs match.
+      for (const version of records(
+        cutByTimeline.get(timelineId)?.versions
+      ).reverse()) {
+        if (
+          version.ready !== true ||
+          !isRecord(version.render_spec) ||
+          !isRecord(version.render_spec.sequential)
+        )
+          continue;
+        const { prepared_video, ...baseSequential } =
+          version.render_spec.sequential;
+        if (
+          !isRecord(prepared_video) ||
+          typeof prepared_video.asset_id !== "string" ||
+          !prepared_video.asset_id
+        )
+          continue;
+        const valid = videoTailProvenanceSchema.safeParse(
+          prepared_video.provenance
+        );
+        if (
+          !valid.success ||
+          valid.data.requested_seconds !== sequential.chunk_seconds
+        )
+          continue;
+        const baseSpec = { ...version.render_spec, sequential: baseSequential };
+        if (fingerprint(baseSpec) === fingerprint(spec)) {
+          spec.sequential = { ...sequentialSpec, prepared_video };
+          break;
+        }
+      }
+    }
     const value = fingerprint(spec);
     // A matching old spec cannot represent the new predecessor render.
     if (
@@ -611,7 +658,23 @@ export const planShotRun = ({
       changed_by_timeline_id: changedByTimelineId,
       duration_ignored: [],
       duration_missing: reported,
-      sequential_ignored: sequentialIgnored
+      sequential_ignored: sequentialIgnored,
+      ...(videoSettings.render_provider === FAL_SHOT_PROVIDER
+        ? {
+            fal_video_tail_estimates: planned
+              .filter((item) => item.sequential?.mode === "last_chunk")
+              .map((item) =>
+                falVideoTailEstimate(
+                  String(item.shot.timeline_id),
+                  isRecord(videoSettings.provider_settings)
+                    ? videoSettings.provider_settings.resolution
+                    : undefined,
+                  item.durationSeconds,
+                  Number(item.sequential?.chunk_seconds)
+                )
+              )
+          }
+        : {})
     },
     planned,
     videoSettings,

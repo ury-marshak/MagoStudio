@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { falVideoTailEstimateSchema } from "../../desktop/shared/falVideoTailPricing";
+
 /** An asset URL is trusted by the app to be fetched and assigned to media sources. Cloud HTTPS
  * and the desktop's isolated local-media protocol are accepted; everything else is treated as
  * absent rather than passed through to `fetch()` or an `<img>`/`<video>` src. */
@@ -180,7 +182,8 @@ export type SheetGroup = z.infer<typeof SheetGroupSchema>;
  * preceding Shot — the backend exposes no way to name a different one. */
 export const SEQUENTIAL_SHOT_MODE_VALUES = [
   "last_frame",
-  "key_frames"
+  "key_frames",
+  "last_chunk"
 ] as const;
 
 const SequentialShotModeSchema = z
@@ -546,6 +549,7 @@ const SequentialBlockedReasonCodeSchema = z
   .enum([
     "unsupported_engine",
     "fal_sequential_unsupported",
+    "fal_video_tail_invalid",
     "raw_reference_overflow",
     "predecessor_not_rendered",
     "unsupported_sequential_mode",
@@ -588,6 +592,7 @@ export const ShotGenerateResultSchema = z.object({
     .default([]),
   changed: z.record(z.string(), z.array(z.string())).default({}),
   changed_by_timeline_id: z.record(z.string(), z.array(z.string())).default({}),
+  fal_video_tail_estimates: z.array(falVideoTailEstimateSchema).optional(),
   plan_id: z.string().nullable().optional()
 });
 

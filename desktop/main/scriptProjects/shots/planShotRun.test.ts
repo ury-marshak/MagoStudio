@@ -156,24 +156,53 @@ describe("planShotRun fal sequential frames", () => {
     }
   );
 
-  it("blocks previous-shot video inputs with an actionable reason", () => {
+  it("plans a video tail with an independent modality and sourced pricing examples", () => {
     const run = plan(
       [shot(1), shot(2, { sequential: { enabled: true, mode: "last_chunk" } })],
       { videoSettings: FAL_SETTINGS },
       { cutShots: [rendered("shot-1", "old")] }
     );
-    expect(run.preview.would_run_timeline_ids).toEqual(["shot-1"]);
-    expect(run.preview.blocked).toEqual([
+    expect(run.preview.would_run_timeline_ids).toEqual(["shot-1", "shot-2"]);
+    expect(run.preview.blocked).toEqual([]);
+    expect(run.planned[1]?.renderSpec.spec).toMatchObject({
+      sequential: {
+        mode: "last_chunk",
+        chunk_seconds: 2,
+        tail_preparation: "h3-tail-cfr-720p-v1"
+      }
+    });
+    expect(run.preview.fal_video_tail_estimates).toEqual([
       expect.objectContaining({
         timeline_id: "shot-2",
-        reason_code: "fal_sequential_unsupported",
-        reason: expect.stringContaining("Previous-shot video inputs")
+        resolution: "768P",
+        output_base_usd: 0.48,
+        example_reference_min_usd: 0.16
       })
     ]);
-    expect((run.preview.blocked as { reason: string }[])[0]!.reason).toContain(
-      "use last_frame or key_frames"
-    );
   });
+
+  it.each([0.5, 1, 1.99])(
+    "blocks a fal tail below two seconds (%s) with a typed reason",
+    (seconds) => {
+      const run = plan(
+        [
+          shot(1),
+          shot(2, {
+            sequential: {
+              enabled: true,
+              mode: "last_chunk",
+              chunk_seconds: seconds
+            }
+          })
+        ],
+        { videoSettings: FAL_SETTINGS },
+        { cutShots: [rendered("shot-1", "old")] }
+      );
+      expect(run.preview.blocked).toMatchObject([
+        { timeline_id: "shot-2", reason_code: "fal_video_tail_invalid" }
+      ]);
+    }
+  );
 
   it.each([...FRAME_MODES, { mode: "last_chunk" }])(
     "ignores $mode continuity on the first shot",

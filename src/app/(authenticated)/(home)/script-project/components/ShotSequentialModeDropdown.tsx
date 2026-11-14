@@ -12,6 +12,7 @@ type Props = {
   isDisabled: boolean;
   onChange: (nextContinuation: SequentialContinuation) => void;
   testId?: string;
+  allowVideoTail?: boolean;
 };
 
 const SEQUENTIAL_CONTINUATIONS: SequentialContinuation[] = [
@@ -23,7 +24,8 @@ export const ShotSequentialModeDropdown: React.FC<Props> = ({
   continuation,
   isDisabled,
   onChange,
-  testId
+  testId,
+  allowVideoTail = false
 }) => {
   const { t } = useTranslation();
 
@@ -36,7 +38,12 @@ export const ShotSequentialModeDropdown: React.FC<Props> = ({
         aria-label={t("script_project.sequential_mode_input.label")}
         isDisabled={isDisabled}
         selectedKey={continuation}
-        items={SEQUENTIAL_CONTINUATIONS.map((sequentialContinuation) => ({
+        items={SEQUENTIAL_CONTINUATIONS.filter(
+          (mode) =>
+            mode !== "last_chunk" ||
+            allowVideoTail ||
+            continuation === "last_chunk"
+        ).map((sequentialContinuation) => ({
           key: sequentialContinuation,
           label: t(
             `script_project.sequential_mode_${sequentialContinuation}.label`

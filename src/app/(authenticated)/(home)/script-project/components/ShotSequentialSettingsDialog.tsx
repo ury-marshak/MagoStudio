@@ -22,6 +22,7 @@ type Props = {
   onSaveSequential: (sequential: SequentialShotConfig) => void;
   onClose: () => void;
   testIdSuffix: string | number;
+  allowVideoTail?: boolean;
 };
 
 export const ShotSequentialSettingsDialog: React.FC<Props> = ({
@@ -31,7 +32,8 @@ export const ShotSequentialSettingsDialog: React.FC<Props> = ({
   isDisabled,
   onSaveSequential,
   onClose,
-  testIdSuffix
+  testIdSuffix,
+  allowVideoTail = false
 }) => {
   const { t } = useTranslation();
   const [savedSequential] = useState(() =>
@@ -71,6 +73,7 @@ export const ShotSequentialSettingsDialog: React.FC<Props> = ({
           sequentialPromptDefaults={sequentialPromptDefaults}
           predecessorShot={predecessorShot}
           isDisabled={isDisabled}
+          allowVideoTail={allowVideoTail}
           onChange={setDraftSequential}
           testIdSuffix={testIdSuffix}
         />

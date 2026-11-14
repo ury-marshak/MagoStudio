@@ -1015,3 +1015,216 @@ it("recovers an accepted H3 Max shot automatically and leaves later shots unsubm
     fetchMock.mock.calls.filter(([target]) => target === shotQueue)
   ).toHaveLength(2);
 });
+
+describe("typed render inputs", () => {
+  const typed = {
+    ...input,
+    kind: "video" as const,
+    endpoint: "minimax/h3-max/reference-to-video",
+    inputAssetIds: ["portrait", "tail"],
+    assetInputs: [
+      {
+        field: "reference_image_urls",
+        kind: "image" as const,
+        assetIds: ["portrait"]
+      },
+      {
+        field: "reference_video_urls",
+        kind: "video" as const,
+        assetIds: ["tail"]
+      }
+    ]
+  };
+
+  const seedInputs = async () => {
+    for (const [id, extension, type] of [
+      ["portrait", "png", "image"],
+      ["tail", "mp4", "video"]
+    ] as const) {
+      const sourcePath = path.join(directory, `${id}.${extension}`);
+      await writeFile(sourcePath, `${id}-bytes`);
+      await manager
+        .get()
+        .insert(assets)
+        .values({ id, name: id, type, sourcePath });
+      await manager
+        .get()
+        .insert(projectAssets)
+        .values({ projectId: input.projectId, assetId: id });
+    }
+  };
+
+  it("uploads ordered image/video groups with their MIME types and recovers the immutable payload", async () => {
+    await seedInputs();
+    for (const [id, extension, type] of [
+      ["portrait", "png", "image/png"],
+      ["tail", "mp4", "video/mp4"]
+    ]) {
+      fetchMock.mockImplementationOnce(async (_target, options) => {
+        if (typeof options?.body !== "string")
+          throw new Error("Expected upload JSON");
+        expect(JSON.parse(options.body)).toEqual({
+          file_name: `${id}.${extension}`,
+          content_type: type
+        });
+        return Response.json({
+          file_url: `https://v3.fal.media/${id}.${extension}`,
+          upload_url: `https://v3.fal.media/upload/${id}`
+        });
+      });
+      fetchMock.mockImplementationOnce(async (_target, options) => {
+        expect(options?.headers).toEqual({ "Content-Type": type });
+        const body = options?.body;
+        if (!(body instanceof Blob)) throw new Error("Expected upload Blob");
+        expect(await body.text()).toBe(`${id}-bytes`);
+        expect(await jobs.get(input.id)).toBeNull();
+        return new Response(null);
+      });
+    }
+    fetchMock.mockResolvedValueOnce(queued());
+    const submitted = await service.submit(typed);
+    expect(submitted.inputAssetIds).toEqual(["portrait", "tail"]);
+    expect(submitted.requestJson).toEqual({
+      ...input.requestJson,
+      reference_image_urls: ["https://v3.fal.media/portrait.png"],
+      reference_video_urls: ["https://v3.fal.media/tail.mp4"]
+    });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      `https://queue.fal.run/${typed.endpoint}`,
+      expect.objectContaining({ body: JSON.stringify(submitted.requestJson) })
+    );
+    manager.close();
+    await manager.open(directory);
+    await rm(path.join(directory, "tail.mp4"));
+    fetchMock.mockResolvedValueOnce(
+      Response.json({ status: "COMPLETED", request_id: requestId })
+    );
+    fetchMock.mockResolvedValueOnce(
+      Response.json({ video: { url: "https://v3.fal.media/output.mp4" } })
+    );
+    await expect(service.refresh(input.id)).resolves.toMatchObject({
+      status: "OUTPUT_READY",
+      requestJson: submitted.requestJson
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(7);
+  });
+
+  it("preflights every modality before uploading anything", async () => {
+    await seedInputs();
+    await expect(
+      service.submit({
+        ...typed,
+        assetInputs: [
+          typed.assetInputs[0]!,
+          { ...typed.assetInputs[1]!, kind: "image" }
+        ]
+      })
+    ).rejects.toThrow("image is unavailable");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await jobs.get(input.id)).toBeNull();
+  });
+
+  it.each([
+    {
+      assetInputs: [
+        {
+          field: "reference_image_urls",
+          kind: "image" as const,
+          assetIds: ["tail", "portrait"]
+        }
+      ]
+    },
+    {
+      assetInputs: [
+        { field: "reference_image_urls", kind: "image" as const, assetIds: [] }
+      ]
+    },
+    {
+      assetInputs: typed.assetInputs.map((group) => ({
+        ...group,
+        field: "reference_image_urls"
+      }))
+    },
+    {
+      assetInputs: typed.assetInputs.map((group) => ({
+        ...group,
+        field: "__proto__"
+      }))
+    },
+    { assetInputs: [] },
+    { assetUrlField: "image_urls" }
+  ])(
+    "rejects inconsistent input mappings before any request: %j",
+    async (override) => {
+      await expect(service.submit({ ...typed, ...override })).rejects.toThrow();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(readKey).not.toHaveBeenCalled();
+      expect(await jobs.get(input.id)).toBeNull();
+    }
+  );
+
+  it("does not submit or persist a generation when a video upload fails", async () => {
+    await seedInputs();
+    fetchMock
+      .mockResolvedValueOnce(
+        Response.json({
+          file_url: "https://v3.fal.media/image.png",
+          upload_url: "https://v3.fal.media/upload/image"
+        })
+      )
+      .mockResolvedValueOnce(new Response(null))
+      .mockResolvedValueOnce(
+        Response.json({
+          file_url: "https://v3.fal.media/tail.mp4",
+          upload_url: "https://v3.fal.media/upload/tail"
+        })
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 500 }));
+    await expect(service.submit(typed)).rejects.toThrow(
+      "upload returned HTTP 500"
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(await jobs.get(input.id)).toBeNull();
+  });
+
+  it("cancels between modalities without a generation POST", async () => {
+    await seedInputs();
+    const controller = new AbortController();
+    fetchMock
+      .mockResolvedValueOnce(
+        Response.json({
+          file_url: "https://v3.fal.media/image.png",
+          upload_url: "https://v3.fal.media/upload/image"
+        })
+      )
+      .mockImplementationOnce(async () => {
+        controller.abort();
+        return new Response(null);
+      });
+    await expect(
+      service.submit(typed, controller.signal)
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(await jobs.get(input.id)).toBeNull();
+  });
+
+  it("does not resolve a known wrong-modality asset through the script fallback", async () => {
+    await seedInputs();
+    const resolve = vi.fn(async () => path.join(directory, "tail.mp4"));
+    const assetsWithFallback = new ExternalRenderAssets(
+      manager,
+      async () => directory,
+      resolve
+    );
+    await expect(
+      assetsWithFallback.input(input.projectId, "tail", "image")
+    ).rejects.toThrow("image is unavailable");
+    expect(resolve).not.toHaveBeenCalled();
+    await expect(
+      transfer.input(input.projectId, "tail", "video")
+    ).resolves.toMatchObject({
+      name: "tail.mp4",
+      file: expect.objectContaining({ type: "video/mp4" })
+    });
+  });
+});

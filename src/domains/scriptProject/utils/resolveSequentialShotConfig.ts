@@ -13,6 +13,7 @@ export type ResolvedSequentialShotConfig = {
   enabled: boolean;
   mode: SequentialShotMode;
   num_select: number;
+  chunk_seconds?: number;
   prompt_appendix: string;
   opening_frame: SequentialOpeningFrame;
 };
@@ -23,6 +24,9 @@ export const resolveSequentialShotConfig = (
   enabled: sequential?.enabled ?? false,
   mode: sequential?.mode ?? DEFAULT_SEQUENTIAL_SHOT_MODE,
   num_select: sequential?.num_select ?? DEFAULT_SEQUENTIAL_KEY_FRAMES,
+  ...(sequential?.chunk_seconds == null
+    ? {}
+    : { chunk_seconds: sequential.chunk_seconds }),
   prompt_appendix: sequential?.prompt_appendix ?? "",
   opening_frame: sequential?.opening_frame ?? DEFAULT_SEQUENTIAL_OPENING_FRAME
 });

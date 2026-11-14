@@ -105,6 +105,7 @@ import { FAL_SHOT_ENGINE } from "../../../../../../desktop/shared/falShotModel";
 
 import { AddShotDialog } from "./AddShotDialog";
 import { EarlierScriptVersionToggle } from "./EarlierScriptVersionToggle";
+import { FalVideoTailCostNote } from "./FalVideoTailCostNote";
 import { GenerateRunButton } from "./GenerateRunButton";
 import { useScenesLayout } from "./hooks/useScenesLayout";
 import {
@@ -860,6 +861,12 @@ export const ShotsTab: React.FC<Props> = ({
             shot={shotEditingSequentialSettings}
             predecessorShot={predecessorOfShotEditingSequentialSettings}
             sequentialPromptDefaults={projectState.sequential_prompt_defaults}
+            allowVideoTail={
+              isLocalProject &&
+              (shotModelOverrides[
+                shotOverridePrefix + shotEditingSequentialSettings.timeline_id
+              ] ?? shotProvider) === FAL_SHOT_PROVIDER
+            }
             isDisabled={
               isEditingShot ||
               renderingShotTimelineIds.has(
@@ -987,6 +994,11 @@ export const ShotsTab: React.FC<Props> = ({
         )}
         {isVideoViewSelected && (
           <div className="flex min-w-0 flex-1 flex-wrap items-end justify-end gap-3 [&>*]:shrink-0">
+            {isFalSelected && !isSequentialSuspendedForRun && (
+              <FalVideoTailCostNote
+                estimates={dryRun?.fal_video_tail_estimates ?? []}
+              />
+            )}
             {cutShotsInActiveScript.length > 0 && (
               <Text variant="xs" color="glyph-secondary">
                 {t("script_project.cut_membership_count.label", {
@@ -1396,6 +1408,18 @@ export const ShotsTab: React.FC<Props> = ({
                                 }
                                 disabled={isRunActive || isGeneratingShots}
                               />
+                              {actionUsesFal &&
+                                !isSequentialSuspendedForRun && (
+                                  <FalVideoTailCostNote
+                                    estimates={
+                                      actionDryRun?.fal_video_tail_estimates?.filter(
+                                        (estimate) =>
+                                          estimate.timeline_id ===
+                                          shot.timeline_id
+                                      ) ?? []
+                                    }
+                                  />
+                                )}
                             </div>
                           ) : (
                             <ShotRenderSpeedSwitch

@@ -12,6 +12,7 @@ import { ProjectRepository } from "../database/projectRepository";
 import { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import * as media from "../scriptProjects/localScriptMedia";
 import { LocalScriptProjectService } from "../scriptProjects/localScriptProjectService";
+import * as tails from "../scriptProjects/prepareVideoTail";
 import { fingerprint } from "../scriptProjects/renderSpec";
 import { defaultSequentialAppendix } from "../scriptProjects/shots/sequentialContinuation";
 import { sceneFingerprint } from "../scriptProjects/storyboards/storyboard";
@@ -248,10 +249,10 @@ beforeEach(async () => {
       if (typeof options.body !== "string")
         throw new Error("Expected upload initiation JSON");
       const body = JSON.parse(options.body) as { file_name: string };
-      const id = path.basename(body.file_name, ".png");
+      const id = path.basename(body.file_name, path.extname(body.file_name));
       uploadIds.push(id);
       return Response.json({
-        file_url: `${cdn}/input/${id}.png`,
+        file_url: `${cdn}/input/${body.file_name}`,
         upload_url: `${cdn}/upload/${id}`
       });
     }
@@ -908,5 +909,476 @@ describe("fal sequential frame integration", () => {
     expect(uploadIds).toEqual([]);
     expect(submissions).toEqual([]);
     expect(rows((await cutShots())[1]!.versions)).toEqual([]);
+  });
+});
+
+describe("fal sequential video-tail integration", () => {
+  const tailStep = (plan: Row) => row(step(plan, "shot_video_source").result);
+  beforeEach(async () => {
+    const filename = path.join(directory, "long-predecessor.mp4");
+    execFileSync(ffmpegPath!, [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=64x48:rate=12:duration=4",
+      "-c:v",
+      "libx264",
+      filename
+    ]);
+    video = await readFile(filename);
+    source = await snapshots.storeGeneratedMedia(projectId, video, "mp4");
+    external.mockResolvedValue({
+      model: "mock/composer",
+      text: JSON.stringify({
+        subject_definitions:
+          "{{subject:hero}} is the courier in {{ref:hero}}. {{video:prev_shot_video}} shows the preceding motion.",
+        summary: "[video continuation] The courier keeps walking.",
+        retention_analysis:
+          "{{ref:hero}}: weak_reference - courier appearance. {{video:prev_shot_video}}: weak_reference - continue its motion.",
+        detailed_description:
+          "[Shot 1] The courier keeps walking by the door, continuing from {{video:prev_shot_video}}.",
+        overall_soundscape: "Room tone.",
+        non_diegetic_music: "N/A"
+      })
+    });
+  });
+
+  it.each(["raw", "mago"])(
+    "submits separate ordered image/video lists with %s prompts and persists trim provenance",
+    async (rewrite) => {
+      await seed({ mode: "last_chunk", chunk_seconds: 2.5 });
+      const prepare = vi.spyOn(tails, "prepareVideoTail");
+      const input = request(rewrite);
+      const preview = await director.generateShots({
+        ...input,
+        isDryRun: true
+      });
+      expect(preview).toMatchObject({
+        would_run_timeline_ids: ["shot-2"],
+        blocked: [],
+        fal_video_tail_estimates: [
+          expect.objectContaining({ timeline_id: "shot-2" })
+        ]
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(prepare).not.toHaveBeenCalled();
+      const generated = await director.generateShots({
+        ...input,
+        videoSettings: {
+          ...input.videoSettings,
+          provider_settings: { resolution: "480P" }
+        }
+      });
+      const plan = await waitPlan(String(generated.plan_id), "COMPLETED");
+      const prepared = tailStep(plan);
+      const provenance = row(prepared.continues_from);
+      const tailId = String(prepared.shot_reference_video_id);
+      expect(provenance).toMatchObject({
+        timeline_id: "shot-1",
+        asset_id: source.id,
+        reference_asset_id: tailId,
+        mode: "last_chunk",
+        tail_provenance: {
+          requested_seconds: 2.5,
+          source_frame_count: 48,
+          source_fps: 12,
+          start_frame: 18,
+          selected_frame_count: 30,
+          output_frame_count: 60,
+          output_fps: 24,
+          output_duration_seconds: 2.5,
+          audio: false
+        }
+      });
+      expect(prepare).toHaveBeenCalledExactlyOnceWith(
+        source.path,
+        2.5,
+        expect.any(AbortSignal)
+      );
+      const job = await jobFor(plan);
+      expect(job.requestJson).toMatchObject({
+        duration: 5,
+        resolution: "480P",
+        reference_image_urls: [`${cdn}/input/${hero.id}.png`],
+        reference_video_urls: [`${cdn}/input/${tailId}.mp4`]
+      });
+      expect(job.requestJson).not.toHaveProperty("reference_conditions");
+      expect(job.inputAssetIds).toEqual([hero.id, tailId]);
+      expect(uploadIds).toEqual([hero.id, tailId]);
+      expect(job.requestJson.prompt).toContain("Video 1");
+      expect(job.requestJson.prompt).not.toMatch(/Image 2|<Video|<Picture/);
+      const initiate = fetchMock.mock.calls.filter(([url]) => url === storage);
+      const initiatedBody = initiate[1]![1]!.body;
+      if (typeof initiatedBody !== "string")
+        throw new Error("Expected upload JSON");
+      expect(JSON.parse(initiatedBody).content_type).toBe("video/mp4");
+      expect(uploaded.get(tailId)).toEqual(
+        await readFile((await snapshots.resolveMediaPath(tailId, projectId))!)
+      );
+      const rendered = await version();
+      expect(rendered).toMatchObject({
+        continues_from: provenance,
+        render_spec: {
+          sequential: {
+            prev_asset_id: source.id,
+            tail_preparation: "h3-tail-cfr-720p-v1",
+            prepared_video: {
+              asset_id: tailId,
+              provenance: provenance.tail_provenance
+            }
+          }
+        },
+        metrics_input: {
+          reference_asset_ids: [hero.id],
+          reference_video_asset_ids: [tailId]
+        },
+        input_settings: {
+          reference_video_inputs: [
+            { asset_id: tailId, provenance: provenance.tail_provenance }
+          ]
+        }
+      });
+      expect(rendered.fingerprint).toBe(fingerprint(row(rendered.render_spec)));
+      const unchanged = await director.generateShots({
+        ...input,
+        isDryRun: true,
+        videoSettings: {
+          ...input.videoSettings,
+          provider_settings: { resolution: "480P" }
+        }
+      });
+      expect(unchanged.would_run_timeline_ids).toEqual([]);
+      const changed = await director.generateShots({
+        ...input,
+        isDryRun: true,
+        videoSettings: {
+          ...input.videoSettings,
+          provider_settings: { resolution: "480P" }
+        },
+        sequential: {
+          shots: {
+            "shot-2": { enabled: true, mode: "last_chunk", chunk_seconds: 3 }
+          }
+        }
+      });
+      expect(changed.would_run_timeline_ids).toEqual(["shot-2"]);
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(submissions).toHaveLength(1);
+      if (rewrite === "mago")
+        expect(row(step(plan, "poll_shot_video_prompt").result)).toMatchObject({
+          numbered_ref_asset_ids: [hero.id],
+          numbered_video_asset_ids: [tailId],
+          fallback: false
+        });
+    }
+  );
+
+  it("supports video-only continuation without inventing an image slot", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 });
+    const snapshot = (await snapshots.get(projectId))!;
+    rows(snapshot.state!.shots)[1]!.references = {};
+    rows(snapshot.state!.shots)[1]!.tags = {};
+    rows(snapshot.state!.shots)[1]!.video_prompt =
+      "Continue the courier walking from Video 1.";
+    await snapshots.put({ projectId, state: snapshot.state! });
+    const generated = await director.generateShots(request());
+    const plan = await waitPlan(String(generated.plan_id), "COMPLETED");
+    const job = await jobFor(plan);
+    expect(job.requestJson).not.toHaveProperty("reference_image_urls");
+    expect(job.inputAssetIds).toEqual([tailStep(plan).shot_reference_video_id]);
+    expect(job.requestJson.reference_video_urls).toHaveLength(1);
+  });
+
+  it("reuses prepared video and a frozen predecessor after an upload failure", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 });
+    const prepare = vi.spyOn(tails, "prepareVideoTail");
+    fetchMock.mockRejectedValueOnce(new Error("upload connection lost"));
+    const generated = await director.generateShots(request("mago"));
+    const planId = String(generated.plan_id);
+    const paused = await waitPlan(planId, "PAUSED");
+    const prepared = structuredClone(tailStep(paused));
+    expect(await jobFor(paused)).toBeNull();
+    await rm(source.path);
+    const snapshot = (await snapshots.get(projectId))!;
+    rows(snapshot.cut!.shots)[0]!.pinned_asset_id = "changed-pin";
+    await snapshots.put({ projectId, cut: snapshot.cut! });
+    await director.resumePlan(planId);
+    const completed = await waitPlan(planId, "COMPLETED");
+    expect(tailStep(completed)).toEqual(prepared);
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(external).toHaveBeenCalledTimes(1);
+    expect(submissions).toHaveLength(1);
+  });
+
+  it("recovers an accepted tail job with all local inputs deleted and pauses before later work", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 }, [shot(3)]);
+    const prepare = vi.spyOn(tails, "prepareVideoTail");
+    offline = true;
+    const generated = await director.generateShots(
+      request("mago", ["shot-2", "shot-3"])
+    );
+    const planId = String(generated.plan_id);
+    const paused = await waitPlan(planId, "PAUSED");
+    const prepared = structuredClone(tailStep(paused));
+    const accepted = await jobFor(paused);
+    const snapshot = (await snapshots.get(projectId))!;
+    rows(snapshot.cut!.shots)[0]!.pinned_asset_id = "new-pin";
+    await snapshots.put({ projectId, cut: snapshot.cut! });
+    for (const id of [source.id, ...accepted.inputAssetIds])
+      await rm((await snapshots.resolveMediaPath(id, projectId))!);
+    const before = fetchMock.mock.calls.length;
+    manager.close();
+    await manager.open(directory);
+    director = makeDirector();
+    offline = false;
+    await director.recoverExternalRenderPlans();
+    await vi.waitFor(
+      async () =>
+        expect(await director.getPlan(planId)).toMatchObject({
+          status: "PAUSED",
+          steps: expect.arrayContaining([
+            expect.objectContaining({
+              timeline_id: "shot-2",
+              tool_name: "poll_video_render",
+              status: "COMPLETED"
+            })
+          ])
+        }),
+      { timeout: 10000, interval: 20 }
+    );
+    const recovered = (await director.getPlan(planId))!;
+    expect(tailStep(recovered)).toEqual(prepared);
+    expect(await jobFor(recovered)).toMatchObject({
+      status: "INGESTED",
+      requestId: accepted.requestId,
+      requestJson: accepted.requestJson,
+      inputAssetIds: accepted.inputAssetIds
+    });
+    expect(
+      fetchMock.mock.calls
+        .slice(before)
+        .every(([, options]) => options?.method === "GET" || !options?.method)
+    ).toBe(true);
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(external).toHaveBeenCalledTimes(1);
+    expect(submissions).toHaveLength(1);
+    expect(rows((await cutShots())[2]!.versions)).toEqual([]);
+    expect((await version()).metrics_input).toMatchObject({
+      reference_asset_ids: [hero.id],
+      reference_video_asset_ids: [prepared.shot_reference_video_id]
+    });
+  });
+
+  it("binds the same-run predecessor result even after repinning, and unchanged inputs subsequently skip", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 });
+    const snapshot = (await snapshots.get(projectId))!;
+    rows(snapshot.state!.shots)[0]!.duration_s = 5;
+    await snapshots.put({ projectId, state: snapshot.state! });
+    const putPlan = snapshots.putPlan.bind(snapshots);
+    let predecessorId: string | undefined;
+    vi.spyOn(snapshots, "putPlan").mockImplementation(
+      async (project, id, plan) => {
+        await putPlan(project, id, plan);
+        const finished = step(plan, "poll_video_render", "shot-1");
+        if (!predecessorId && finished?.status === "COMPLETED") {
+          predecessorId = String(row(finished.result).render_asset_id);
+          const snapshot = (await snapshots.get(projectId))!;
+          rows(snapshot.cut!.shots)[0]!.pinned_asset_id = source.id;
+          rows(snapshot.cut!.shots)[0]!.asset_id = source.id;
+          await snapshots.put({ projectId, cut: snapshot.cut! });
+        }
+      }
+    );
+    const generated = await director.generateShots(
+      request("raw", ["shot-1", "shot-2"])
+    );
+    const completed = await waitPlan(String(generated.plan_id), "COMPLETED");
+    expect(predecessorId).toBeTruthy();
+    expect(predecessorId).not.toBe(source.id);
+    expect(row(tailStep(completed).continues_from).asset_id).toBe(
+      predecessorId
+    );
+    const current = (await snapshots.get(projectId))!;
+    rows(current.cut!.shots)[0]!.pinned_asset_id = predecessorId;
+    rows(current.cut!.shots)[0]!.asset_id = predecessorId;
+    await snapshots.put({ projectId, cut: current.cut! });
+    const preview = await director.generateShots({
+      ...request(),
+      isDryRun: true
+    });
+    expect(preview.would_run_timeline_ids).toEqual([]);
+    expect(submissions).toHaveLength(2);
+  });
+
+  it("fails closed on missing accepted-job trim provenance without polling or submitting again", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 });
+    offline = true;
+    const generated = await director.generateShots(request());
+    const planId = String(generated.plan_id);
+    const paused = await waitPlan(planId, "PAUSED");
+    delete row(tailStep(paused).continues_from).tail_provenance;
+    await snapshots.putPlan(projectId, planId, paused);
+    const before = fetchMock.mock.calls.length;
+    offline = false;
+    await director.resumePlan(planId);
+    await waitPlan(planId, "PAUSED");
+    expect(fetchMock).toHaveBeenCalledTimes(before);
+    expect(submissions).toHaveLength(1);
+  });
+
+  it("cancels preparation before any upload or text composition", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 });
+    const prepare = vi.spyOn(tails, "prepareVideoTail").mockImplementation(
+      async (_file, _seconds, signal) =>
+        new Promise((_resolve, reject) =>
+          signal!.addEventListener("abort", () => reject(signal!.reason), {
+            once: true
+          })
+        )
+    );
+    const generated = await director.generateShots(request("mago"));
+    const planId = String(generated.plan_id);
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledTimes(1));
+    await director.cancelPlan(planId);
+    await waitPlan(planId, "CANCELLED");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(external).not.toHaveBeenCalled();
+  });
+
+  it("refuses a predecessor below two seconds before upload", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 });
+    const filename = path.join(directory, "too-short.mp4");
+    execFileSync(ffmpegPath!, [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=64x48:rate=24:duration=1",
+      "-c:v",
+      "libx264",
+      filename
+    ]);
+    await writeFile(source.path, await readFile(filename));
+    const generated = await director.generateShots(request());
+    const plan = await waitPlan(String(generated.plan_id), "PAUSED");
+    expect(plan).toMatchObject({
+      error: { message: expect.stringContaining("shorter than the 2-second") }
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(external).not.toHaveBeenCalled();
+  });
+  it("keeps overflow grids, storyboard and Video 1 numbering independent", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 });
+    const snapshot = (await snapshots.get(projectId))!;
+    const successor = rows(snapshot.state!.shots)[1]!;
+    const props = await Promise.all(
+      Array.from({ length: 9 }, async (_, i) => {
+        const image = await snapshots.storeGeneratedMedia(
+          projectId,
+          Buffer.concat([png, Buffer.from(`tail-prop-${i}`)]),
+          "png"
+        );
+        return { token: `prop-${i}`, asset_id: image.id };
+      })
+    );
+    successor.references = {
+      characters: [{ token: "hero", asset_id: hero.id }],
+      props
+    };
+    successor.tags = {
+      characters: ["hero"],
+      props: props.map((item) => item.token)
+    };
+    const keys = rows(snapshot.state!.keys);
+    keys.push(
+      ...props.map((item) => ({
+        token: item.token,
+        name: item.token,
+        description: "Parcel"
+      }))
+    );
+    const board = await snapshots.storeGeneratedMedia(
+      projectId,
+      Buffer.concat([png, Buffer.from("tail-board")]),
+      "png"
+    );
+    keys.push({
+      token: "storyboard_shot_2",
+      role: "storyboard",
+      timeline_id: "shot-2",
+      images: [
+        {
+          asset_id: board.id,
+          status: "available",
+          panel_count: 1,
+          storyboard_scene_fingerprint: sceneFingerprint(successor, keys)
+        }
+      ]
+    });
+    await snapshots.put({ projectId, state: snapshot.state! });
+    const generated = await director.generateShots(request("mago"));
+    const plan = await waitPlan(String(generated.plan_id), "COMPLETED");
+    const job = await jobFor(plan);
+    const tailId = String(tailStep(plan).shot_reference_video_id);
+    expect(job.requestJson.reference_image_urls).toHaveLength(9);
+    expect(job.inputAssetIds.at(-2)).toBe(board.id);
+    expect(job.inputAssetIds.at(-1)).toBe(tailId);
+    expect(job.inputAssetIds).toHaveLength(10);
+    expect(job.requestJson.prompt).toContain("Video 1");
+    expect(job.requestJson.prompt).toContain("panel 1 of Image 9");
+    expect(job.requestJson.prompt).not.toContain("Image 10");
+    expect(row(step(plan, "poll_shot_video_prompt").result)).toMatchObject({
+      numbered_ref_asset_ids: job.inputAssetIds.slice(0, -1),
+      numbered_video_asset_ids: [tailId]
+    });
+  });
+
+  it("uses the out-of-run predecessor frozen in the plan even if repinned before preparation", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 });
+    const original = source;
+    const putPlan = snapshots.putPlan.bind(snapshots);
+    let repinned = false;
+    vi.spyOn(snapshots, "putPlan").mockImplementation(
+      async (project, id, plan) => {
+        await putPlan(project, id, plan);
+        if (!repinned && rows(plan.local_targets ?? []).length) {
+          repinned = true;
+          const snapshot = (await snapshots.get(projectId))!;
+          rows(snapshot.cut!.shots)[0]!.pinned_asset_id = "replacement-pin";
+          rows(snapshot.cut!.shots)[0]!.asset_id = "replacement-pin";
+          await snapshots.put({ projectId, cut: snapshot.cut! });
+        }
+      }
+    );
+    const generated = await director.generateShots(request());
+    const plan = await waitPlan(String(generated.plan_id), "COMPLETED");
+    expect(repinned).toBe(true);
+    expect(row(tailStep(plan).continues_from).asset_id).toBe(original.id);
+  });
+
+  it("fails closed when resuming an unsubmitted legacy tail plan without its preparation profile", async () => {
+    await seed({ mode: "last_chunk", chunk_seconds: 2 });
+    fetchMock.mockRejectedValueOnce(new Error("upload offline"));
+    const generated = await director.generateShots(request());
+    const planId = String(generated.plan_id);
+    const paused = await waitPlan(planId, "PAUSED");
+    const target = rows(paused.local_targets)[0]!;
+    delete row(row(target._local_render_spec).spec).sequential;
+    await snapshots.putPlan(projectId, planId, paused);
+    const before = fetchMock.mock.calls.length;
+    await director.resumePlan(planId);
+    const resumed = await waitPlan(planId, "PAUSED");
+    expect(resumed).toMatchObject({
+      error: {
+        message: expect.stringContaining("predates bounded preparation")
+      }
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(before);
+    expect(submissions).toHaveLength(0);
   });
 });

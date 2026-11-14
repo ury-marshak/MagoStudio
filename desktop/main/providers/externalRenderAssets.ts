@@ -44,36 +44,54 @@ export class ExternalRenderAssets {
     ) => Promise<string | null>
   ) {}
 
-  async input(projectId: string, assetId: string) {
+  async input(
+    projectId: string,
+    assetId: string,
+    kind: "image" | "video" = "image"
+  ) {
     const [asset] = await this.manager
       .get()
       .select({
         sourcePath: assets.sourcePath,
-        relativeSourcePath: assets.relativeSourcePath
+        relativeSourcePath: assets.relativeSourcePath,
+        type: assets.type,
+        active: assets.active,
+        status: assets.status
       })
       .from(projectAssets)
       .innerJoin(assets, eq(assets.id, projectAssets.assetId))
       .where(
-        and(
-          eq(projectAssets.projectId, projectId),
-          eq(assets.id, assetId),
-          eq(assets.active, true),
-          eq(assets.status, "available"),
-          eq(assets.type, "image")
-        )
+        and(eq(projectAssets.projectId, projectId), eq(assets.id, assetId))
       );
+    // A known but unavailable/wrong-modality asset must not fall through to
+    // a script-media resolver and bypass the project asset's state.
+    if (
+      asset &&
+      (!asset.active || asset.status !== "available" || asset.type !== kind)
+    )
+      throw new Error(`Render input ${kind} is unavailable in this project`);
     const source = asset?.relativeSourcePath
       ? path.join(await this.libraryRoot(), asset.relativeSourcePath)
       : (asset?.sourcePath ??
         (await this.resolveScriptMedia?.(assetId, projectId)));
     if (!source)
-      throw new Error("Render input image is unavailable in this project");
+      throw new Error(`Render input ${kind} is unavailable in this project`);
     const name = path.basename(source);
-    const type = imageTypes.get(path.extname(name).toLowerCase());
+    const extension = path.extname(name).toLowerCase();
+    const type =
+      kind === "video"
+        ? extension === ".mp4"
+          ? "video/mp4"
+          : undefined
+        : imageTypes.get(extension);
     if (!type)
-      throw new Error("Render input must be a PNG, JPEG, or WebP image");
+      throw new Error(
+        kind === "video"
+          ? "Render input must be an MP4 video"
+          : "Render input must be a PNG, JPEG, or WebP image"
+      );
     const file = await openAsBlob(source, { type });
-    if (!file.size) throw new Error("Render input image is empty");
+    if (!file.size) throw new Error(`Render input ${kind} is empty`);
     return { file, name };
   }
 

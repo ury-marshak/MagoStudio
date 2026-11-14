@@ -21,6 +21,12 @@ import {
   FAL_SHOT_PROVIDER,
   hasRawNumberedReferenceOverflow
 } from "../../shared/falShotModel";
+import { FAL_VIDEO_TAIL_PROFILE } from "../../shared/falVideoTail";
+import {
+  videoTailProvenanceSchema,
+  type VideoTailProvenance
+} from "../../shared/falVideoTail";
+import { falVideoTailEstimate } from "../../shared/falVideoTailPricing";
 import type { RunCloudTextModel } from "../../shared/textModelRequest";
 import { probeRenderedVideoMetadata } from "../cloud/probeRenderedVideoMetadata";
 import { ProjectRepository } from "../database/projectRepository";
@@ -60,6 +66,7 @@ import {
   extractKeyframeGrid,
   extractLastFrame
 } from "./localScriptMedia";
+import { prepareVideoTail } from "./prepareVideoTail";
 import { fingerprint } from "./renderSpec";
 import {
   characterSheetPrompt,
@@ -2927,7 +2934,12 @@ export class LocalScriptProjectService {
         if (!isFalRender && board && typeof board.asset_id === "string")
           referencePaths.push(await resolveReferencePath(board.asset_id));
         const numberedImageIds = savedJob
-          ? [...savedJob.inputAssetIds]
+          ? savedJob.inputAssetIds.slice(
+              0,
+              Array.isArray(savedJob.requestJson.reference_image_urls)
+                ? savedJob.requestJson.reference_image_urls.length
+                : 0
+            )
           : [...referenceIds, ...(board ? [String(board.asset_id)] : [])];
         // The previous shot's reference, when this shot continues from one:
         // its own slot, appended last so it takes the highest tag.
@@ -2938,6 +2950,8 @@ export class LocalScriptProjectService {
         } | null = null;
         let openingFramePath: string | undefined;
         let continuityVideo: { id: string; description: string } | null = null;
+        let tailProvenance: VideoTailProvenance | null = null;
+        const numberedVideoIds: string[] = [];
         const referenceVideos: Array<{
           path: string;
           skipFrames: number;
@@ -2992,19 +3006,30 @@ export class LocalScriptProjectService {
         if (
           isFalRender &&
           sequential &&
-          (sequential.mode === "last_chunk" ||
-            (sequential.mode === "last_frame" &&
-              sequential.opening_frame === "pin"))
+          sequential.mode === "last_frame" &&
+          sequential.opening_frame === "pin"
         )
           throw new Error(
-            "H3 Max (fal) supports last-frame cut/off and key-frame references; video inputs and pinned opening frames are not yet supported"
+            "H3 Max (fal) pinned opening frames are not yet supported"
+          );
+        if (
+          isFalRender &&
+          !savedJob &&
+          sequential?.mode === "last_chunk" &&
+          record(record(record(target._local_render_spec)?.spec)?.sequential)
+            ?.tail_preparation !== FAL_VIDEO_TAIL_PROFILE
+        )
+          throw new Error(
+            "This video-tail plan predates bounded preparation; create a new plan"
           );
         const frameStep = sequential
           ? this.findStep(
               plan,
               sequential.mode === "key_frames"
                 ? "poll_pick_keyframes"
-                : "use_provided_reference_frame",
+                : sequential.mode === "last_chunk"
+                  ? "shot_video_source"
+                  : "use_provided_reference_frame",
               timelineId
             )
           : undefined;
@@ -3027,15 +3052,51 @@ export class LocalScriptProjectService {
             throw new Error(
               "The saved sequential frame provenance is unavailable"
             );
-          continuityImage = {
-            id: referenceId,
-            description: textValue(
-              sequential.prompt_appendix,
-              SEQUENTIAL_SHOT_REFERENCE_DESCRIPTION
-            ),
-            continuation: sequentialContinuation(sequential)
-          };
-          if (!savedJob) numberedImageIds.push(referenceId);
+          if (sequential.mode === "last_chunk") {
+            tailProvenance = videoTailProvenanceSchema.parse(
+              continuesFrom?.tail_provenance
+            );
+            const expectedSource =
+              target._local_previous_in_run === true
+                ? record(
+                    this.findStep(
+                      plan,
+                      "poll_video_render",
+                      String(target._local_previous_timeline_id)
+                    )?.result
+                  )?.render_asset_id
+                : target._local_previous_asset_id;
+            if (
+              tailProvenance.requested_seconds !== sequential.chunk_seconds ||
+              fingerprint(record(savedFrame?.selection) ?? {}) !==
+                fingerprint(sequential) ||
+              continuesFrom?.asset_id !== expectedSource ||
+              (savedJob &&
+                (!Array.isArray(savedJob.requestJson.reference_video_urls) ||
+                  savedJob.requestJson.reference_video_urls.length !== 1 ||
+                  savedJob.inputAssetIds.at(-1) !== referenceId ||
+                  numberedImageIds.length + 1 !==
+                    savedJob.inputAssetIds.length))
+            )
+              throw new Error(
+                "The saved sequential video provenance is unavailable"
+              );
+            numberedVideoIds.push(referenceId);
+            continuityVideo = {
+              id: referenceId,
+              description: textValue(sequential.prompt_appendix, "")
+            };
+          } else {
+            continuityImage = {
+              id: referenceId,
+              description: textValue(
+                sequential.prompt_appendix,
+                SEQUENTIAL_SHOT_REFERENCE_DESCRIPTION
+              ),
+              continuation: sequentialContinuation(sequential)
+            };
+            if (!savedJob) numberedImageIds.push(referenceId);
+          }
         } else if (sequential) {
           const previousId = String(target._local_previous_timeline_id);
           const latest = await this.requireSnapshot(input.projectId);
@@ -3064,7 +3125,57 @@ export class LocalScriptProjectService {
             sequential.prompt_appendix,
             SEQUENTIAL_SHOT_REFERENCE_DESCRIPTION
           );
-          if (sequential.mode === "last_chunk") {
+          if (isFalRender && sequential.mode === "last_chunk") {
+            activeStep = this.findStep(plan, "shot_video_source", timelineId);
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              activeStep,
+              "RUNNING"
+            );
+            const tail = await prepareVideoTail(
+              previousPath,
+              Number(sequential.chunk_seconds),
+              control.abortController.signal
+            );
+            this.throwIfCancelled(control);
+            const prepared = await this.snapshots.storeGeneratedMedia(
+              input.projectId,
+              tail.bytes,
+              "mp4"
+            );
+            this.throwIfCancelled(control);
+            tailProvenance = videoTailProvenanceSchema.parse(tail.provenance);
+            numberedVideoIds.push(prepared.id);
+            continuityVideo = { id: prepared.id, description: appendix };
+            continuesFrom = {
+              timeline_id: previousId,
+              asset_id: previousAssetId,
+              mode: "last_chunk",
+              reference_asset_id: prepared.id,
+              tail_provenance: tailProvenance
+            };
+            plan = await this.setStep(
+              input.projectId,
+              planId,
+              activeStep,
+              "COMPLETED",
+              {
+                source_asset_id: previousAssetId,
+                shot_reference_video_id: prepared.id,
+                output_url: prepared.url,
+                mode: "last_chunk",
+                selection: structuredClone(sequential),
+                cost_example: falVideoTailEstimate(
+                  timelineId,
+                  record(input.videoSettings?.provider_settings)?.resolution,
+                  durationSeconds,
+                  tailProvenance.output_duration_seconds
+                ),
+                continues_from: continuesFrom
+              }
+            );
+          } else if (sequential.mode === "last_chunk") {
             activeStep = this.findStep(plan, "shot_video_source", timelineId);
             const previousStateShot = records(latest.state?.shots).find(
               (shot) => shot.timeline_id === previousId
@@ -3233,7 +3344,7 @@ export class LocalScriptProjectService {
           adaptedPrompt = sequential
             ? shotPromptWithSequentialAppendix(
                 textValue(target.video_prompt, ""),
-                textValue(sequential.prompt_appendix, "")
+                `${isFalRender && sequential.mode === "last_chunk" ? "Video 1: " : ""}${textValue(sequential.prompt_appendix, "")}`
               )
             : textValue(target.video_prompt, "");
           adaptedPrompt = applyVisualStyle(
@@ -3481,10 +3592,9 @@ export class LocalScriptProjectService {
             "mp4"
           );
         } else {
-          adaptedPrompt = (adaptedPrompt ?? "").replace(
-            /<Picture (\d+)>/gi,
-            "Image $1"
-          );
+          adaptedPrompt = (adaptedPrompt ?? "")
+            .replace(/<Picture (\d+)>/gi, "Image $1")
+            .replace(/<Video (\d+)>/gi, "Video $1");
           const result = await renderFalShot(this.externalRenderJobs!, {
             jobId,
             savedJob,
@@ -3495,6 +3605,10 @@ export class LocalScriptProjectService {
               | Record<string, string | number | null>
               | undefined,
             sourceIds: [...new Set(numberedImageIds)],
+            videoInputs: numberedVideoIds.map((assetId) => ({
+              assetId,
+              provenance: tailProvenance!
+            })),
             recovering: control.recovering,
             signal: control.abortController.signal,
             onSubmitted: startPolling
@@ -3547,7 +3661,15 @@ export class LocalScriptProjectService {
                   ...plannedSpec,
                   sequential: {
                     ...record(plannedSpec.sequential),
-                    prev_asset_id: continuesFrom.asset_id
+                    prev_asset_id: continuesFrom.asset_id,
+                    ...(tailProvenance
+                      ? {
+                          prepared_video: {
+                            asset_id: continuesFrom.reference_asset_id,
+                            provenance: tailProvenance
+                          }
+                        }
+                      : {})
                   }
                 }
               : plannedSpec;
@@ -3569,7 +3691,10 @@ export class LocalScriptProjectService {
             metrics_input: {
               prompt: adaptedPrompt,
               duration_s: durationSeconds,
-              reference_asset_ids: [...new Set(numberedImageIds)]
+              reference_asset_ids: [...new Set(numberedImageIds)],
+              ...(numberedVideoIds.length
+                ? { reference_video_asset_ids: numberedVideoIds }
+                : {})
             },
             render_spec: renderSpec,
             input_settings: {
@@ -3581,6 +3706,28 @@ export class LocalScriptProjectService {
                     endpoint: falJob.endpoint,
                     external_job_id: falJob.id,
                     provider_settings: falJob.requestJson,
+                    ...(tailProvenance
+                      ? {
+                          reference_video_inputs: numberedVideoIds.map(
+                            (assetId) => ({
+                              asset_id: assetId,
+                              provenance: tailProvenance
+                            })
+                          )
+                        }
+                      : {}),
+                    ...(tailProvenance
+                      ? {
+                          reference_video_cost_example:
+                            record(
+                              this.findStep(
+                                plan,
+                                "shot_video_source",
+                                timelineId
+                              )?.result
+                            )?.cost_example ?? null
+                        }
+                      : {}),
                     resolution: falJob.requestJson.resolution,
                     aspect_ratio: falJob.requestJson.aspect_ratio,
                     measured_duration_s:

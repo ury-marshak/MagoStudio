@@ -214,4 +214,41 @@ describe("ShotSequentialControls", () => {
       ).screen.queryByTestId("shot-sequential-opening-frame-2")
     ).toBeNull();
   });
+  it("preserves and edits an existing video tail without exposing an opening-frame control", () => {
+    const { screen, onChange } = setup(
+      { enabled: true, mode: "last_chunk", chunk_seconds: 3 },
+      null
+    );
+    const input = screen.getByTestId("shot-sequential-tail-seconds-2");
+    expect(input).toHaveValue(3);
+    fireEvent.change(input, { target: { value: "5" } });
+    fireEvent.blur(input);
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: "last_chunk", chunk_seconds: 5 })
+    );
+    expect(screen.queryByTestId("shot-sequential-opening-frame-2")).toBeNull();
+  });
+
+  it("restricts fal tail controls to 2–10 seconds and keeps the default at two", () => {
+    const state = parseState({ enabled: true, mode: "last_chunk" }, null);
+    const onChange = vi.fn();
+    const screen = renderWithProviders(
+      <ShotSequentialControls
+        sequential={resolveSequentialShotConfig(state.shots[1]!.sequential)}
+        sequentialPromptDefaults={null}
+        predecessorShot={state.shots[0]!}
+        isDisabled={false}
+        onChange={onChange}
+        testIdSuffix={2}
+        allowVideoTail
+      />
+    );
+    const input = screen.getByTestId("shot-sequential-tail-seconds-2");
+    expect(input).toHaveValue(2);
+    expect(input).toHaveAttribute("min", "2");
+    expect(input).toHaveAttribute("max", "10");
+    fireEvent.change(input, { target: { value: "1" } });
+    fireEvent.blur(input);
+    expect(onChange).not.toHaveBeenCalled();
+  });
 });
