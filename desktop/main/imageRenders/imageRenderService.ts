@@ -35,6 +35,7 @@ import {
 } from "../libraryHealth";
 import { doesVideoHaveAudioStream } from "../media/doesVideoHaveAudioStream";
 import { validateVideo } from "../media/validateVideo";
+import { InferenceUnavailableError } from "../providers/inferenceUnavailableError";
 import {
   atomicWriteFile,
   atomicCopyFile,
@@ -377,8 +378,22 @@ export class ImageRenderService {
     private readonly getLibraryRoot: () => Promise<string | null>,
     private readonly getComfyEndpoint: () => Promise<string>,
     /** Told about every image that lands, e.g. to caption it. Must not throw. */
-    private readonly onImageAvailable?: (assetId: string) => void
+    private readonly onImageAvailable?: (assetId: string) => void,
+    /** Gates saved endpoints too, not only endpoint lookup for new renders. */
+    private readonly assertInferenceAvailable: () => Promise<void> = async () => {}
   ) {}
+
+  /** Policy pauses are not failed jobs and must not make a clean external
+   * startup display a library-health error. Corrupt settings still surface. */
+  private async canProcessInference(): Promise<boolean> {
+    try {
+      await this.assertInferenceAvailable();
+      return true;
+    } catch (error) {
+      if (error instanceof InferenceUnavailableError) return false;
+      throw error;
+    }
+  }
 
   start(): void {
     if (this.timer) return;
@@ -395,6 +410,7 @@ export class ImageRenderService {
   }
 
   async reconcileInterruptedRenders(): Promise<void> {
+    if (!(await this.canProcessInference())) return;
     this.processing = true;
     try {
       const jobs = await this.manager.get().select().from(imageRenderJobs);
@@ -479,6 +495,7 @@ export class ImageRenderService {
   }
 
   async submit(input: LocalImageRenderInput): Promise<{ jobId: string }> {
+    await this.assertInferenceAvailable();
     if (!this.manager.isOpen())
       throw new Error("Choose a Mago library folder first");
     if (input.model === "qwen") {
@@ -612,6 +629,7 @@ export class ImageRenderService {
   }
 
   async submitVideo(input: LocalVideoRenderInput): Promise<{ jobId: string }> {
+    await this.assertInferenceAvailable();
     if (!this.manager.isOpen())
       throw new Error("Choose a Mago library folder first");
     if (isComfyRenderModel(input.model)) {
@@ -945,6 +963,7 @@ export class ImageRenderService {
   }
 
   async cancel(jobId: string): Promise<void> {
+    await this.assertInferenceAvailable();
     const database = this.manager.get();
     const [job] = await database
       .select()
@@ -1022,12 +1041,15 @@ export class ImageRenderService {
     this.processing = true;
     this.isKickRequestedDuringProcessing = false;
     try {
+      if (!(await this.canProcessInference())) return;
       const jobs = await this.manager
         .get()
         .select()
         .from(imageRenderJobs)
         .where(inArray(imageRenderJobs.status, ACTIVE_STATUSES));
       for (const job of jobs) {
+        // A changed profile pauses the queue without marking saved jobs failed.
+        if (!(await this.canProcessInference())) return;
         try {
           await this.process(job);
           clearLibraryIssue(`render-poll:${job.id}`);

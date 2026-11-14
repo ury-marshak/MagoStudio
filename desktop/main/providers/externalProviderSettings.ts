@@ -17,6 +17,8 @@ import { falGenerationDefaultsSchema } from "../../shared/falGenerationSettings"
 import { FAL_SHEET_MODELS } from "../../shared/falSheetModel";
 import { FAL_SHOT_PROVIDER } from "../../shared/falShotModel";
 
+import { InferenceUnavailableError } from "./inferenceUnavailableError";
+
 export type {
   ExternalModelCapability,
   ExternalModelConfig
@@ -155,6 +157,25 @@ export const createExternalProviderSettings = (userData: () => string) => {
   return {
     get: (capability: ExternalModelCapability) =>
       get(capability, (value) => parseConfig(capability, value)),
+    /** A partial external profile is not permission to use legacy inference.
+     * Read selection and the omission gate from one metadata snapshot; never
+     * inspect credentials, probe models, or treat invalid entries as absent. */
+    getForInference: async (capability: ExternalModelCapability) => {
+      const settings = await readSettings(settingsPath());
+      if (Object.hasOwn(settings, capability))
+        return parseConfig(capability, settings[capability]);
+      if (Object.keys(settings).length > 0)
+        throw new Error(
+          `Configure an external ${capability} provider to use this capability. Legacy Mago/ComfyUI inference is disabled while external providers are configured.`
+        );
+      return null;
+    },
+    assertLegacyInferenceAvailable: async () => {
+      if (Object.keys(await readSettings(settingsPath())).length > 0)
+        throw new InferenceUnavailableError(
+          "Local inference, supporting effects and model setup are unavailable while external providers are configured. No external adapter is integrated for this operation."
+        );
+    },
     save: (capability: ExternalModelCapability, value: unknown) =>
       save(capability, value, (entry) => parseConfig(capability, entry)),
     getFal: () => get("fal", parseFalConfig),

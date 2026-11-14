@@ -25,6 +25,7 @@ import { requireTrustedSender } from "./trustedSender";
 
 export const registerLocalSetupHandlers = (options: {
   settings: LibrarySettings;
+  assertInferenceAvailable?: () => Promise<void>;
 }): void => {
   const installer = new StarterInstaller(options.settings, {
     confirmModelCopy: async (bytes) => {
@@ -59,11 +60,13 @@ export const registerLocalSetupHandlers = (options: {
     IPC_CHANNELS.localSetupInstallerStart,
     async (event, request: unknown) => {
       requireTrustedSender(event);
+      await options.assertInferenceAvailable?.();
       return installer.start(readStarterInstallRequest(request));
     }
   );
   ipcMain.handle(IPC_CHANNELS.localSetupModelGroupsStatus, async (event) => {
     requireTrustedSender(event);
+    await options.assertInferenceAvailable?.();
     return readLocalModelGroupsStatus(
       options.settings,
       readVideoMemoryBytesOnce
@@ -130,6 +133,7 @@ export const registerLocalSetupHandlers = (options: {
     IPC_CHANNELS.localSetupDownloadRequirement,
     async (event, name, downloadOptions: unknown) => {
       requireTrustedSender(event);
+      await options.assertInferenceAvailable?.();
       if (typeof name !== "string") throw new Error("Invalid requirement");
       const replaceExistingNodePackIn =
         typeof downloadOptions === "object" &&
@@ -183,6 +187,7 @@ export const registerLocalSetupHandlers = (options: {
     IPC_CHANNELS.localSetupDownloadRequirements,
     async (event, batchName, names) => {
       requireTrustedSender(event);
+      await options.assertInferenceAvailable?.();
       const areNamesValid =
         typeof batchName === "string" &&
         Array.isArray(names) &&
@@ -214,6 +219,7 @@ export const registerLocalSetupHandlers = (options: {
   );
   ipcMain.handle(IPC_CHANNELS.localSetupProbeHardware, async (event) => {
     requireTrustedSender(event);
+    await options.assertInferenceAvailable?.();
     return probeHardware();
   });
 

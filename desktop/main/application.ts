@@ -41,20 +41,15 @@ import { runBackgroundTask } from "./libraryHealth";
 import { LibrarySettings } from "./librarySettings";
 import { VideoFrameService } from "./media/videoFrameService";
 import { openStartupLibrary } from "./openStartupLibrary";
+import { createExternalInferenceRouting } from "./providers/externalInferenceRouting";
 import {
   createExternalProviderSettings,
-  readExternalProviderKey,
-  resolveProviderStartupMode,
-  type ExternalModelCapability
+  resolveProviderStartupMode
 } from "./providers/externalProviderSettings";
 import { ExternalRenderAssets } from "./providers/externalRenderAssets";
 import { ExternalRenderJobRepository } from "./providers/externalRenderJobRepository";
 import { ExternalRenderJobService } from "./providers/externalRenderJobService";
 import { FalRenderProvider } from "./providers/falRenderProvider";
-import {
-  generateOpenAiCompatible,
-  probeOpenAiCompatible
-} from "./providers/openAiCompatible";
 import { installOfflineRenderer } from "./renderer/offlineRenderer";
 import {
   ensureRendererCertificate,
@@ -80,7 +75,6 @@ import {
   probeComfyVision
 } from "./vlm/comfyVisionProvider";
 import { LocalI2vPromptAdapter } from "./vlm/localI2vPromptAdapter";
-import type { VisionGenerator } from "./vlm/visionGenerator";
 import { VlmService } from "./vlm/vlmService";
 
 const databaseManager = new DatabaseManager();
@@ -112,63 +106,27 @@ const externalRenderJobService = new ExternalRenderJobService(
       scriptProjectSnapshotRepository.resolveMediaPath(assetId, projectId)
   )
 );
-const getExternalGenerator = async (capability: ExternalModelCapability) => {
-  const config = await externalProviders.get(capability);
-  return config
-    ? generateOpenAiCompatible(
-        config,
-        await readExternalProviderKey(config.keychainAccount)
-      )
-    : null;
-};
-const comfyVision = generateComfyVision(librarySettings);
-const generateVision: VisionGenerator = async (request) => {
-  request.signal?.throwIfAborted();
-  const generate = (await getExternalGenerator("vision")) ?? comfyVision;
-  request.signal?.throwIfAborted();
-  return generate(request);
-};
-const generateEnhancement: VisionGenerator = async (request) => {
-  request.signal?.throwIfAborted();
-  const generate = (await getExternalGenerator("text")) ?? comfyVision;
-  request.signal?.throwIfAborted();
-  return generate(request);
-};
+const inference = createExternalInferenceRouting(
+  externalProviders,
+  generateComfyVision(librarySettings),
+  () => probeComfyVision(librarySettings)
+);
+const getExternalGenerator = inference.getGenerator;
 const vlmService = new VlmService(
   projectRepository,
-  generateVision,
-  async () => {
-    try {
-      const config = await externalProviders.get("vision");
-      if (!config) return probeComfyVision(librarySettings);
-      await probeOpenAiCompatible(
-        config,
-        await readExternalProviderKey(config.keychainAccount),
-        "vision"
-      );
-      return {
-        backend: "external",
-        ready: true,
-        missingModels: [],
-        message: null
-      };
-    } catch (error) {
-      return {
-        backend: "external",
-        ready: false,
-        missingModels: [],
-        message:
-          error instanceof Error
-            ? error.message
-            : "External vision provider is unavailable"
-      };
-    }
-  },
-  generateEnhancement
+  inference.generateVision,
+  inference.probeVision,
+  inference.generateEnhancement
 );
+const assertLegacyInferenceAvailable =
+  externalProviders.assertLegacyInferenceAvailable;
+const getLegacyComfyEndpoint = async () => {
+  await assertLegacyInferenceAvailable();
+  return librarySettings.getComfyEndpoint();
+};
 const getComfyScriptClient = async () =>
   new ComfyScriptProjectClient(
-    await librarySettings.getComfyEndpoint(),
+    await getLegacyComfyEndpoint(),
     await librarySettings.getScriptTextModel()
   );
 const PROMPT_ADAPTATION_MAX_TOKENS = 4600;
@@ -215,14 +173,18 @@ const i2vPromptAdapter = new LocalI2vPromptAdapter({
   }
 });
 const textModelBridge = new TextModelBridge();
+const runLegacyTextModel: typeof textModelBridge.run = async (...args) => {
+  await assertLegacyInferenceAvailable();
+  return textModelBridge.run(...args);
+};
 const localScriptProjectService = new LocalScriptProjectService(
   projectRepository,
   scriptProjectSnapshotRepository,
-  () => librarySettings.getComfyEndpoint(),
+  getLegacyComfyEndpoint,
   () => librarySettings.getScriptTextModel(),
   (sourcePath, kind, signal) =>
     vlmService.describeEntityImage(sourcePath, kind, undefined, signal),
-  textModelBridge.run,
+  runLegacyTextModel,
   (input, signal) => vlmService.evaluateShotVideo(input, signal),
   () => getExternalGenerator("text"),
   externalRenderJobService,
@@ -249,7 +211,7 @@ const localScriptChatService = new LocalScriptChatService(
     );
     if (external) return { content: external.text, model: external.model };
     signal?.throwIfAborted();
-    const cloud = await textModelBridge.run(
+    const cloud = await runLegacyTextModel(
       "chat",
       { prompt },
       () => signal?.aborted === true
@@ -273,8 +235,9 @@ const cloudRenderSubmitService = new CloudRenderSubmitService(
 const imageRenderService = new ImageRenderService(
   databaseManager,
   () => librarySettings.getLibraryRoot(),
-  () => librarySettings.getComfyEndpoint(),
-  describeImageLater
+  getLegacyComfyEndpoint,
+  describeImageLater,
+  assertLegacyInferenceAvailable
 );
 const videoFrameService = new VideoFrameService(projectRepository);
 const usesPackagedRenderer =
@@ -511,7 +474,7 @@ void app
   .then(async () => {
     logStartup("Electron ready; registering services");
     registerMediaProtocol(projectRepository, scriptProjectSnapshotRepository);
-    registerComfyHandlers(librarySettings);
+    registerComfyHandlers(librarySettings, assertLegacyInferenceAvailable);
     registerExternalProviderHandlers(externalProviders);
     textModelBridge.register();
     registerCloudHandlers({
@@ -532,7 +495,10 @@ void app
       async () => !!(await externalProviders.get("text"))
     );
 
-    registerLocalSetupHandlers({ settings: librarySettings });
+    registerLocalSetupHandlers({
+      settings: librarySettings,
+      assertInferenceAvailable: assertLegacyInferenceAvailable
+    });
 
     registerLibraryHandlers({
       settings: librarySettings,

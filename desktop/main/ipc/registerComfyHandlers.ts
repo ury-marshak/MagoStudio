@@ -62,13 +62,17 @@ const readComfySettings = async (
   textModelProvider: await settings.getTextModelProvider()
 });
 
-export const registerComfyHandlers = (settings: LibrarySettings): void => {
+export const registerComfyHandlers = (
+  settings: LibrarySettings,
+  assertInferenceAvailable: () => Promise<void> = async () => {}
+): void => {
   const launcher = new ComfyLauncher(
     settings,
     path.join(app.getPath("userData"), "logs", "comfyui.log")
   );
   ipcMain.handle(IPC_CHANNELS.comfyRestartStatus, async (event) => {
     requireTrustedSender(event);
+    await assertInferenceAvailable();
     return readComfyRestartStatus({
       launcher,
       endpoint: normalizeComfyEndpoint(await settings.getComfyEndpoint())
@@ -76,6 +80,7 @@ export const registerComfyHandlers = (settings: LibrarySettings): void => {
   });
   ipcMain.handle(IPC_CHANNELS.comfyRestart, async (event) => {
     requireTrustedSender(event);
+    await assertInferenceAvailable();
     await restartComfy({
       launcher,
       endpoint: normalizeComfyEndpoint(await settings.getComfyEndpoint())
@@ -83,6 +88,7 @@ export const registerComfyHandlers = (settings: LibrarySettings): void => {
   });
   ipcMain.handle(IPC_CHANNELS.comfyLaunch, async (event, options) => {
     requireTrustedSender(event);
+    await assertInferenceAvailable();
     const restartUnresponsiveProcess =
       options &&
       typeof options === "object" &&
@@ -94,6 +100,7 @@ export const registerComfyHandlers = (settings: LibrarySettings): void => {
     IPC_CHANNELS.comfyScriptSetupStatus,
     async (event, options) => {
       requireTrustedSender(event);
+      await assertInferenceAvailable();
       const probeSettings = await readComfySettings(settings);
       if (options?.scriptTextModel !== undefined) {
         if (!LOCAL_SCRIPT_TEXT_MODELS.includes(options.scriptTextModel))
@@ -136,6 +143,7 @@ export const registerComfyHandlers = (settings: LibrarySettings): void => {
   });
   ipcMain.handle(IPC_CHANNELS.comfySave, async (event, value, options) => {
     requireTrustedSender(event);
+    await assertInferenceAvailable();
     const payload = value && typeof value === "object" ? value : null;
     const endpoint = normalizeComfyEndpoint(
       payload && "endpoint" in payload ? String(payload.endpoint) : ""
@@ -192,6 +200,7 @@ export const registerComfyHandlers = (settings: LibrarySettings): void => {
   });
   ipcMain.handle(IPC_CHANNELS.comfyCheck, async (event, endpoint) => {
     requireTrustedSender(event);
+    await assertInferenceAvailable();
     if (endpoint !== undefined) {
       if (typeof endpoint !== "string")
         throw new Error("Invalid ComfyUI endpoint");
@@ -210,6 +219,7 @@ export const registerComfyHandlers = (settings: LibrarySettings): void => {
   });
   ipcMain.handle(IPC_CHANNELS.comfyModelStatus, async (event, value) => {
     requireTrustedSender(event);
+    await assertInferenceAvailable();
     const payload = value && typeof value === "object" ? value : null;
     const model = payload && "model" in payload ? payload.model : undefined;
     if (!isComfyRenderModelName(model))
