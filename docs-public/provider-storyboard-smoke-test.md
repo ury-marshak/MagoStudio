@@ -4,13 +4,21 @@ Prepared and run 2026-11-13 with the user's **$1 combined budget approval**. Fre
 
 **Historical run, not a reusable authorization.** Future video tests must use **480P**, as requested after this run's 768P video completed. The current source supports a resolution override, and the November 14 package now includes it. The $1 approval below is complete.
 
+## Separate 480P video check completed 2026-11-14
+
+The user authorized a fresh **$1 total** for one five-second H3 Max shot including required external text composition. The actual packaged app submitted one request, `01a1da36-f27e-78b0-bd58-2564bda8c5ef`, using the existing synthetic storyboard and action controls: **480P**, 16:9, seed 42, prompt expansion disabled. No new image generation or additional shot was requested.
+
+The saved payload confirmed 480P. The result attached normally, played in Timeline, exported, and persisted after reopening. Measured output: **832×480, 24 fps, H.264, stereo AAC**; exported MP4: **1,805,608 bytes**, **5.216 seconds** container duration, fully decodable. The app's size estimate was 848×480; requested and measured values remain separate.
+
+Fal billable units imply **$0.25**; OpenRouter key usage grew by **$0.01152925**, giving **$0.26152925 combined**, below the fresh budget. These are billable-unit/key-usage calculations, not billing-ledger receipts. **This paid scope is complete.** Details and limitations: [480P validation record](../PROVIDER_INTEGRATION_PLAN.md#packaged-480p-video-smoke-test-2026-11-14). Evidence/export: `/tmp/mago-480p-smoke-20261114/`.
+
 ## Controls validation completed 2026-11-14 (no paid requests)
 
 - Preserved the earlier bundle/profile under `/tmp/mago-controls-validation-20261114/preserved/`; packaged the updated arm64 app with Node 24.15.0 through Herdr. Both the initial and responsive-fix builds exited 0.
 - Used a copied isolated profile/library with nonexistent Keychain account references. Inspected Providers, Assets/draft, Storyboard, individual-shot and batch controls. Fixed toolbar clipping/squeezing; geometry assertions and screenshots cover 1440×868 and 1024×700. The existing-reference edit form still needs a populated-fixture pass.
 - Verified independent per-model choices, app persistence after restart, explicit project-default saving, and individual/batch overrides. Historical accepted payloads and the two-job count are unchanged. No inference was submitted. Details, evidence paths and limitations are in the [integration plan](../PROVIDER_INTEGRATION_PLAN.md#packaged-controls-validation-2026-11-14-no-paid-requests).
-- Do not submit an inference request during this pass. A subsequent five-second 480P check needs a fresh total budget including required text composition; reuse an existing synthetic reference where practical.
-- Verify `resolution: "480P"` in the immutable saved request after an authorized submission. Record requested settings separately from measured media properties. The UI currently composes and submits as one plan: do not promise an intervening inspection pause.
+- This no-cost controls pass did not authorize inference. The separately approved 480P check is recorded above; its budget is now complete.
+- The live check verified `resolution: "480P"` in the immutable saved request and recorded requested settings separately from measured output. Composition/submission remain one UI plan; there was no intervening inspection pause.
 
 The recipe and results below document the completed November 13 run at 768P. Do not repeat that recipe unchanged.
 
