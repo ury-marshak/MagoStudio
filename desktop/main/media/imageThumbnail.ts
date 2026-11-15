@@ -17,9 +17,11 @@ const executablePath = (): string => {
  * image never stalls Electron's main thread or project navigation. */
 const createThumbnailFile = (
   sourcePath: string,
-  outputPath: string
+  outputPath: string,
+  signal?: AbortSignal
 ): Promise<void> =>
   new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
     const child = spawn(
       executablePath(),
       [
@@ -44,28 +46,34 @@ const createThumbnailFile = (
       { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] }
     );
     let errorOutput = "";
-    let settled = false;
-    const finish = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (error) reject(error);
-      else resolve();
+    let failure: unknown;
+    const fail = (error: unknown) => {
+      if (failure) return;
+      failure = error;
+      child.kill("SIGKILL");
     };
-    const timer = setTimeout(() => {
-      child.kill();
-      finish(new Error("Timed out creating the image preview"));
-    }, FFMPEG_TIMEOUT_MS);
+    const abort = () => fail(signal?.reason);
+    const timer = setTimeout(
+      () => fail(new Error("Timed out creating the image preview")),
+      FFMPEG_TIMEOUT_MS
+    );
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     child.stderr.on("data", (chunk: Buffer) => {
       errorOutput = `${errorOutput}${chunk.toString()}`.slice(
         -MAX_ERROR_LENGTH
       );
     });
-    child.once("error", finish);
+    child.once("error", (error) => {
+      failure ??= error;
+    });
     child.once("close", (code) => {
-      if (code === 0) finish();
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (failure || signal?.aborted) reject(failure ?? signal?.reason);
+      else if (code === 0) resolve();
       else {
-        finish(
+        reject(
           new Error(
             `Unable to create the image preview${errorOutput.trim() ? `: ${errorOutput.trim()}` : ""}`
           )
@@ -76,8 +84,9 @@ const createThumbnailFile = (
 
 export const createImageThumbnail = (
   sourcePath: string,
-  outputPath: string
+  outputPath: string,
+  signal?: AbortSignal
 ): Promise<void> =>
   atomicProduceFile(outputPath, (temporary) =>
-    createThumbnailFile(sourcePath, temporary)
+    createThumbnailFile(sourcePath, temporary, signal)
   );

@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import ffmpegPath from "ffmpeg-static";
 
 import { ProjectRepository } from "../database/projectRepository";
+import { LibraryWorkSession } from "../libraryWorkSession";
 
 const MAX_FFMPEG_ERROR_LENGTH = 4000;
 const MAX_JPEG_BYTES = 67_108_864;
@@ -103,8 +104,12 @@ export const buildVideoFilmstripArgs = (input: {
   ];
 };
 
-const runJpeg = async (args: string[]): Promise<string> =>
-  new Promise((resolve, reject) => {
+const runJpeg = async (
+  args: string[],
+  signal: AbortSignal
+): Promise<string> => {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
     const child = spawn(executablePath(), args, {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
@@ -112,25 +117,24 @@ const runJpeg = async (args: string[]): Promise<string> =>
     const chunks: Buffer[] = [];
     let byteLength = 0;
     let errorOutput = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      child.kill();
-      if (!settled) {
-        settled = true;
-        reject(new Error("ffmpeg timed out extracting the video preview"));
-      }
-    }, FFMPEG_TIMEOUT_MS);
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
+    let failure: unknown;
+    const fail = (error: unknown) => {
+      if (failure) return;
+      failure = error;
+      // Local decoding only: never invoke a provider cancellation endpoint.
+      child.kill("SIGKILL");
     };
-
+    const abort = () => fail(signal.reason);
+    const timer = setTimeout(
+      () => fail(new Error("ffmpeg timed out extracting the video preview")),
+      FFMPEG_TIMEOUT_MS
+    );
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
     child.stdout.on("data", (chunk: Buffer) => {
+      if (failure) return;
       byteLength += chunk.length;
       if (byteLength > MAX_JPEG_BYTES) {
-        child.kill();
         fail(new Error("The extracted video preview is too large"));
         return;
       }
@@ -141,12 +145,16 @@ const runJpeg = async (args: string[]): Promise<string> =>
         -MAX_FFMPEG_ERROR_LENGTH
       );
     });
-    child.once("error", fail);
+    child.once("error", (error) => {
+      failure ??= error;
+    });
+    // Do not release the library on kill/error: wait for stdio and process close.
     child.once("close", (code) => {
-      if (settled) return;
-      settled = true;
       clearTimeout(timer);
-      if (code !== 0 || byteLength === 0) {
+      signal.removeEventListener("abort", abort);
+      if (failure || signal.aborted) {
+        reject(failure ?? signal.reason);
+      } else if (code !== 0 || byteLength === 0) {
         reject(
           new Error(
             `Unable to extract video preview${
@@ -154,16 +162,28 @@ const runJpeg = async (args: string[]): Promise<string> =>
             }`
           )
         );
-        return;
+      } else {
+        resolve(
+          `data:image/jpeg;base64,${Buffer.concat(chunks).toString("base64")}`
+        );
       }
-      resolve(
-        `data:image/jpeg;base64,${Buffer.concat(chunks).toString("base64")}`
-      );
     });
   });
+};
 
 export class VideoFrameService {
-  constructor(private readonly repository: ProjectRepository) {}
+  private readonly repository: ProjectRepository;
+
+  constructor(
+    repository: ProjectRepository,
+    readonly libraryWork = new LibraryWorkSession(() => undefined)
+  ) {
+    this.repository = libraryWork.guard(repository);
+    this.extractFrame = libraryWork.bind(this.extractFrame.bind(this));
+    this.generateFilmstrip = libraryWork.bind(
+      this.generateFilmstrip.bind(this)
+    );
+  }
 
   async extractFrame(input: {
     assetId: string;
@@ -175,8 +195,11 @@ export class VideoFrameService {
       input.assetId
     );
     if (!inputPath) throw new Error("The local video asset could not be found");
-    return runJpeg(
-      buildVideoFrameArgs(inputPath, input.frameNumber, input.fps)
+    return this.libraryWork.boundary(() =>
+      runJpeg(
+        buildVideoFrameArgs(inputPath, input.frameNumber, input.fps),
+        this.libraryWork.signal
+      )
     );
   }
 
@@ -199,15 +222,18 @@ export class VideoFrameService {
     if (!Number.isFinite(totalFrames) || totalFrames <= 0) {
       throw new Error("The local video metadata is incomplete");
     }
-    return runJpeg(
-      buildVideoFilmstripArgs({
-        inputPath,
-        width: input.width,
-        frameHeight: input.frameHeight,
-        sourceWidth,
-        sourceHeight,
-        totalFrames
-      })
+    return this.libraryWork.boundary(() =>
+      runJpeg(
+        buildVideoFilmstripArgs({
+          inputPath,
+          width: input.width,
+          frameHeight: input.frameHeight,
+          sourceWidth,
+          sourceHeight,
+          totalFrames
+        }),
+        this.libraryWork.signal
+      )
     );
   }
 }

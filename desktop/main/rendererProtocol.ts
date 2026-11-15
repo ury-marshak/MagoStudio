@@ -13,6 +13,8 @@ import { ProjectRepository } from "./database/projectRepository";
 import { ScriptProjectSnapshotRepository } from "./database/scriptProjectSnapshotRepository";
 import { clearLibraryIssue, reportLibraryIssue } from "./libraryHealth";
 import { LibrarySettings } from "./librarySettings";
+import { LibraryWorkSession } from "./libraryWorkSession";
+import { libraryMediaStream } from "./media/libraryMediaStream";
 
 const HTTP_OK = 200;
 const HTTP_PARTIAL_CONTENT = 206;
@@ -71,9 +73,11 @@ const parseByteRange = (
 
 const mediaFileResponse = async (
   request: Request,
-  filePath: string
+  filePath: string,
+  work: LibraryWorkSession<undefined>
 ): Promise<Response> => {
-  const fileStats = await stat(filePath);
+  const fileStats = await work.boundary(() => stat(filePath));
+  request.signal.throwIfAborted();
   if (!fileStats.isFile()) return new Response("Not found", { status: 404 });
 
   const rangeHeader = request.headers.get("range");
@@ -93,14 +97,15 @@ const mediaFileResponse = async (
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Expose-Headers":
       "Accept-Ranges, Content-Length, Content-Range",
-    "Cache-Control": "public, max-age=31536000, immutable",
+    // IDs may be reused in another library; do not let Chromium reuse old bytes.
+    "Cache-Control": "no-store",
     "Content-Length": String(contentLength),
     "Content-Type": mediaContentType(filePath)
   });
   if (range) {
     headers.set("Content-Range", `bytes ${start}-${end}/${fileStats.size}`);
   }
-  if (request.method === "HEAD") {
+  if (request.method === "HEAD" || fileStats.size === 0) {
     return new Response(null, {
       status: range ? HTTP_PARTIAL_CONTENT : HTTP_OK,
       headers
@@ -110,7 +115,7 @@ const mediaFileResponse = async (
   const body = Readable.toWeb(
     createReadStream(filePath, { start, end })
   ) as ReadableStream<Uint8Array>;
-  return new Response(body, {
+  return new Response(libraryMediaStream(body, work, request.signal), {
     status: range ? HTTP_PARTIAL_CONTENT : HTTP_OK,
     headers
   });
@@ -132,49 +137,77 @@ protocol.registerSchemesAsPrivileged([
 export const registerMediaProtocol = (
   repository: ProjectRepository,
   scriptProjects: ScriptProjectSnapshotRepository,
-  settings: LibrarySettings
+  settings: LibrarySettings,
+  work = new LibraryWorkSession(() => undefined)
 ): void => {
   const cloudStorageHosts = resolveCloudConfig().cloudStorageHosts;
-  protocol.handle("mago-media", async (request) => {
+  const projects = work.guard(repository);
+  const scripts = work.guard(scriptProjects);
+  protocol.handle("mago-media", async (originalRequest) => {
+    let signal: AbortSignal | undefined;
     try {
-      const url = new URL(request.url);
-      const kind = url.hostname;
-      if (kind === CLOUD_STORAGE_PROTOCOL_HOST) {
-        return await cloudStorageProtocolResponse(
-          request,
-          cloudStorageHosts,
-          undefined,
-          () => requireCloudAccount(settings)
-        );
-      }
-      if (
-        kind !== "asset" &&
-        kind !== "thumbnail" &&
-        kind !== "script-project" &&
-        kind !== "script-project-thumbnail"
-      ) {
-        return new Response("Not found", { status: 404 });
-      }
-      const id = decodeURIComponent(url.pathname.slice(1));
-      if (!id || id.includes("/") || id.includes("\\")) {
-        return new Response("Not found", { status: 404 });
-      }
-      const filePath =
-        kind === "script-project"
-          ? await scriptProjects.resolveMediaPath(id)
-          : kind === "script-project-thumbnail"
-            ? await scriptProjects.resolveThumbnailMediaPath(id)
-            : await repository.resolveMediaPath(kind, id);
-      if (!filePath) return new Response("Not found", { status: 404 });
-      const response = await mediaFileResponse(request, filePath);
-      clearLibraryIssue(`media:${request.url}`);
-      return response;
-    } catch (error) {
-      reportLibraryIssue({
-        id: `media:${request.url}`,
-        kind: "asset",
-        message: `Media unavailable: ${request.url}. ${error instanceof Error ? error.message : String(error)}`
+      signal = AbortSignal.any([work.capture(), originalRequest.signal]);
+      const request = new Request(originalRequest, { signal });
+      return await work.run(async () => {
+        signal!.throwIfAborted();
+        const url = new URL(request.url);
+        const kind = url.hostname;
+        if (kind === CLOUD_STORAGE_PROTOCOL_HOST) {
+          const response = await work.boundary(async () => {
+            const upstream = await cloudStorageProtocolResponse(
+              request,
+              cloudStorageHosts,
+              undefined,
+              () => requireCloudAccount(settings)
+            );
+            // Even an abort-ignoring headers callback must release its body.
+            if (request.signal.aborted) {
+              await upstream.body?.cancel(request.signal.reason);
+              request.signal.throwIfAborted();
+            }
+            return upstream;
+          });
+          return new Response(
+            response.body
+              ? libraryMediaStream(response.body, work, request.signal)
+              : null,
+            { status: response.status, headers: response.headers }
+          );
+        }
+        if (
+          kind !== "asset" &&
+          kind !== "thumbnail" &&
+          kind !== "script-project" &&
+          kind !== "script-project-thumbnail"
+        ) {
+          return new Response("Not found", { status: 404 });
+        }
+        const id = decodeURIComponent(url.pathname.slice(1));
+        if (!id || id.includes("/") || id.includes("\\")) {
+          return new Response("Not found", { status: 404 });
+        }
+        const filePath =
+          kind === "script-project"
+            ? await scripts.resolveMediaPath(id)
+            : kind === "script-project-thumbnail"
+              ? await scripts.resolveThumbnailMediaPath(id, work.signal)
+              : await projects.resolveMediaPath(kind, id);
+        request.signal.throwIfAborted();
+        if (!filePath) return new Response("Not found", { status: 404 });
+        const response = await mediaFileResponse(request, filePath, work);
+        request.signal.throwIfAborted();
+        clearLibraryIssue(`media:${request.url}`);
+        return response;
       });
+    } catch (error) {
+      // A stale request is not evidence about the replacement library's health.
+      if (signal && !signal.aborted) {
+        reportLibraryIssue({
+          id: `media:${originalRequest.url}`,
+          kind: "asset",
+          message: `Media unavailable: ${originalRequest.url}. ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
       return new Response("Not found", { status: 404 });
     }
   });

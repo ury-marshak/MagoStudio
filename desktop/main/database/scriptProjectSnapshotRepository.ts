@@ -534,10 +534,14 @@ export class ScriptProjectSnapshotRepository {
     await atomicWriteFile(target, JSON.stringify(metrics), "utf8");
   }
 
-  async resolveThumbnailMediaPath(mediaId: string): Promise<string | null> {
+  async resolveThumbnailMediaPath(
+    mediaId: string,
+    signal?: AbortSignal
+  ): Promise<string | null> {
+    signal?.throwIfAborted();
     const active = this.thumbnailJobs.get(mediaId);
     if (active) return active;
-    const job = this.createThumbnail(mediaId).finally(() => {
+    const job = this.createThumbnail(mediaId, signal).finally(() => {
       if (this.thumbnailJobs.get(mediaId) === job) {
         this.thumbnailJobs.delete(mediaId);
       }
@@ -546,8 +550,12 @@ export class ScriptProjectSnapshotRepository {
     return job;
   }
 
-  private async createThumbnail(mediaId: string): Promise<string | null> {
+  private async createThumbnail(
+    mediaId: string,
+    signal?: AbortSignal
+  ): Promise<string | null> {
     const sourcePath = await this.resolveMediaPath(mediaId);
+    signal?.throwIfAborted();
     if (!sourcePath) return null;
     const thumbnailPath = `${sourcePath}.thumbnail.jpg`;
     const temporaryPath = `${thumbnailPath}.partial`;
@@ -557,15 +565,19 @@ export class ScriptProjectSnapshotRepository {
     } catch {
       // Existing projects create their thumbnail on the first visible request.
     }
-
+    signal?.throwIfAborted();
     await this.acquireThumbnailSlot();
     try {
+      signal?.throwIfAborted();
       await unlink(temporaryPath).catch(() => {});
-      await createImageThumbnail(sourcePath, temporaryPath);
+      signal?.throwIfAborted();
+      await createImageThumbnail(sourcePath, temporaryPath, signal);
+      signal?.throwIfAborted();
       await publishFile(temporaryPath, thumbnailPath);
       return thumbnailPath;
     } catch {
       await unlink(temporaryPath).catch(() => {});
+      signal?.throwIfAborted();
       // Keep the card usable if this particular format cannot be decoded.
       return sourcePath;
     } finally {

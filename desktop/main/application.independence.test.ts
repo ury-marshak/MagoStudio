@@ -376,23 +376,33 @@ it.each(["fal", "text", "vision"])(
     expect(mocks.exit).not.toHaveBeenCalled();
     expect(mocks.quit).not.toHaveBeenCalled();
     expect(mocks.dialog).not.toHaveBeenCalled();
-    // Exercise the actual composed library hooks: successful replacement resets
-    // VLM, whereas failed opening leaves it (and the Director owners) suspended.
+    // Actual composition must reset media only after successful opening/settings
+    // and cancel old response bodies even if the same media ID exists again.
     const replacement = path.join(root, "replacement");
     await seed.open(replacement);
+    const replacementMedia = path.join(replacement, "fixture.png");
+    await writeFile(replacementMedia, "replacement local bytes");
     await seed.get().insert(assets).values({
       id: "asset",
       name: "Reused",
       type: "image",
-      sourcePath: "fixture",
+      sourcePath: replacementMedia,
       status: "available"
     });
     seed.close();
+    const staleBody = await media(
+      new Request("mago-media://script-project/cached")
+    );
     mocks.choose.mockResolvedValue({
       canceled: false,
       filePaths: [replacement]
     });
     await invoke(IPC_CHANNELS.libraryChoose);
+    await expect(staleBody.text()).rejects.toThrow();
+    const replacementBody = await media(
+      new Request("mago-media://asset/asset")
+    );
+    expect(await replacementBody.text()).toBe("replacement local bytes");
     await expect(
       invoke(IPC_CHANNELS.vlmSaveAutoPrompt, {
         assetId: "asset",
@@ -422,6 +432,16 @@ it.each(["fal", "text", "vision"])(
       })
     ).rejects.toThrow();
     await expect(invoke(IPC_CHANNELS.vlmStatus)).rejects.toThrow();
+    expect((await media(new Request("mago-media://asset/asset"))).status).toBe(
+      404
+    );
+    await expect(
+      invoke(IPC_CHANNELS.assetsExtractVideoFrame, {
+        assetId: "asset",
+        frameNumber: 0,
+        fps: 24
+      })
+    ).rejects.toThrow();
     expect(transport).not.toHaveBeenCalled();
     expect(mocks.key).not.toHaveBeenCalled();
     open.mockRestore();

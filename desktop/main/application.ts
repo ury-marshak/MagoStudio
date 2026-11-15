@@ -486,7 +486,8 @@ void app
     registerMediaProtocol(
       projectRepository,
       scriptProjectSnapshotRepository,
-      librarySettings
+      librarySettings,
+      videoFrameService.libraryWork
     );
     registerComfyHandlers(librarySettings, assertLegacyInferenceAvailable);
     registerExternalProviderHandlers(externalProviders);
@@ -527,7 +528,8 @@ void app
           localScriptChatService.suspend(),
           localScriptProjectService.suspendMetrics(),
           localScriptProjectService.suspendDescriptions(),
-          vlmService.suspend()
+          vlmService.suspend(),
+          videoFrameService.libraryWork.suspend()
         ]);
       },
       afterLibraryChange: () => {
@@ -537,6 +539,7 @@ void app
         localScriptProjectService.resetMetrics();
         localScriptProjectService.resetDescriptions();
         vlmService.reset();
+        videoFrameService.libraryWork.reset();
       }
     });
     registerProjectHandlers(
@@ -545,7 +548,8 @@ void app
       databaseManager,
       librarySettings,
       describeImageLater,
-      vlmService.libraryWork
+      vlmService.libraryWork,
+      videoFrameService.libraryWork
     );
     registerScriptProjectHandlers({
       service: localScriptProjectService,
@@ -599,6 +603,7 @@ app.on("before-quit", () => {
   externalRenderJobService.stop();
   stopVlmRequests();
   vlmService.stop();
+  videoFrameService.libraryWork.stop();
   localScriptChatService.stop();
   localScriptProjectService.stopMetrics();
   localScriptProjectService.stopDescriptions();

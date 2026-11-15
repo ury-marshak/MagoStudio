@@ -101,7 +101,8 @@ export const registerProjectHandlers = (
   importWork: Pick<
     LibraryWorkSession<unknown>,
     "run" | "boundary" | "capture"
-  > = new LibraryWorkSession(() => undefined)
+  > = new LibraryWorkSession(() => undefined),
+  mediaWork = importWork
 ): void => {
   const ensureDatabase = async (required = false): Promise<boolean> => {
     if (databaseManager.isOpen()) return true;
@@ -271,17 +272,27 @@ export const registerProjectHandlers = (
     IPC_CHANNELS.projectsImportVideos,
     async (event, value: unknown) => {
       requireTrustedSender(event);
-      await ensureDatabase(true);
-      const input = requireRecord(value);
-      if (!Array.isArray(input.videos) || input.videos.length === 0) {
-        throw new Error("At least one video is required");
-      }
-      if (input.videos.length > MAX_IMPORT_VIDEOS)
-        throw new Error("Too many videos selected");
-      return repository.importVideos(
-        requireString(input.projectId, "projectId"),
-        input.videos.map(validateVideo)
-      );
+      return mediaWork.run(async () => {
+        if (!databaseManager.isOpen()) {
+          const root = await mediaWork.boundary(() =>
+            settings.getLibraryRoot()
+          );
+          if (!root) throw new Error("Choose a Mago library folder first");
+          await mediaWork.boundary(() => databaseManager.open(root));
+        }
+        const input = requireRecord(value);
+        if (!Array.isArray(input.videos) || input.videos.length === 0) {
+          throw new Error("At least one video is required");
+        }
+        if (input.videos.length > MAX_IMPORT_VIDEOS)
+          throw new Error("Too many videos selected");
+        return mediaWork.boundary(() =>
+          repository.importVideos(
+            requireString(input.projectId, "projectId"),
+            (input.videos as unknown[]).map(validateVideo)
+          )
+        );
+      });
     }
   );
   ipcMain.handle(IPC_CHANNELS.tracksCreate, async (event, value: unknown) => {
