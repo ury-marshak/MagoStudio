@@ -41,8 +41,12 @@ export const createAudioStreamLineScanner = () => {
   };
 };
 
-export const doesVideoHaveAudioStream = (filename: string): Promise<boolean> =>
+export const doesVideoHaveAudioStream = (
+  filename: string,
+  signal?: AbortSignal
+): Promise<boolean> =>
   new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
     if (!ffmpegPath) {
       reject(new Error("The bundled video encoder is unavailable"));
       return;
@@ -53,19 +57,31 @@ export const doesVideoHaveAudioStream = (filename: string): Promise<boolean> =>
       { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] }
     );
     const audioStreamScanner = createAudioStreamLineScanner();
+    let failure: unknown;
+    const fail = (error: unknown) => {
+      if (failure) return;
+      failure = error;
+      child.kill("SIGKILL");
+    };
+    const abort = () => fail(signal?.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error("Timed out checking the video's audio"));
+      fail(new Error("Timed out checking the video's audio"));
     }, PROBE_TIMEOUT_MS);
     child.stderr.on("data", (chunk: Buffer) => {
       audioStreamScanner.read(chunk.toString());
     });
-    child.once("error", (failure) => {
-      clearTimeout(timer);
-      reject(failure);
+    child.once("error", (error) => {
+      failure ??= error;
     });
     child.once("close", () => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (failure || signal?.aborted) {
+        reject(failure ?? signal?.reason);
+        return;
+      }
       if (!audioStreamScanner.hasOpenedInput()) {
         reject(
           new Error(

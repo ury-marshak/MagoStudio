@@ -21,6 +21,7 @@ import {
   resolveImageToVideoResolution
 } from "../imageRenders/imageToVideoModels";
 import { estimateImageToVideoOutputDimensions } from "../imageRenders/imageToVideoOutputDimensions";
+import { LibraryWorkSession } from "../libraryWorkSession";
 import { atomicWriteFile } from "../storage/atomicFile";
 
 import { readStoredCloudOutputLayerId } from "./cloudRenderJobRepository";
@@ -154,6 +155,9 @@ export const isImageJobRequest = (
 ): boolean => request?.kind === IMAGE_JOB_KIND;
 
 export class CloudRenderSubmitService {
+  /** Also owns cloud-finish IPC and its download, before policy/root waits. */
+  readonly libraryWork = new LibraryWorkSession(() => undefined);
+
   constructor(
     private readonly manager: DatabaseManager,
     private readonly getLibraryRoot: () => Promise<string | null>,
@@ -163,10 +167,26 @@ export class CloudRenderSubmitService {
       origin?: AbortSignal
     ) => void,
     private readonly probeRenderedVideo: (
-      filePath: string
+      filePath: string,
+      signal?: AbortSignal
     ) => Promise<RenderedVideoMetadata | null> = probeRenderedVideoMetadata,
     private readonly captureImageSession?: () => AbortSignal
-  ) {}
+  ) {
+    this.manager = this.libraryWork.guard(manager);
+    this.getLibraryRoot = this.libraryWork.bind(getLibraryRoot);
+    // These are local repository/media operations, not provider inference.
+    // Drain their complete internal multi-await work before replacing the DB.
+    const ingestion = this.libraryWork.guard({
+      register: this.register.bind(this),
+      registerImage: this.registerImage.bind(this),
+      complete: this.complete.bind(this),
+      fail: this.fail.bind(this)
+    });
+    this.register = ingestion.register;
+    this.registerImage = ingestion.registerImage;
+    this.complete = ingestion.complete;
+    this.fail = ingestion.fail;
+  }
 
   async register(
     input: CloudRenderRegistration
@@ -427,8 +447,7 @@ export class CloudRenderSubmitService {
     },
     descriptionSession = this.captureImageSession?.()
   ): Promise<void> {
-    // Description ownership begins before any asynchronous ingestion lookup.
-    // Transfer/write ownership itself is audited separately.
+    this.libraryWork.capture();
     const libraryRoot = await this.getLibraryRoot();
     if (!libraryRoot) throw new Error("Choose a Mago library folder first");
 
@@ -499,7 +518,7 @@ export class CloudRenderSubmitService {
 
     const deliveredVideo = isImage
       ? null
-      : await this.probeRenderedVideo(absolutePath);
+      : await this.probeRenderedVideo(absolutePath, this.libraryWork.signal);
     const deliveredVideoAssetFields = deliveredVideo
       ? toDeliveredVideoAssetFields(deliveredVideo, request.fps)
       : {};
@@ -622,6 +641,7 @@ export class CloudRenderSubmitService {
         })
         .where(eq(cloudRenderJobs.id, input.jobId));
     });
+    this.libraryWork.capture();
     if (isImage) this.onImageAvailable?.(job.assetId, descriptionSession);
   }
 

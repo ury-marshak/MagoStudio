@@ -414,6 +414,15 @@ it.each(["fal", "text", "vision"])(
       id: "asset",
       data: { auto_prompt: [{ positive_prompt: "replacement prompt" }] }
     });
+    await expect(invoke(IPC_CHANNELS.imageRendersListQueue)).resolves.toEqual(
+      []
+    );
+    await expect(
+      invoke(IPC_CHANNELS.cloudRenderFail, {
+        jobId: "missing",
+        message: "fixture"
+      })
+    ).resolves.toBeUndefined();
     const failed = path.join(root, "failed-replacement");
     await mkdir(failed);
     const open = vi
@@ -432,6 +441,13 @@ it.each(["fal", "text", "vision"])(
       })
     ).rejects.toThrow();
     await expect(invoke(IPC_CHANNELS.vlmStatus)).rejects.toThrow();
+    await expect(invoke(IPC_CHANNELS.imageRendersListQueue)).rejects.toThrow();
+    await expect(
+      invoke(IPC_CHANNELS.cloudRenderFail, {
+        jobId: "missing",
+        message: "late fixture"
+      })
+    ).rejects.toThrow();
     expect((await media(new Request("mago-media://asset/asset"))).status).toBe(
       404
     );

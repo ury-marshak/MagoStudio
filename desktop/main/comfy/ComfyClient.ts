@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, openAsBlob } from "node:fs";
 import path from "node:path";
-import { Readable, Transform } from "node:stream";
+import { Readable, Transform, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 
@@ -45,9 +45,13 @@ type ComfyPromptMonitor = Pick<
   "watch" | "forget" | "livePrompt" | "waitForSettle" | "resetConnection"
 >;
 
-const hashFile = async (filePath: string): Promise<string> => {
+const hashFile = async (
+  filePath: string,
+  signal?: AbortSignal
+): Promise<string> => {
   const hash = createHash("sha256");
-  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  for await (const chunk of createReadStream(filePath, { signal }))
+    hash.update(chunk);
   return hash.digest("hex");
 };
 
@@ -58,7 +62,11 @@ export class ComfyClient {
   readonly endpoint: string;
   private readonly monitor: ComfyPromptMonitor;
 
-  constructor(endpoint: string, monitor?: ComfyPromptMonitor) {
+  constructor(
+    endpoint: string,
+    monitor?: ComfyPromptMonitor,
+    private readonly signal?: AbortSignal
+  ) {
     this.endpoint = normalizeComfyEndpoint(endpoint);
     this.monitor = monitor ?? comfyProgressMonitorFor(this.endpoint);
   }
@@ -80,6 +88,7 @@ export class ComfyClient {
         client_id: COMFY_PROCESS_CLIENT_ID
       })
     });
+    this.signal?.throwIfAborted();
     if (typeof response.prompt_id !== "string" || !response.prompt_id)
       throw new Error(formatComfyError(response));
     this.monitor.watch(response.prompt_id, graph);
@@ -88,7 +97,8 @@ export class ComfyClient {
 
   async uploadFile(filePath: string): Promise<string> {
     const extension = path.extname(filePath).toLowerCase() || ".png";
-    const contentHash = await hashFile(filePath);
+    this.signal?.throwIfAborted();
+    const contentHash = await hashFile(filePath, this.signal);
     const body = await openAsBlob(filePath, {
       type: comfyMimeTypeForFile(filePath)
     });
@@ -112,6 +122,7 @@ export class ComfyClient {
 
   async readPromptStatus(promptId: string): Promise<ComfyPromptStatus> {
     const status = await this.readPromptStatusOverHttp(promptId);
+    this.signal?.throwIfAborted();
     const isPromptOver =
       status.state === "finished" || status.state === "error";
     if (isPromptOver) this.monitor.forget(promptId);
@@ -139,9 +150,30 @@ export class ComfyClient {
   ): Promise<Buffer> {
     const response = await this.requestView(reference, defaultType);
     const declaredLength = Number(response.headers.get("content-length") ?? 0);
-    if (declaredLength > maxBytes)
+    if (declaredLength > maxBytes) {
+      await response.body?.cancel();
       throw new Error("ComfyUI output is too large");
-    const bytes = Buffer.from(await response.arrayBuffer());
+    }
+    if (!response.body) throw new Error("ComfyUI returned an invalid output");
+    const chunks: Buffer[] = [];
+    let received = 0;
+    await pipeline(
+      Readable.fromWeb(response.body as NodeReadableStream<Uint8Array>),
+      new Writable({
+        write(chunk: Buffer, _encoding, callback) {
+          received += chunk.length;
+          if (received > maxBytes)
+            callback(new Error("ComfyUI output is too large"));
+          else {
+            chunks.push(chunk);
+            callback();
+          }
+        }
+      }),
+      { signal: this.signal }
+    );
+    this.signal?.throwIfAborted();
+    const bytes = Buffer.concat(chunks);
     if (!bytes.length || bytes.length > maxBytes)
       throw new Error("ComfyUI returned an invalid output");
     return bytes;
@@ -154,8 +186,10 @@ export class ComfyClient {
   ): Promise<void> {
     const response = await this.requestView(reference, defaultType);
     const declaredLength = Number(response.headers.get("content-length") ?? 0);
-    if (declaredLength > maxBytes)
+    if (declaredLength > maxBytes) {
+      await response.body?.cancel();
       throw new Error("ComfyUI output is too large");
+    }
     if (!response.body) throw new Error("ComfyUI returned an invalid output");
     let receivedBytes = 0;
     const enforceSizeLimit = new Transform({
@@ -170,8 +204,10 @@ export class ComfyClient {
       await pipeline(
         Readable.fromWeb(response.body as NodeReadableStream<Uint8Array>),
         enforceSizeLimit,
-        createWriteStream(temporary)
+        createWriteStream(temporary),
+        { signal: this.signal }
       );
+      this.signal?.throwIfAborted();
       if (receivedBytes === 0)
         throw new Error("ComfyUI returned an invalid output");
     });
@@ -307,23 +343,34 @@ export class ComfyClient {
   ): Promise<Record<string, unknown>> {
     const response = await this.request(pathname, init);
     try {
-      return (await response.json()) as Record<string, unknown>;
+      const result = (await response.json()) as Record<string, unknown>;
+      this.signal?.throwIfAborted();
+      return result;
     } catch {
       throw new Error(`ComfyUI returned invalid JSON for ${pathname}`);
     }
   }
 
   async request(pathname: string, init: RequestInit): Promise<Response> {
+    this.signal?.throwIfAborted();
     let response: Response;
+    const timeout = init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const signal = this.signal
+      ? AbortSignal.any([this.signal, timeout])
+      : timeout;
     try {
       response = await fetch(`${this.endpoint}${pathname}`, {
         ...init,
-        signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+        signal
       });
     } catch (error) {
       throw new Error(
         `Cannot reach ComfyUI at ${this.endpoint}: ${error instanceof Error ? error.message : "network error"}`
       );
+    }
+    if (signal.aborted) {
+      await response.body?.cancel();
+      signal.throwIfAborted();
     }
     if (!response.ok) {
       const body = await response.text();

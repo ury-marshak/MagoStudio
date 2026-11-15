@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import path from "node:path";
@@ -12,6 +12,7 @@ import type {
   LocalQueueItem,
   LocalVideoRenderInput
 } from "../../shared/contracts";
+import { ComfyClient } from "../comfy/ComfyClient";
 import type { ComfyLivePrompt } from "../comfy/ComfyProgressMonitor";
 import {
   comfyProgressMonitorFor,
@@ -28,12 +29,10 @@ import {
   shots,
   tracks
 } from "../database/schema";
-import {
-  clearLibraryIssue,
-  reportLibraryIssue,
-  runBackgroundTask
-} from "../libraryHealth";
+import { clearLibraryIssue, reportLibraryIssue } from "../libraryHealth";
+import { LibraryWorkSession } from "../libraryWorkSession";
 import { doesVideoHaveAudioStream } from "../media/doesVideoHaveAudioStream";
+import { runLibraryFfmpeg } from "../media/runLibraryFfmpeg";
 import { validateVideo } from "../media/validateVideo";
 import { InferenceUnavailableError } from "../providers/inferenceUnavailableError";
 import {
@@ -117,7 +116,6 @@ const LTX_MAX_INPUT_DIMENSION = 16_384;
 const LTX_TRIM_ALIGNMENT = 32;
 const LTX_MAX_LORA_STRENGTH = 1.5;
 const MIN_TRIM_DURATION_SECONDS = 0.01;
-const MAX_FFMPEG_ERROR_LENGTH = 2_000;
 const QWEN_MULTI_REFERENCE_INSTRUCTION =
   "Preserve the content, composition, geometry, identity, and pose from @Image1. Apply only the visual style from the remaining reference images.";
 
@@ -367,11 +365,22 @@ export const planSettingsCrop = (
 };
 
 export class ImageRenderService {
-  private timer: NodeJS.Timeout | null = null;
-  private processing = false;
-  private isKickRequestedDuringProcessing = false;
-  private stopListeningForComfySettles: (() => void) | null = null;
-  private readonly comfyStatusCheckedAtByJobId = new Map<string, number>();
+  readonly libraryWork = new LibraryWorkSession(() => ({
+    timer: null as NodeJS.Timeout | null,
+    processing: false,
+    isKickRequestedDuringProcessing: false,
+    stopListeningForComfySettles: null as (() => void) | null,
+    comfyStatusCheckedAtByJobId: new Map<string, number>()
+  }));
+  private readonly files = this.libraryWork.guard({
+    mkdir,
+    readFile,
+    stat,
+    atomicWriteFile,
+    atomicCopyFile,
+    atomicProduceFile,
+    publishFile
+  });
 
   constructor(
     private readonly manager: DatabaseManager,
@@ -385,7 +394,79 @@ export class ImageRenderService {
     /** Gates saved endpoints too, not only endpoint lookup for new renders. */
     private readonly assertInferenceAvailable: () => Promise<void> = async () => {},
     private readonly captureImageSession?: () => AbortSignal
-  ) {}
+  ) {
+    this.manager = this.libraryWork.guard(manager);
+    this.getLibraryRoot = this.libraryWork.guard({
+      getLibraryRoot
+    }).getLibraryRoot;
+    this.getComfyEndpoint = this.libraryWork.bind(getComfyEndpoint);
+    this.assertInferenceAvailable = this.libraryWork.bind(
+      assertInferenceAvailable
+    );
+    this.reconcileInterruptedRenders = this.libraryWork.bind(
+      this.reconcileInterruptedRenders.bind(this)
+    );
+    this.submit = this.libraryWork.bind(this.submit.bind(this));
+    this.submitVideo = this.libraryWork.bind(this.submitVideo.bind(this));
+    this.cancel = this.libraryWork.bind(this.cancel.bind(this));
+    this.kick = this.libraryWork.bind(this.kick.bind(this));
+    const local = this.libraryWork.guard({
+      listQueue: this.listQueue.bind(this),
+      markInteracted: this.markInteracted.bind(this),
+      ensureVideoRenderDirectory: this.ensureVideoRenderDirectory.bind(this),
+      completeComfyVideo: this.completeComfyVideo.bind(this),
+      updateProviderProgress: this.updateProviderProgress.bind(this),
+      trimVideo: this.trimVideo.bind(this),
+      filterVideoFile: this.filterVideoFile.bind(this),
+      completeImageBytes: this.completeImageBytes.bind(this),
+      completeVideoFile: this.completeVideoFile.bind(this),
+      extractVideoThumbnail: this.extractVideoThumbnail.bind(this),
+      finishWithStatus: this.finishWithStatus.bind(this),
+      assetPath: this.assetPath.bind(this),
+      fileDataUrl: this.fileDataUrl.bind(this)
+    });
+    this.listQueue = local.listQueue;
+    this.markInteracted = local.markInteracted;
+    this.ensureVideoRenderDirectory = local.ensureVideoRenderDirectory;
+    this.completeComfyVideo = local.completeComfyVideo;
+    this.updateProviderProgress = local.updateProviderProgress;
+    this.trimVideo = local.trimVideo;
+    this.filterVideoFile = local.filterVideoFile;
+    this.completeImageBytes = local.completeImageBytes;
+    this.completeVideoFile = local.completeVideoFile;
+    this.extractVideoThumbnail = local.extractVideoThumbnail;
+    this.finishWithStatus = local.finishWithStatus;
+    this.assetPath = local.assetPath;
+    this.fileDataUrl = local.fileDataUrl;
+  }
+
+  async suspend(): Promise<void> {
+    this.stop();
+    await this.libraryWork.suspend();
+  }
+
+  reset(): void {
+    this.libraryWork.reset();
+    this.startWithRecovery();
+  }
+
+  private ownedComfy(endpoint: string): ComfyClient {
+    this.libraryWork.capture();
+    const client = new ComfyClient(
+      endpoint,
+      undefined,
+      this.libraryWork.signal
+    );
+    const transfers = this.libraryWork.guard({
+      uploadFile: client.uploadFile.bind(client),
+      downloadBuffer: client.downloadBuffer.bind(client),
+      downloadToFile: client.downloadToFile.bind(client)
+    });
+    client.uploadFile = transfers.uploadFile;
+    client.downloadBuffer = transfers.downloadBuffer;
+    client.downloadToFile = transfers.downloadToFile;
+    return this.libraryWork.guard(client, false);
+  }
 
   /** Policy pauses are not failed jobs and must not make a clean external
    * startup display a library-health error. Corrupt settings still surface. */
@@ -399,45 +480,96 @@ export class ImageRenderService {
     }
   }
 
+  startWithRecovery(): void {
+    void this.libraryWork
+      .run(async () => {
+        try {
+          await this.reconcileInterruptedRenders();
+          this.libraryWork.capture();
+          this.start();
+          clearLibraryIssue("Interrupted render recovery");
+        } catch (error) {
+          if (!this.libraryWork.signal.aborted)
+            reportLibraryIssue({
+              id: "Interrupted render recovery",
+              kind: "service",
+              message:
+                "Interrupted render recovery: " +
+                (error instanceof Error ? error.message : String(error))
+            });
+        }
+      })
+      .catch(() => {});
+  }
+
   start(): void {
-    if (this.timer) return;
-    this.timer = setInterval(() => this.scheduleKick(), POLL_INTERVAL_MS);
-    this.timer.unref();
-    this.stopListeningForComfySettles = onAnyComfyPromptSettled(() =>
-      this.scheduleKick()
-    );
-    this.scheduleKick();
+    this.libraryWork.capture();
+    // Timer and global monitor callbacks retain the registration session.
+    void this.libraryWork
+      .run(async () => {
+        if (this.libraryWork.state.timer) return;
+        const timer = setInterval(() => this.scheduleKick(), POLL_INTERVAL_MS);
+        this.libraryWork.state.timer = timer;
+        timer.unref();
+        const schedule = AsyncResource.bind(() => this.scheduleKick());
+        this.libraryWork.state.stopListeningForComfySettles =
+          onAnyComfyPromptSettled(schedule);
+        this.scheduleKick();
+      })
+      .catch(() => {});
   }
 
   private scheduleKick(): void {
-    void runBackgroundTask("Render polling", () => this.kick());
+    if (this.libraryWork.signal.aborted) return;
+    void this.libraryWork
+      .run(async () => {
+        try {
+          await this.kick();
+          this.libraryWork.capture();
+          clearLibraryIssue("Render polling");
+        } catch (error) {
+          if (!this.libraryWork.signal.aborted)
+            reportLibraryIssue({
+              id: "Render polling",
+              kind: "service",
+              message:
+                "Render polling: " +
+                (error instanceof Error ? error.message : String(error))
+            });
+        }
+      })
+      .catch(() => {});
   }
 
   async reconcileInterruptedRenders(): Promise<void> {
     const descriptionSession = this.captureImageSession?.();
     if (!(await this.canProcessInference())) return;
-    this.processing = true;
+    this.libraryWork.state.processing = true;
     try {
-      const jobs = await this.manager.get().select().from(imageRenderJobs);
+      const jobs = await this.libraryWork.boundary(async () =>
+        this.manager.get().select().from(imageRenderJobs)
+      );
       const root = await this.requireLibraryRoot();
       for (const job of jobs) {
         const active = ACTIVE_STATUSES.includes(job.status);
         if (!active && job.status !== "FINISHED") continue;
-        const [asset] = await this.manager
-          .get()
-          .select()
-          .from(assets)
-          .where(eq(assets.id, job.assetId))
-          .limit(1);
+        const [asset] = await this.libraryWork.boundary(async () =>
+          this.manager
+            .get()
+            .select()
+            .from(assets)
+            .where(eq(assets.id, job.assetId))
+            .limit(1)
+        );
         if (!asset) continue;
         try {
           if (active) readRenderRequest(job.requestJson);
-          const file = await stat(asset.sourcePath).catch(
-            (error: NodeJS.ErrnoException) => {
+          const file = await this.files
+            .stat(asset.sourcePath)
+            .catch((error: NodeJS.ErrnoException) => {
               if (error.code === "ENOENT") return null;
               throw error;
-            }
-          );
+            });
           if (!file?.isFile() || file.size === 0) {
             if (!active)
               throw new Error(
@@ -452,7 +584,7 @@ export class ImageRenderService {
           }
           if (!active) continue;
           if (asset.type === "image") {
-            const bytes = await readFile(asset.sourcePath);
+            const bytes = await this.files.readFile(asset.sourcePath);
             if (nativeImage.createFromBuffer(bytes).isEmpty())
               throw new Error("Interrupted render output is unreadable.");
             await this.completeImageBytes(
@@ -462,7 +594,9 @@ export class ImageRenderService {
               descriptionSession
             );
           } else {
-            await validateVideo(asset.sourcePath);
+            await this.libraryWork.boundary(() =>
+              validateVideo(asset.sourcePath, this.libraryWork.signal)
+            );
             const request = parseJson<CompletableVideoRequest>(job.requestJson);
             // The published output has already been cropped. Do not crop it twice.
             await this.completeVideoFile(
@@ -471,8 +605,10 @@ export class ImageRenderService {
               asset.sourcePath
             );
           }
+          this.libraryWork.capture();
           clearLibraryIssue(`render:${job.id}`);
         } catch (error) {
+          this.libraryWork.capture();
           const message =
             error instanceof Error ? error.message : String(error);
           reportLibraryIssue({
@@ -493,15 +629,16 @@ export class ImageRenderService {
         }
       }
     } finally {
-      this.processing = false;
+      this.libraryWork.state.processing = false;
     }
   }
 
   stop(): void {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-    this.stopListeningForComfySettles?.();
-    this.stopListeningForComfySettles = null;
+    if (this.libraryWork.state.timer)
+      clearInterval(this.libraryWork.state.timer);
+    this.libraryWork.state.timer = null;
+    this.libraryWork.state.stopListeningForComfySettles?.();
+    this.libraryWork.state.stopListeningForComfySettles = null;
   }
 
   async submit(input: LocalImageRenderInput): Promise<{ jobId: string }> {
@@ -524,7 +661,7 @@ export class ImageRenderService {
     const root = await this.requireLibraryRoot();
     const jobId = randomUUID();
     const jobDirectory = path.join(root, "renders", "images", jobId);
-    await mkdir(jobDirectory, { recursive: true });
+    await this.files.mkdir(jobDirectory, { recursive: true });
 
     let inputRelativePath: string | undefined;
     if (input.inputImage) {
@@ -535,7 +672,10 @@ export class ImageRenderService {
         jobId,
         `input.${decoded.extension}`
       );
-      await atomicWriteFile(path.join(root, inputRelativePath), decoded.bytes);
+      await this.files.atomicWriteFile(
+        path.join(root, inputRelativePath),
+        decoded.bytes
+      );
     }
 
     const now = new Date();
@@ -682,14 +822,21 @@ export class ImageRenderService {
     const { inputTrackId } = input;
     if (!inputTrackId) throw new Error("The input track has no video clip");
     const database = this.manager.get();
-    const [[outputTrack], [inputTrack]] = await Promise.all([
-      database
-        .select()
-        .from(tracks)
-        .where(eq(tracks.id, input.outputTrackId))
-        .limit(1),
-      database.select().from(tracks).where(eq(tracks.id, inputTrackId)).limit(1)
-    ]);
+    const [[outputTrack], [inputTrack]] = await this.libraryWork.boundary(
+      async () =>
+        Promise.all([
+          database
+            .select()
+            .from(tracks)
+            .where(eq(tracks.id, input.outputTrackId))
+            .limit(1),
+          database
+            .select()
+            .from(tracks)
+            .where(eq(tracks.id, inputTrackId))
+            .limit(1)
+        ])
+    );
     if (
       !outputTrack ||
       !inputTrack ||
@@ -697,17 +844,21 @@ export class ImageRenderService {
     ) {
       throw new Error("Local render tracks are unavailable");
     }
-    const [sourceClip] = await database
-      .select()
-      .from(clips)
-      .where(eq(clips.trackId, inputTrackId))
-      .limit(1);
+    const [sourceClip] = await this.libraryWork.boundary(async () =>
+      database
+        .select()
+        .from(clips)
+        .where(eq(clips.trackId, inputTrackId))
+        .limit(1)
+    );
     if (!sourceClip) throw new Error("The input track has no video clip");
-    const [sourceAsset] = await database
-      .select()
-      .from(assets)
-      .where(eq(assets.id, sourceClip.assetId))
-      .limit(1);
+    const [sourceAsset] = await this.libraryWork.boundary(async () =>
+      database
+        .select()
+        .from(assets)
+        .where(eq(assets.id, sourceClip.assetId))
+        .limit(1)
+    );
     if (!sourceAsset || sourceAsset.type === "image")
       throw new Error("The input track has no local video");
 
@@ -723,7 +874,7 @@ export class ImageRenderService {
       "input.mp4"
     );
     const outputPath = path.join(jobDirectory, "output.mp4");
-    await mkdir(jobDirectory, { recursive: true });
+    await this.files.mkdir(jobDirectory, { recursive: true });
     const durationMs = Math.round((inputFrameCount / input.fps) * 1000);
     const settingsWidth = input.settings.width;
     const settingsHeight = input.settings.height;
@@ -872,6 +1023,7 @@ export class ImageRenderService {
             .where(eq(tracks.id, job.trackId))
             .limit(1)
         ]);
+        this.libraryWork.capture();
         let request: StoredRequest;
         let requestError: string | null = null;
         try {
@@ -975,11 +1127,13 @@ export class ImageRenderService {
   async cancel(jobId: string): Promise<void> {
     await this.assertInferenceAvailable();
     const database = this.manager.get();
-    const [job] = await database
-      .select()
-      .from(imageRenderJobs)
-      .where(eq(imageRenderJobs.id, jobId))
-      .limit(1);
+    const [job] = await this.libraryWork.boundary(async () =>
+      database
+        .select()
+        .from(imageRenderJobs)
+        .where(eq(imageRenderJobs.id, jobId))
+        .limit(1)
+    );
     if (!job || !ACTIVE_STATUSES.includes(job.status)) return;
     if (job.providerRequestId) {
       try {
@@ -991,31 +1145,41 @@ export class ImageRenderService {
             ? storedComfyEndpoint
             : await this.getComfyEndpoint();
           if (job.model === "wan_animate_2_2")
-            await new ComfyWanAnimateClient(endpoint).cancel(
-              job.providerRequestId
-            );
+            await new ComfyWanAnimateClient(
+              endpoint,
+              this.ownedComfy(endpoint)
+            ).cancel(job.providerRequestId);
           else if (job.model === "wan_vace_2_1")
-            await new ComfyWanVaceClient(endpoint).cancel(
-              job.providerRequestId
-            );
+            await new ComfyWanVaceClient(
+              endpoint,
+              this.ownedComfy(endpoint)
+            ).cancel(job.providerRequestId);
           else if (job.model === "mago_style_transfer_local")
-            await new ComfyWanFunControlClient(endpoint).cancel(
-              job.providerRequestId
-            );
+            await new ComfyWanFunControlClient(
+              endpoint,
+              this.ownedComfy(endpoint)
+            ).cancel(job.providerRequestId);
           else if (job.model === "mago_animate")
-            await new ComfyMagoAnimateClient(endpoint).cancel(
-              job.providerRequestId
-            );
+            await new ComfyMagoAnimateClient(
+              endpoint,
+              this.ownedComfy(endpoint)
+            ).cancel(job.providerRequestId);
           else if (job.model === "ltx_2_3_spatial_upscaler")
-            await new ComfyLtxUpscaleClient(endpoint).cancel(
-              job.providerRequestId
-            );
+            await new ComfyLtxUpscaleClient(
+              endpoint,
+              this.ownedComfy(endpoint)
+            ).cancel(job.providerRequestId);
           else if (job.model === "minimax_h3_local")
-            await new ComfyMiniMaxH3Client(endpoint).cancel(
-              job.providerRequestId
-            );
+            await new ComfyMiniMaxH3Client(
+              endpoint,
+              this.ownedComfy(endpoint)
+            ).cancel(job.providerRequestId);
           else
-            await new ComfyQwenClient(endpoint).cancel(job.providerRequestId);
+            await new ComfyQwenClient(
+              endpoint,
+              undefined,
+              this.ownedComfy(endpoint)
+            ).cancel(job.providerRequestId);
         }
       } catch (error) {
         console.warn(
@@ -1024,7 +1188,7 @@ export class ImageRenderService {
         );
       }
     }
-    this.comfyStatusCheckedAtByJobId.delete(job.id);
+    this.libraryWork.state.comfyStatusCheckedAtByJobId.delete(job.id);
     await this.finishWithStatus(
       job.id,
       job.assetId,
@@ -1045,26 +1209,30 @@ export class ImageRenderService {
   async kick(): Promise<void> {
     const descriptionSession = this.captureImageSession?.();
     if (!this.manager.isOpen()) return;
-    if (this.processing) {
-      this.isKickRequestedDuringProcessing = true;
+    if (this.libraryWork.state.processing) {
+      this.libraryWork.state.isKickRequestedDuringProcessing = true;
       return;
     }
-    this.processing = true;
-    this.isKickRequestedDuringProcessing = false;
+    this.libraryWork.state.processing = true;
+    this.libraryWork.state.isKickRequestedDuringProcessing = false;
     try {
       if (!(await this.canProcessInference())) return;
-      const jobs = await this.manager
-        .get()
-        .select()
-        .from(imageRenderJobs)
-        .where(inArray(imageRenderJobs.status, ACTIVE_STATUSES));
+      const jobs = await this.libraryWork.boundary(async () =>
+        this.manager
+          .get()
+          .select()
+          .from(imageRenderJobs)
+          .where(inArray(imageRenderJobs.status, ACTIVE_STATUSES))
+      );
       for (const job of jobs) {
         // A changed profile pauses the queue without marking saved jobs failed.
         if (!(await this.canProcessInference())) return;
         try {
           await this.process(job, descriptionSession);
+          this.libraryWork.capture();
           clearLibraryIssue(`render-poll:${job.id}`);
         } catch (error) {
+          this.libraryWork.capture();
           const rawMessage =
             error instanceof Error ? error.message : "Unknown render error";
           const message = rawMessage;
@@ -1099,9 +1267,10 @@ export class ImageRenderService {
         }
       }
     } finally {
-      this.processing = false;
+      this.libraryWork.state.processing = false;
     }
-    if (this.isKickRequestedDuringProcessing) this.scheduleKick();
+    if (this.libraryWork.state.isKickRequestedDuringProcessing)
+      this.scheduleKick();
   }
 
   private async process(
@@ -1150,7 +1319,8 @@ export class ImageRenderService {
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
     const client = new ComfyQwenClient(
       endpoint,
-      resolveQwenImageEditSetup(request.settings.qwen_image_edit_setup)
+      resolveQwenImageEditSetup(request.settings.qwen_image_edit_setup),
+      this.ownedComfy(endpoint)
     );
     if (!job.providerRequestId) {
       const imagePaths = [
@@ -1233,7 +1403,10 @@ export class ImageRenderService {
   ): Promise<void> {
     const request = parseJson<StoredVideoRequest>(job.requestJson);
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
-    const client = new ComfyWanAnimateClient(endpoint);
+    const client = new ComfyWanAnimateClient(
+      endpoint,
+      this.ownedComfy(endpoint)
+    );
     const { width, height } = this.resolveWanDimensions(
       request.settings,
       request.inputCrop
@@ -1242,7 +1415,7 @@ export class ImageRenderService {
       const root = await this.requireLibraryRoot();
       const inputPath = path.join(root, request.inputRelativePath);
       try {
-        const inputStats = await stat(inputPath);
+        const inputStats = await this.files.stat(inputPath);
         if (!inputStats.isFile())
           throw new Error("Prepared video is unavailable");
       } catch {
@@ -1338,7 +1511,7 @@ export class ImageRenderService {
   ): Promise<void> {
     const request = parseJson<StoredVideoRequest>(job.requestJson);
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
-    const client = new ComfyWanVaceClient(endpoint);
+    const client = new ComfyWanVaceClient(endpoint, this.ownedComfy(endpoint));
     const { width, height } = this.resolveWanDimensions(
       request.settings,
       request.inputCrop
@@ -1347,7 +1520,7 @@ export class ImageRenderService {
       const root = await this.requireLibraryRoot();
       const inputPath = path.join(root, request.inputRelativePath);
       try {
-        const inputStats = await stat(inputPath);
+        const inputStats = await this.files.stat(inputPath);
         if (!inputStats.isFile()) throw new Error("Prepared video unavailable");
       } catch {
         await this.trimVideo(
@@ -1450,7 +1623,10 @@ export class ImageRenderService {
   ): Promise<void> {
     const request = parseJson<StoredVideoRequest>(job.requestJson);
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
-    const client = new ComfyWanFunControlClient(endpoint);
+    const client = new ComfyWanFunControlClient(
+      endpoint,
+      this.ownedComfy(endpoint)
+    );
     const { width, height } = this.resolveWanDimensions(
       request.settings,
       request.inputCrop
@@ -1459,7 +1635,7 @@ export class ImageRenderService {
       const root = await this.requireLibraryRoot();
       const inputPath = path.join(root, request.inputRelativePath);
       try {
-        const inputStats = await stat(inputPath);
+        const inputStats = await this.files.stat(inputPath);
         if (!inputStats.isFile())
           throw new Error("Prepared video is unavailable");
       } catch {
@@ -1584,7 +1760,10 @@ export class ImageRenderService {
   ): Promise<void> {
     const request = parseJson<StoredVideoRequest>(job.requestJson);
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
-    const client = new ComfyMagoAnimateClient(endpoint);
+    const client = new ComfyMagoAnimateClient(
+      endpoint,
+      this.ownedComfy(endpoint)
+    );
     const { width, height } = this.resolveWanDimensions(
       request.settings,
       request.inputCrop
@@ -1593,7 +1772,7 @@ export class ImageRenderService {
       const root = await this.requireLibraryRoot();
       const inputPath = path.join(root, request.inputRelativePath);
       try {
-        const inputStats = await stat(inputPath);
+        const inputStats = await this.files.stat(inputPath);
         if (!inputStats.isFile())
           throw new Error("Prepared video is unavailable");
       } catch {
@@ -1723,7 +1902,10 @@ export class ImageRenderService {
   ): Promise<void> {
     const request = parseJson<StoredVideoRequest>(job.requestJson);
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
-    const client = new ComfyLtxUpscaleClient(endpoint);
+    const client = new ComfyLtxUpscaleClient(
+      endpoint,
+      this.ownedComfy(endpoint)
+    );
     const factor: LtxUpscaleFactor =
       Number(request.settings.ltx_upscale_factor) === LTX_UPSCALE_FACTOR_4
         ? LTX_UPSCALE_FACTOR_4
@@ -1744,7 +1926,7 @@ export class ImageRenderService {
       const root = await this.requireLibraryRoot();
       const inputPath = path.join(root, request.inputRelativePath);
       try {
-        const inputStats = await stat(inputPath);
+        const inputStats = await this.files.stat(inputPath);
         if (!inputStats.isFile())
           throw new Error("Prepared video is unavailable");
       } catch {
@@ -1860,12 +2042,15 @@ export class ImageRenderService {
   ): Promise<void> {
     const request = parseJson<StoredVideoRequest>(job.requestJson);
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
-    const client = new ComfyMiniMaxH3Client(endpoint);
+    const client = new ComfyMiniMaxH3Client(
+      endpoint,
+      this.ownedComfy(endpoint)
+    );
     if (!job.providerRequestId) {
       const root = await this.requireLibraryRoot();
       const inputPath = path.join(root, request.inputRelativePath);
       try {
-        const inputStats = await stat(inputPath);
+        const inputStats = await this.files.stat(inputPath);
         if (!inputStats.isFile())
           throw new Error("Prepared video is unavailable");
       } catch {
@@ -1880,8 +2065,9 @@ export class ImageRenderService {
       const referenceImagePaths = await Promise.all(
         request.referenceImageIds.map((assetId) => this.assetPath(assetId))
       );
-      const doesSourceVideoHaveAudio =
-        await doesVideoHaveAudioStream(inputPath);
+      const doesSourceVideoHaveAudio = await this.libraryWork.boundary(() =>
+        doesVideoHaveAudioStream(inputPath, this.libraryWork.signal)
+      );
       const promptId = await client.submitMiniMaxH3(
         buildMiniMaxH3RenderRequest({
           settings: request.settings,
@@ -1962,15 +2148,20 @@ export class ImageRenderService {
       monitor: comfyProgressMonitorFor(endpoint),
       promptId,
       lastStatusCheckAt:
-        this.comfyStatusCheckedAtByJobId.get(job.id) ??
+        this.libraryWork.state.comfyStatusCheckedAtByJobId.get(job.id) ??
         Number.NEGATIVE_INFINITY,
-      readOverHttp
+      readOverHttp: this.libraryWork.bind(readOverHttp)
     });
+    this.libraryWork.capture();
     const isPromptOver =
       result.state === "finished" || result.state === "error";
-    if (isPromptOver) this.comfyStatusCheckedAtByJobId.delete(job.id);
+    if (isPromptOver)
+      this.libraryWork.state.comfyStatusCheckedAtByJobId.delete(job.id);
     else if (statusCheckedAt !== null)
-      this.comfyStatusCheckedAtByJobId.set(job.id, statusCheckedAt);
+      this.libraryWork.state.comfyStatusCheckedAtByJobId.set(
+        job.id,
+        statusCheckedAt
+      );
     return result;
   }
 
@@ -1979,7 +2170,7 @@ export class ImageRenderService {
   ): Promise<string> {
     const root = await this.requireLibraryRoot();
     const jobDirectory = path.join(root, "renders", "videos", job.id);
-    await mkdir(jobDirectory, { recursive: true });
+    await this.files.mkdir(jobDirectory, { recursive: true });
     return jobDirectory;
   }
 
@@ -2086,30 +2277,19 @@ export class ImageRenderService {
       "-y",
       outputPath
     ];
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(executable, args, {
-        windowsHide: true,
-        stdio: ["ignore", "ignore", "pipe"]
-      });
-      let errorOutput = "";
-      child.stderr.on("data", (chunk: Buffer) => {
-        errorOutput = `${errorOutput}${chunk.toString()}`.slice(
-          -MAX_FFMPEG_ERROR_LENGTH
-        );
-      });
-      child.once("error", reject);
-      child.once("exit", (code) => {
-        if (code === 0) resolve();
-        else
-          reject(
-            new Error(
-              `Unable to prepare the selected video for Seedance${
-                errorOutput.trim() ? `: ${errorOutput.trim()}` : ""
-              }`
-            )
-          );
-      });
-    });
+    try {
+      await runLibraryFfmpeg(
+        executable,
+        args,
+        this.libraryWork.signal,
+        "Unable to prepare the selected video for Seedance"
+      );
+    } catch (error) {
+      // Cleanup of a captured old path is part of the issued media boundary;
+      // it must still run after the session has been aborted.
+      await rm(outputPath, { force: true });
+      throw error;
+    }
   }
 
   private async filterVideoFile(
@@ -2141,30 +2321,12 @@ export class ImageRenderService {
       outputPath
     ];
     try {
-      await new Promise<void>((resolve, reject) => {
-        const child = spawn(executable, args, {
-          windowsHide: true,
-          stdio: ["ignore", "ignore", "pipe"]
-        });
-        let errorOutput = "";
-        child.stderr.on("data", (chunk: Buffer) => {
-          errorOutput = `${errorOutput}${chunk.toString()}`.slice(
-            -MAX_FFMPEG_ERROR_LENGTH
-          );
-        });
-        child.once("error", reject);
-        child.once("exit", (code) => {
-          if (code === 0) resolve();
-          else
-            reject(
-              new Error(
-                `${errorMessage}${
-                  errorOutput.trim() ? `: ${errorOutput.trim()}` : ""
-                }`
-              )
-            );
-        });
-      });
+      await runLibraryFfmpeg(
+        executable,
+        args,
+        this.libraryWork.signal,
+        errorMessage
+      );
     } catch (error) {
       await rm(outputPath, { force: true });
       throw error;
@@ -2191,8 +2353,11 @@ export class ImageRenderService {
       `${job.assetId}.jpg`
     );
     await Promise.all([
-      atomicWriteFile(path.join(root, outputRelative), image.toPNG()),
-      atomicWriteFile(
+      this.files.atomicWriteFile(
+        path.join(root, outputRelative),
+        image.toPNG()
+      ),
+      this.files.atomicWriteFile(
         path.join(root, thumbnailRelative),
         image
           .resize({ width: 480, quality: "good" })
@@ -2243,6 +2408,7 @@ export class ImageRenderService {
         })
         .where(eq(clips.id, job.clipId));
     });
+    this.libraryWork.capture();
     this.onImageAvailable?.(job.assetId, descriptionSession);
   }
 
@@ -2260,7 +2426,7 @@ export class ImageRenderService {
       : null;
     if (cropBackVideoFilter) {
       try {
-        await atomicProduceFile(outputPath, (temporary) =>
+        await this.files.atomicProduceFile(outputPath, (temporary) =>
           this.filterVideoFile(
             renderedVideoPath,
             temporary,
@@ -2272,9 +2438,9 @@ export class ImageRenderService {
         await rm(renderedVideoPath, { force: true });
       }
     } else {
-      await publishFile(renderedVideoPath, outputPath);
+      await this.files.publishFile(renderedVideoPath, outputPath);
     }
-    const deliveredSizeBytes = (await stat(outputPath)).size;
+    const deliveredSizeBytes = (await this.files.stat(outputPath)).size;
 
     let thumbnailRelative: string | null = path.join(
       "thumbnails",
@@ -2282,10 +2448,13 @@ export class ImageRenderService {
       `${job.assetId}.jpg`
     );
     try {
-      await atomicProduceFile(path.join(root, thumbnailRelative), (temporary) =>
-        this.extractVideoThumbnail(path.join(root, outputRelative), temporary)
+      await this.files.atomicProduceFile(
+        path.join(root, thumbnailRelative),
+        (temporary) =>
+          this.extractVideoThumbnail(path.join(root, outputRelative), temporary)
       );
     } catch (error) {
+      this.libraryWork.capture();
       console.warn("Unable to extract generated video thumbnail", error);
       thumbnailRelative = null;
       if (request.sourceThumbnailRelativePath) {
@@ -2296,7 +2465,7 @@ export class ImageRenderService {
           "assets",
           `${job.assetId}${extension}`
         );
-        await atomicCopyFile(
+        await this.files.atomicCopyFile(
           path.join(root, request.sourceThumbnailRelativePath),
           path.join(root, thumbnailRelative)
         );
@@ -2359,30 +2528,12 @@ export class ImageRenderService {
       throw new Error("The bundled video encoder is unavailable");
     const executable = ffmpegPath.replace("app.asar", "app.asar.unpacked");
     const args = buildVideoThumbnailArgs(inputPath, outputPath);
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(executable, args, {
-        windowsHide: true,
-        stdio: ["ignore", "ignore", "pipe"]
-      });
-      let errorOutput = "";
-      child.stderr.on("data", (chunk: Buffer) => {
-        errorOutput = `${errorOutput}${chunk.toString()}`.slice(
-          -MAX_FFMPEG_ERROR_LENGTH
-        );
-      });
-      child.once("error", reject);
-      child.once("exit", (code) => {
-        if (code === 0) resolve();
-        else
-          reject(
-            new Error(
-              `Unable to extract first video frame${
-                errorOutput.trim() ? `: ${errorOutput.trim()}` : ""
-              }`
-            )
-          );
-      });
-    });
+    await runLibraryFfmpeg(
+      executable,
+      args,
+      this.libraryWork.signal,
+      "Unable to extract first video frame"
+    );
   }
 
   private async finishWithStatus(
@@ -2419,12 +2570,13 @@ export class ImageRenderService {
         try {
           data = parseJson<Record<string, unknown>>(clip.dataJson);
         } catch {
-          reportLibraryIssue({
-            id: `clip:${clip.id}`,
-            kind: "asset",
-            assetId,
-            message: `Saved clip ${clip.id} is damaged. Original data has been kept.`
-          });
+          if (!this.libraryWork.signal.aborted)
+            reportLibraryIssue({
+              id: `clip:${clip.id}`,
+              kind: "asset",
+              assetId,
+              message: `Saved clip ${clip.id} is damaged. Original data has been kept.`
+            });
           return;
         }
       }
@@ -2458,14 +2610,14 @@ export class ImageRenderService {
       .where(eq(assets.id, assetId))
       .limit(1);
     if (!asset) throw new Error("A referenced image no longer exists");
-    const fileStats = await stat(asset.sourcePath);
+    const fileStats = await this.files.stat(asset.sourcePath);
     if (!fileStats.isFile() || fileStats.size > MAX_IMAGE_BYTES)
       throw new Error("A referenced image is unavailable or too large");
     return asset.sourcePath;
   }
 
   private async fileDataUrl(filename: string): Promise<string> {
-    const fileStats = await stat(filename);
+    const fileStats = await this.files.stat(filename);
     if (!fileStats.isFile() || fileStats.size > MAX_IMAGE_BYTES)
       throw new Error("Input image is unavailable or too large");
     const extension = path.extname(filename).toLowerCase();
@@ -2475,7 +2627,7 @@ export class ImageRenderService {
         : extension === ".webp"
           ? "image/webp"
           : "image/jpeg";
-    return `data:${mime};base64,${(await readFile(filename)).toString("base64")}`;
+    return `data:${mime};base64,${(await this.files.readFile(filename)).toString("base64")}`;
   }
 
   private decodeDataImage(dataUrl: string): {

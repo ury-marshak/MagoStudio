@@ -53,18 +53,22 @@ export const probeRenderedVideoMetadata = (
   if (!executablePath) return Promise.resolve(null);
   return new Promise((resolve) => {
     const child = spawn(executablePath, buildPacketListingArgs(filePath), {
-      ...(signal ? { signal, killSignal: "SIGKILL" as const } : {}),
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
     const packetLineCounter = createFramecrcPacketLineCounter();
     let ffmpegLog = "";
-    let settled = false;
+    let failed = false;
+    const abort = () => {
+      failed = true;
+      child.kill("SIGKILL");
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     const finish = (exitCode: number | null) => {
-      if (settled) return;
-      settled = true;
       clearTimeout(timer);
-      const didListEveryPacket = exitCode === 0;
+      signal?.removeEventListener("abort", abort);
+      const didListEveryPacket = !failed && !signal?.aborted && exitCode === 0;
       resolve(
         didListEveryPacket
           ? parseRenderedVideoMetadata({
@@ -74,10 +78,7 @@ export const probeRenderedVideoMetadata = (
           : null
       );
     };
-    const timer = setTimeout(() => {
-      child.kill();
-      finish(null);
-    }, FFMPEG_PROBE_TIMEOUT_MS);
+    const timer = setTimeout(abort, FFMPEG_PROBE_TIMEOUT_MS);
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", packetLineCounter.read);
     child.stderr.on("data", (chunk: Buffer) => {
@@ -86,7 +87,10 @@ export const probeRenderedVideoMetadata = (
         KEPT_FFMPEG_LOG_LENGTH
       );
     });
-    child.once("error", () => finish(null));
+    // Even spawn/abort errors are followed by close; retain ownership of stdio.
+    child.once("error", () => {
+      failed = true;
+    });
     child.once("close", finish);
   });
 };

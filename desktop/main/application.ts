@@ -529,7 +529,9 @@ void app
           localScriptProjectService.suspendMetrics(),
           localScriptProjectService.suspendDescriptions(),
           vlmService.suspend(),
-          videoFrameService.libraryWork.suspend()
+          videoFrameService.libraryWork.suspend(),
+          cloudRenderSubmitService.libraryWork.suspend(),
+          imageRenderService.suspend()
         ]);
       },
       afterLibraryChange: () => {
@@ -540,6 +542,8 @@ void app
         localScriptProjectService.resetDescriptions();
         vlmService.reset();
         videoFrameService.libraryWork.reset();
+        cloudRenderSubmitService.libraryWork.reset();
+        imageRenderService.reset();
       }
     });
     registerProjectHandlers(
@@ -580,10 +584,7 @@ void app
       localScriptProjectService.recoverExternalRenderPlans()
     );
     await createWindow();
-    void runBackgroundTask("Interrupted render recovery", async () => {
-      await imageRenderService.reconcileInterruptedRenders();
-      imageRenderService.start();
-    });
+    imageRenderService.startWithRecovery();
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0)
@@ -604,11 +605,13 @@ app.on("before-quit", () => {
   stopVlmRequests();
   vlmService.stop();
   videoFrameService.libraryWork.stop();
+  cloudRenderSubmitService.libraryWork.stop();
   localScriptChatService.stop();
   localScriptProjectService.stopMetrics();
   localScriptProjectService.stopDescriptions();
   void rendererOriginPromise?.then((origin) => origin.close());
   imageRenderService.stop();
+  imageRenderService.libraryWork.stop();
   closeAllComfyProgressMonitors();
   databaseManager.close();
 });

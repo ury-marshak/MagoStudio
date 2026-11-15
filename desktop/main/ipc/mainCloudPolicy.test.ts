@@ -56,6 +56,7 @@ import type { DatabaseManager } from "../database/databaseManager";
 import type { ProjectRepository } from "../database/projectRepository";
 import type { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import { LibrarySettings } from "../librarySettings";
+import { LibraryWorkSession } from "../libraryWorkSession";
 import { registerMediaProtocol } from "../rendererProtocol";
 import type { LocalScriptChatService } from "../scriptProjects/localScriptChatService";
 import type { LocalScriptProjectService } from "../scriptProjects/localScriptProjectService";
@@ -75,6 +76,7 @@ const invoke = (channel: string, ...args: unknown[]) =>
   state.handlers.get(channel)!(event, ...args);
 let settings: LibrarySettings;
 let imageSession: AbortController;
+let renderWork: LibraryWorkSession<undefined>;
 const effects = {
   getLink: vi.fn(),
   putLink: vi.fn(),
@@ -105,6 +107,7 @@ beforeEach(async () => {
   state.profile = await mkdtemp(path.join(tmpdir(), "mago-cloud-policy-"));
   settings = new LibrarySettings();
   imageSession = new AbortController();
+  renderWork = new LibraryWorkSession(() => undefined);
   effects.root.mockResolvedValue(state.profile);
   effects.resolve.mockResolvedValue("/fixture/input.mp4");
   effects.prepare.mockResolvedValue({
@@ -139,6 +142,7 @@ beforeEach(async () => {
       get: effects.getJob
     } as unknown as CloudRenderJobRepository,
     renderSubmits: {
+      libraryWork: renderWork,
       register: effects.register,
       registerImage: effects.registerImage,
       complete: effects.complete,
@@ -548,5 +552,91 @@ test("cloud-finish IPC captures description ownership before the account/root/do
     { jobId: "job", relativePath: "output.mp4", sizeBytes: 3 },
     old.signal
   );
+  vi.restoreAllMocks();
+});
+
+test.each([
+  IPC_CHANNELS.cloudRenderRegister,
+  IPC_CHANNELS.cloudImageRenderRegister,
+  IPC_CHANNELS.cloudRenderFinish
+])(
+  "%s retains ingestion ownership before delayed account permission",
+  async (channel) => {
+    let release!: (value: "cloud") => void;
+    vi.spyOn(settings, "getAppMode").mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        })
+    );
+    const args = requests.find(([name]) => name === channel)![1];
+    const pending = invoke(channel, ...args);
+    const rejected = expect(pending).rejects.toThrow();
+    await renderWork.suspend();
+    renderWork.reset();
+    release("cloud");
+    await rejected;
+    for (const effect of [
+      effects.root,
+      effects.register,
+      effects.registerImage,
+      effects.getJob,
+      effects.complete,
+      state.download
+    ])
+      expect(effect).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  }
+);
+
+test("cloud finish drains an issued download and suppresses late progress/completion after reset", async () => {
+  await settings.setAppMode("cloud");
+  let release!: (value: unknown) => void;
+  state.download.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      })
+  );
+  const pending = invoke(IPC_CHANNELS.cloudRenderFinish, {
+    jobId: "job",
+    url: remoteUrl
+  });
+  const rejected = expect(pending).rejects.toThrow();
+  await vi.waitFor(() => expect(release).toBeDefined());
+  const input = state.download.mock.calls.at(-1)![0];
+  let suspended = false;
+  const suspension = renderWork.suspend().then(() => {
+    suspended = true;
+  });
+  await Promise.resolve();
+  expect(suspended).toBe(false);
+  expect(input.signal.aborted).toBe(true);
+  event.sender.send.mockClear();
+  input.onProgress(0.9);
+  expect(event.sender.send).not.toHaveBeenCalled();
+  release({ relativePath: "output.mp4", sizeBytes: 3 });
+  await suspension;
+  renderWork.reset();
+  await rejected;
+  expect(effects.complete).not.toHaveBeenCalled();
+});
+
+test("suspended ingestion refuses terminal failure and registration without new policy or repository work", async () => {
+  await renderWork.suspend();
+  const policy = vi.spyOn(settings, "getAppMode");
+  for (const channel of [
+    IPC_CHANNELS.cloudRenderRegister,
+    IPC_CHANNELS.cloudImageRenderRegister,
+    IPC_CHANNELS.cloudRenderFinish
+  ]) {
+    const args = requests.find(([name]) => name === channel)![1];
+    await expect(invoke(channel, ...args)).rejects.toThrow();
+  }
+  await expect(
+    invoke(IPC_CHANNELS.cloudRenderFail, { jobId: "job", message: "late" })
+  ).rejects.toThrow();
+  expect(policy).not.toHaveBeenCalled();
+  expect(effects.fail).not.toHaveBeenCalled();
   vi.restoreAllMocks();
 });

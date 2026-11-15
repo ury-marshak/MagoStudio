@@ -88,7 +88,17 @@ export const registerCloudHandlers = (options: {
   settings: LibrarySettings;
   captureImageDescriptionSession?: () => AbortSignal;
 }): void => {
-  const { links, uploads, repository, renderJobs, renderSubmits } = options;
+  const { links, uploads, repository, renderJobs } = options;
+  const renderWork = options.renderSubmits.libraryWork;
+  const renderSubmits = renderWork.guard(options.renderSubmits, false);
+  const handleRender = (
+    channel: string,
+    handler: Parameters<typeof ipcMain.handle>[1]
+  ) =>
+    ipcMain.handle(
+      channel,
+      renderWork.bind(async (...args) => handler(...args))
+    );
 
   ipcMain.handle(IPC_CHANNELS.cloudLinkGet, async (event, kind, localId) => {
     requireTrustedSender(event);
@@ -293,7 +303,7 @@ export const registerCloudHandlers = (options: {
     });
   });
 
-  ipcMain.handle(IPC_CHANNELS.cloudRenderRegister, async (event, input) => {
+  handleRender(IPC_CHANNELS.cloudRenderRegister, async (event, input) => {
     requireTrustedSender(event);
     await requireCloudAccount(options.settings);
     const value = (input ?? {}) as Record<string, unknown>;
@@ -337,32 +347,29 @@ export const registerCloudHandlers = (options: {
     });
   });
 
-  ipcMain.handle(
-    IPC_CHANNELS.cloudImageRenderRegister,
-    async (event, input) => {
-      requireTrustedSender(event);
-      await requireCloudAccount(options.settings);
-      const value = (input ?? {}) as Record<string, unknown>;
-      const frame = value.frame;
-      if (typeof frame !== "number" || !Number.isInteger(frame) || frame < 0) {
-        throw new Error("frame must be a non-negative integer");
-      }
-      return renderSubmits.registerImage({
-        projectId: requireId(value.projectId, "projectId"),
-        shotId: requireId(value.shotId, "shotId"),
-        sourceAssetId: requireId(value.sourceAssetId, "sourceAssetId"),
-        model: requireId(value.model, "model"),
-        frame,
-        name: requireId(value.name, "name"),
-        cloudAssetId: requireId(value.cloudAssetId, "cloudAssetId"),
-        cloudClipId: requireId(value.cloudClipId, "cloudClipId"),
-        settings:
-          value.settings && typeof value.settings === "object"
-            ? (value.settings as Record<string, unknown>)
-            : {}
-      });
+  handleRender(IPC_CHANNELS.cloudImageRenderRegister, async (event, input) => {
+    requireTrustedSender(event);
+    await requireCloudAccount(options.settings);
+    const value = (input ?? {}) as Record<string, unknown>;
+    const frame = value.frame;
+    if (typeof frame !== "number" || !Number.isInteger(frame) || frame < 0) {
+      throw new Error("frame must be a non-negative integer");
     }
-  );
+    return renderSubmits.registerImage({
+      projectId: requireId(value.projectId, "projectId"),
+      shotId: requireId(value.shotId, "shotId"),
+      sourceAssetId: requireId(value.sourceAssetId, "sourceAssetId"),
+      model: requireId(value.model, "model"),
+      frame,
+      name: requireId(value.name, "name"),
+      cloudAssetId: requireId(value.cloudAssetId, "cloudAssetId"),
+      cloudClipId: requireId(value.cloudClipId, "cloudClipId"),
+      settings:
+        value.settings && typeof value.settings === "object"
+          ? (value.settings as Record<string, unknown>)
+          : {}
+    });
+  });
 
   ipcMain.handle(IPC_CHANNELS.cloudRenderListActive, async (event) => {
     requireTrustedSender(event);
@@ -399,40 +406,44 @@ export const registerCloudHandlers = (options: {
     });
   });
 
-  ipcMain.handle(IPC_CHANNELS.cloudRenderFinish, async (event, input) => {
+  handleRender(IPC_CHANNELS.cloudRenderFinish, async (event, input) => {
     requireTrustedSender(event);
     const descriptionSession = options.captureImageDescriptionSession?.();
     await requireCloudAccount(options.settings);
     const value = (input ?? {}) as Record<string, unknown>;
     const jobId = requireId(value.jobId, "jobId");
     const url = requireId(value.url, "url");
-    const libraryRoot = await options.getLibraryRoot();
+    const libraryRoot = await renderWork.boundary(options.getLibraryRoot);
     if (!libraryRoot) throw new Error("Choose a Mago library folder first");
 
     // An img2img output is a still, so it must not land under a .mp4 name.
-    const job = await renderJobs.get(jobId);
+    const job = await renderWork.guard(renderJobs).get(jobId);
     const extension = isImageJobRequest(job?.request)
       ? toCloudImageOutputExtension(url, IMAGE_OUTPUT_EXTENSION)
       : undefined;
 
-    const downloaded = await downloadRenderOutput({
-      cloudStorage: {
-        allowedHosts: resolveCloudConfig().cloudStorageHosts,
-        assertAccess: () => requireCloudAccount(options.settings)
-      },
-      url,
-      libraryRoot,
-      jobId,
-      extension,
-      onProgress: (fraction) => {
-        if (!event.sender.isDestroyed()) {
-          event.sender.send(IPC_CHANNELS.cloudUploadProgress, {
-            assetId: jobId,
-            fraction
-          });
+    const signal = renderWork.signal;
+    const downloaded = await renderWork.boundary(() =>
+      downloadRenderOutput({
+        signal,
+        cloudStorage: {
+          allowedHosts: resolveCloudConfig().cloudStorageHosts,
+          assertAccess: () => requireCloudAccount(options.settings)
+        },
+        url,
+        libraryRoot,
+        jobId,
+        extension,
+        onProgress: (fraction) => {
+          if (!signal.aborted && !event.sender.isDestroyed()) {
+            event.sender.send(IPC_CHANNELS.cloudUploadProgress, {
+              assetId: jobId,
+              fraction
+            });
+          }
         }
-      }
-    });
+      })
+    );
     await renderSubmits.complete(
       {
         jobId,
@@ -443,7 +454,7 @@ export const registerCloudHandlers = (options: {
     );
   });
 
-  ipcMain.handle(IPC_CHANNELS.cloudRenderFail, async (event, input) => {
+  handleRender(IPC_CHANNELS.cloudRenderFail, async (event, input) => {
     requireTrustedSender(event);
     const value = (input ?? {}) as Record<string, unknown>;
     await renderSubmits.fail({
