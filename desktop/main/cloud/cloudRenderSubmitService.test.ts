@@ -679,3 +679,34 @@ describe("CloudRenderSubmitService.fail", () => {
     ).resolves.toBeUndefined();
   });
 });
+
+test("captures automatic-description ownership before the completion root lookup", async () => {
+  const { service, manager, directory } = await openLibrary();
+  const job = await service.registerImage(imageRegistration);
+  let release!: (root: string) => void;
+  const root = new Promise<string>((resolve) => {
+    release = resolve;
+  });
+  const old = new AbortController();
+  let current = old;
+  const described = vi.fn();
+  const capture = vi.fn(() => current.signal);
+  const completion = new CloudRenderSubmitService(
+    manager,
+    () => root,
+    described,
+    undefined,
+    capture
+  );
+  const result = completion.complete({
+    jobId: job.jobId,
+    relativePath: "fixture.png",
+    sizeBytes: 1
+  });
+  expect(capture).toHaveBeenCalledTimes(1);
+  old.abort();
+  current = new AbortController();
+  release(directory);
+  await result;
+  expect(described).toHaveBeenCalledExactlyOnceWith(job.assetId, old.signal);
+});

@@ -116,7 +116,7 @@ const externalRenderJobService = new ExternalRenderJobService(
 const inference = createExternalInferenceRouting(
   externalProviders,
   generateComfyVision(librarySettings),
-  () => probeComfyVision(librarySettings)
+  (signal) => probeComfyVision(librarySettings, signal)
 );
 const getExternalGenerator = inference.getGenerator;
 const vlmService = new VlmService(
@@ -144,7 +144,7 @@ const runExternalScriptText = async (
   signal?: AbortSignal
 ) => {
   signal?.throwIfAborted();
-  const generate = await getExternalGenerator("text");
+  const generate = await getExternalGenerator("text", signal);
   signal?.throwIfAborted();
   return generate?.({
     signal,
@@ -157,10 +157,12 @@ const runExternalScriptText = async (
 };
 // Every image that lands in the library gets a description, the way
 // The backend describes every upload and render.
-const describeImageLater = (assetId: string) =>
-  vlmService.describeAssetLater(assetId);
+const describeImageLater = (assetId: string, origin?: AbortSignal) =>
+  vlmService.describeAssetLater(assetId, origin);
+const captureImageDescriptionSession = () => vlmService.libraryWork.signal;
 const i2vPromptAdapter = new LocalI2vPromptAdapter({
-  getAsset: (assetId) => projectRepository.getAsset(assetId),
+  getAsset: (assetId) =>
+    vlmService.libraryWork.boundary(() => projectRepository.getAsset(assetId)),
   describeImage: (assetId, signal) =>
     vlmService.describeImageAsset(assetId, signal),
   captionVideo: async (assetId, signal) =>
@@ -171,12 +173,10 @@ const i2vPromptAdapter = new LocalI2vPromptAdapter({
       PROMPT_ADAPTATION_MAX_TOKENS,
       signal
     );
-    return external
-      ? external.text
-      : (await getComfyScriptClient()).runPromptAdaptation(
-          prompt,
-          () => signal?.aborted === true
-        );
+    if (external) return external.text;
+    const client = await getComfyScriptClient();
+    signal?.throwIfAborted();
+    return client.runPromptAdaptation(prompt, () => signal?.aborted === true);
   }
 });
 const textModelBridge = new TextModelBridge();
@@ -197,7 +197,7 @@ const localScriptProjectService = new LocalScriptProjectService(
   externalRenderJobService,
   async (sourcePath, kind, signal) => {
     signal?.throwIfAborted();
-    const generate = await getExternalGenerator("vision");
+    const generate = await getExternalGenerator("vision", signal);
     signal?.throwIfAborted();
     if (!generate)
       throw new Error(
@@ -237,14 +237,17 @@ const cloudRenderJobRepository = new CloudRenderJobRepository(databaseManager);
 const cloudRenderSubmitService = new CloudRenderSubmitService(
   databaseManager,
   () => librarySettings.getLibraryRoot(),
-  describeImageLater
+  describeImageLater,
+  undefined,
+  captureImageDescriptionSession
 );
 const imageRenderService = new ImageRenderService(
   databaseManager,
   () => librarySettings.getLibraryRoot(),
   getLegacyComfyEndpoint,
   describeImageLater,
-  assertLegacyInferenceAvailable
+  assertLegacyInferenceAvailable,
+  captureImageDescriptionSession
 );
 const videoFrameService = new VideoFrameService(projectRepository);
 const usesPackagedRenderer =
@@ -496,7 +499,8 @@ void app
       renderSubmits: cloudRenderSubmitService,
       databaseManager,
       getLibraryRoot: () => librarySettings.getLibraryRoot(),
-      settings: librarySettings
+      settings: librarySettings,
+      captureImageDescriptionSession
     });
     registerImageRenderHandlers(imageRenderService, cloudRenderJobRepository);
     registerMediaHandlers(videoFrameService);
@@ -522,7 +526,8 @@ void app
           externalRenderJobService.suspend(),
           localScriptChatService.suspend(),
           localScriptProjectService.suspendMetrics(),
-          localScriptProjectService.suspendDescriptions()
+          localScriptProjectService.suspendDescriptions(),
+          vlmService.suspend()
         ]);
       },
       afterLibraryChange: () => {
@@ -531,6 +536,7 @@ void app
         localScriptChatService.reset();
         localScriptProjectService.resetMetrics();
         localScriptProjectService.resetDescriptions();
+        vlmService.reset();
       }
     });
     registerProjectHandlers(
@@ -538,7 +544,8 @@ void app
       cloudProjectMirrorRepository,
       databaseManager,
       librarySettings,
-      describeImageLater
+      describeImageLater,
+      vlmService.libraryWork
     );
     registerScriptProjectHandlers({
       service: localScriptProjectService,

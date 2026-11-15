@@ -86,6 +86,7 @@ export const registerCloudHandlers = (options: {
   databaseManager: DatabaseManager;
   getLibraryRoot: () => Promise<string | null>;
   settings: LibrarySettings;
+  captureImageDescriptionSession?: () => AbortSignal;
 }): void => {
   const { links, uploads, repository, renderJobs, renderSubmits } = options;
 
@@ -400,6 +401,7 @@ export const registerCloudHandlers = (options: {
 
   ipcMain.handle(IPC_CHANNELS.cloudRenderFinish, async (event, input) => {
     requireTrustedSender(event);
+    const descriptionSession = options.captureImageDescriptionSession?.();
     await requireCloudAccount(options.settings);
     const value = (input ?? {}) as Record<string, unknown>;
     const jobId = requireId(value.jobId, "jobId");
@@ -431,11 +433,14 @@ export const registerCloudHandlers = (options: {
         }
       }
     });
-    await renderSubmits.complete({
-      jobId,
-      relativePath: downloaded.relativePath,
-      sizeBytes: downloaded.sizeBytes
-    });
+    await renderSubmits.complete(
+      {
+        jobId,
+        relativePath: downloaded.relativePath,
+        sizeBytes: downloaded.sizeBytes
+      },
+      descriptionSession
+    );
   });
 
   ipcMain.handle(IPC_CHANNELS.cloudRenderFail, async (event, input) => {

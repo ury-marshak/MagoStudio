@@ -68,6 +68,7 @@ export type VlmRequest = {
   nCtx?: number;
   /** Omit to get a random one — see the seed note in submit(). */
   seed?: number;
+  signal?: AbortSignal;
 };
 
 /**
@@ -92,12 +93,14 @@ export class ComfyVlmClient {
   }
 
   /** Are the selected backend's nodes installed and weights in place? */
-  async probeModels(): Promise<VlmModelStatus> {
+  async probeModels(signal?: AbortSignal): Promise<VlmModelStatus> {
+    signal?.throwIfAborted();
     if (this.backend === "qwen3-vl-4b-heretic-int8")
-      return this.probeNativeModels();
+      return this.probeNativeModels(signal);
     const info = await this.comfy.getJson(
       `/object_info/${encodeURIComponent(LOADER_CLASS)}`
     );
+    signal?.throwIfAborted();
     const node = asRecord(info[LOADER_CLASS]);
     if (!node)
       throw new Error(
@@ -126,10 +129,13 @@ export class ComfyVlmClient {
     };
   }
 
-  private async probeNativeModels(): Promise<VlmModelStatus> {
+  private async probeNativeModels(
+    signal?: AbortSignal
+  ): Promise<VlmModelStatus> {
     const loaderInfo = await this.comfy.getJson(
       `/object_info/${encodeURIComponent(NATIVE_LOADER_CLASS)}`
     );
+    signal?.throwIfAborted();
     const loader = asRecord(loaderInfo[NATIVE_LOADER_CLASS]);
     if (!loader)
       throw new Error(
@@ -140,6 +146,7 @@ export class ComfyVlmClient {
       const info = await this.comfy.getJson(
         `/object_info/${encodeURIComponent(nodeClass)}`
       );
+      signal?.throwIfAborted();
       if (!asRecord(info[nodeClass]))
         throw new Error(
           `ComfyUI has no ${nodeClass} node — update ComfyUI to use the native Qwen3-VL model`
@@ -162,21 +169,25 @@ export class ComfyVlmClient {
 
   /** Submit a caption request and wait for the generated text. */
   async generate(request: VlmRequest): Promise<string> {
-    const models = await this.probeModels();
+    request.signal?.throwIfAborted();
+    const models = await this.probeModels(request.signal);
+    request.signal?.throwIfAborted();
     if (this.backend === "qwen3-vl-4b-heretic-int8") {
       if (!models.installed || !models.safetensors)
         throw new Error(
           `ComfyUI is missing the Qwen3-VL weights: ${models.missing.join(", ")}`
         );
       const promptId = await this.submitNative(request, models.safetensors);
-      return this.awaitText(promptId);
+      request.signal?.throwIfAborted();
+      return this.awaitText(promptId, request.signal);
     }
     if (!models.installed || !models.gguf || !models.mmproj)
       throw new Error(
         `ComfyUI is missing the Qwen3-VL weights: ${models.missing.join(", ")}`
       );
     const promptId = await this.submit(request, models.gguf, models.mmproj);
-    return this.awaitText(promptId);
+    request.signal?.throwIfAborted();
+    return this.awaitText(promptId, request.signal);
   }
 
   private async submitNative(
@@ -189,6 +200,7 @@ export class ComfyVlmClient {
         this.comfy.uploadBytes(bytes, "image/png", ".png")
       )
     );
+    request.signal?.throwIfAborted();
     return this.comfy.submitGraph(
       this.buildNativeGraph({
         safetensors,
@@ -216,6 +228,7 @@ export class ComfyVlmClient {
         this.comfy.uploadBytes(bytes, "image/png", ".png")
       )
     );
+    request.signal?.throwIfAborted();
     return this.comfy.submitGraph(
       this.buildGraph({
         gguf,
@@ -236,11 +249,18 @@ export class ComfyVlmClient {
     );
   }
 
-  private async awaitText(promptId: string): Promise<string> {
+  private async awaitText(
+    promptId: string,
+    signal?: AbortSignal
+  ): Promise<string> {
+    signal?.throwIfAborted();
     const outcome = await this.comfy.waitForPrompt(promptId, {
       timeoutMs: POLL_TIMEOUT_MS,
-      pollIntervalMs: POLL_INTERVAL_MS
+      pollIntervalMs: POLL_INTERVAL_MS,
+      ...(signal ? { isCancelled: () => signal.aborted } : {})
     });
+    // Teardown stops local follow-up; it never cancels a provider job.
+    signal?.throwIfAborted();
     if (outcome.kind !== "finished") {
       await this.cancel(promptId).catch(() => undefined);
       throw new Error("ComfyUI did not return a caption in time");

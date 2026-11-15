@@ -13,7 +13,8 @@ import type {
   VlmModelStatus
 } from "../../shared/contracts";
 import type { ProjectRepository } from "../database/projectRepository";
-import { runBackgroundTask } from "../libraryHealth";
+import { clearLibraryIssue, reportLibraryIssue } from "../libraryHealth";
+import { LibraryWorkSession } from "../libraryWorkSession";
 import {
   SharedInference,
   waitForInference
@@ -68,38 +69,60 @@ const storedDescription = (asset: LocalAsset): string | null =>
 type GenerateRequest = Omit<VisionRequest, "systemPrompt">;
 
 export class VlmService {
-  private readonly lifetime = new AbortController();
-  /** Shared operations retain independent cancellation ownership per caller. */
-  private readonly pending = new SharedInference<LocalAssetPromptResult>();
-  private readonly pendingDescriptions = new SharedInference<string | null>();
+  /** Maps and serialization belong to a library, not to reused asset IDs. */
+  readonly libraryWork = new LibraryWorkSession(() => ({
+    pending: new SharedInference<LocalAssetPromptResult>(),
+    pendingDescriptions: new SharedInference<string | null>(),
+    queue: Promise.resolve() as Promise<unknown>
+  }));
 
   stop(): void {
-    this.lifetime.abort();
+    this.libraryWork.stop();
+  }
+
+  suspend(): Promise<void> {
+    return this.libraryWork.suspend();
+  }
+
+  reset(): void {
+    this.libraryWork.reset();
   }
 
   private signal(caller?: AbortSignal): AbortSignal {
-    const signal = caller
-      ? AbortSignal.any([caller, this.lifetime.signal])
-      : this.lifetime.signal;
+    const lifetime = this.libraryWork.signal;
+    const signal = caller ? AbortSignal.any([caller, lifetime]) : lifetime;
     signal.throwIfAborted();
     return signal;
   }
 
-  /**
-   * Serialise generation so background captions do not fill the provider's
-   * queue ahead of interactive renders.
-   */
-  private queue: Promise<unknown> = Promise.resolve();
-
   constructor(
     private readonly repository: ProjectRepository,
     private readonly generateVision: VisionGenerator,
-    private readonly probeVision: () => Promise<VlmModelStatus>,
+    private readonly probeVision: (
+      signal?: AbortSignal
+    ) => Promise<VlmModelStatus>,
     private readonly generateEnhancement: VisionGenerator = generateVision
-  ) {}
+  ) {
+    this.repository = this.libraryWork.guard(repository);
+    this.status = this.libraryWork.bind(this.status.bind(this));
+    this.captionAsset = this.libraryWork.bind(this.captionAsset.bind(this));
+    this.describeImageAsset = this.libraryWork.bind(
+      this.describeImageAsset.bind(this)
+    );
+    this.describeEntityImage = this.libraryWork.bind(
+      this.describeEntityImage.bind(this)
+    );
+    this.evaluateShotVideo = this.libraryWork.bind(
+      this.evaluateShotVideo.bind(this)
+    );
+    this.autoPrompt = this.libraryWork.bind(this.autoPrompt.bind(this));
+    this.saveAutoPrompt = this.libraryWork.bind(this.saveAutoPrompt.bind(this));
+    this.enhancePrompt = this.libraryWork.bind(this.enhancePrompt.bind(this));
+  }
 
   status(): Promise<VlmModelStatus> {
-    return this.probeVision();
+    const signal = this.signal();
+    return waitForInference(this.probeVision(signal), signal);
   }
 
   async captionAsset(
@@ -107,7 +130,7 @@ export class VlmService {
     caller?: AbortSignal
   ): Promise<LocalAssetPromptResult> {
     if (!assetId) throw new Error("Asset ID is required");
-    return this.pending.run(
+    return this.libraryWork.state.pending.run(
       assetId,
       (signal) => this.generateAssetPrompt(assetId, this.signal(signal)),
       this.signal(caller)
@@ -154,7 +177,11 @@ export class VlmService {
       images.push(
         input.referencePaths.length === 1
           ? await this.loadImage(input.referencePaths[0]!)
-          : this.resize(await createReferenceGrid(input.referencePaths, signal))
+          : this.resize(
+              await this.libraryWork.boundary(() =>
+                createReferenceGrid(input.referencePaths, signal)
+              )
+            )
       );
     }
     for (
@@ -163,11 +190,13 @@ export class VlmService {
       index += METRICS_FRAMES_PER_GRID
     ) {
       images.push(
-        await extractMetricsFrameGrid(
-          input.sourcePath,
-          timestamps.slice(index, index + METRICS_FRAMES_PER_GRID),
-          input.durationSeconds,
-          signal
+        await this.libraryWork.boundary(() =>
+          extractMetricsFrameGrid(
+            input.sourcePath,
+            timestamps.slice(index, index + METRICS_FRAMES_PER_GRID),
+            input.durationSeconds,
+            signal
+          )
         )
       );
     }
@@ -204,7 +233,7 @@ export class VlmService {
     caller?: AbortSignal
   ): Promise<string | null> {
     if (!assetId) throw new Error("Asset ID is required");
-    return this.pendingDescriptions.run(
+    return this.libraryWork.state.pendingDescriptions.run(
       assetId,
       (signal) => this.generateImageDescription(assetId, this.signal(signal)),
       this.signal(caller)
@@ -217,11 +246,32 @@ export class VlmService {
    * the VLM is not installed; adaptation captions such an image on demand
    * later.
    */
-  describeAssetLater(assetId: string): void {
-    void runBackgroundTask(`Image description ${assetId}`, async () => {
-      if (!(await this.status()).ready) return;
-      await this.describeImageAsset(assetId);
-    });
+  describeAssetLater(assetId: string, origin = this.libraryWork.signal): void {
+    // Capture before the first readiness/cache await, including when a producer
+    // supplies the lifetime it captured before ingestion. Expected teardown is
+    // not a library-health failure and must not clear a replacement's issue.
+    if (origin.aborted) return;
+    const id = `Image description ${assetId}`;
+    void this.libraryWork
+      .run(async () => {
+        this.signal(origin);
+        const status = await this.status();
+        this.signal(origin);
+        if (status.ready) await this.describeImageAsset(assetId, origin);
+      })
+      .then(
+        () => {
+          if (!origin.aborted) clearLibraryIssue(id);
+        },
+        (error: unknown) => {
+          if (!origin.aborted)
+            reportLibraryIssue({
+              id,
+              kind: "service",
+              message: `${id}: ${error instanceof Error ? error.message : String(error)}`
+            });
+        }
+      );
   }
 
   async autoPrompt(
@@ -302,10 +352,12 @@ export class VlmService {
   ): Promise<string | null> {
     signal.throwIfAborted();
     const asset = await this.repository.getAsset(assetId);
+    signal.throwIfAborted();
     if (!asset || asset.type !== "IMAGE") return null;
     if ("description" in asset.data) return storedDescription(asset);
 
     const sourcePath = await this.repository.assetSourcePath(assetId);
+    signal.throwIfAborted();
     if (!sourcePath) return null;
     const description = await this.generate({
       userPrompt: IMAGE_DESCRIPTION_PROMPT,
@@ -332,6 +384,7 @@ export class VlmService {
   ): Promise<LocalAssetPromptResult> {
     signal.throwIfAborted();
     const asset = await this.repository.getAsset(assetId);
+    signal.throwIfAborted();
     if (!asset) throw new Error("Local asset not found");
 
     const cached = readCachedPrompt(asset.data.prompt);
@@ -356,6 +409,7 @@ export class VlmService {
   ): Promise<StructuredPrompt> {
     signal.throwIfAborted();
     const sourcePath = await this.repository.assetSourcePath(assetId);
+    signal.throwIfAborted();
     if (!sourcePath) throw new Error("Asset file is unavailable");
     const image = await this.loadImage(sourcePath);
     return this.generateStructured({
@@ -373,15 +427,14 @@ export class VlmService {
   ): Promise<StructuredPrompt> {
     signal.throwIfAborted();
     const sourcePath = await this.repository.assetSourcePath(assetId);
+    signal.throwIfAborted();
     if (!sourcePath) throw new Error("Asset file is unavailable");
     const totalFrames = Number(asset.data.total_frames) || 0;
     if (totalFrames < 1)
       throw new Error("Video asset has no frame count to sample from");
-    const { firstFrame, grids } = await extractVideoCaptionFrames({
-      sourcePath,
-      signal,
-      totalFrames
-    });
+    const { firstFrame, grids } = await this.libraryWork.boundary(() =>
+      extractVideoCaptionFrames({ sourcePath, signal, totalFrames })
+    );
     return this.generateStructured({
       userPrompt: VIDEO_DESCRIPTION_PROMPT,
       signal,
@@ -441,7 +494,8 @@ export class VlmService {
 
   private complete(request: GenerateRequest, generate = this.generateVision) {
     const signal = this.signal(request.signal);
-    const task = this.queue.then(async () => {
+    const state = this.libraryWork.state;
+    const task = state.queue.then(async () => {
       signal.throwIfAborted();
       const { text, model } = await generate({
         systemPrompt: SYSTEM_PROMPT,
@@ -452,8 +506,9 @@ export class VlmService {
       signal.throwIfAborted();
       return { text: text.trim(), model };
     });
-    // Keep serialization until the provider settles, even if a caller leaves.
-    this.queue = task.then(
+    // Keep serialization within this session until the provider settles. A
+    // replacement library gets a fresh queue even if that provider ignores abort.
+    state.queue = task.then(
       () => undefined,
       () => undefined
     );
@@ -461,7 +516,9 @@ export class VlmService {
   }
 
   private async loadImage(sourcePath: string): Promise<Buffer> {
-    return this.resize(await readFile(sourcePath));
+    return this.libraryWork.boundary(async () =>
+      this.resize(await readFile(sourcePath))
+    );
   }
 
   /** Decode a data URI (or bare base64) as the renderer sends it. Returns null
@@ -489,11 +546,5 @@ export class VlmService {
           )
         : image;
     return scaled.toPNG();
-  }
-
-  private message(error: unknown): string {
-    return error instanceof Error
-      ? error.message
-      : "Vision model is unavailable";
   }
 }

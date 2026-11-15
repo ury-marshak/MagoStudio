@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { IPC_CHANNELS } from "../../shared/contracts";
+import { LibraryWorkSession } from "../libraryWorkSession";
 import type { LocalI2vPromptAdapter } from "../vlm/localI2vPromptAdapter";
 import type { VlmService } from "../vlm/vlmService";
 
@@ -14,6 +15,7 @@ vi.mock("./trustedSender", () => ({ requireTrustedSender: mocks.trusted }));
 
 const setup = () => {
   const service = {
+    libraryWork: new LibraryWorkSession(() => undefined),
     captionAsset: vi.fn(),
     autoPrompt: vi.fn(),
     enhancePrompt: vi.fn()

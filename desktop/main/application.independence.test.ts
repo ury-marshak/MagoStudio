@@ -19,7 +19,8 @@ const mocks = vi.hoisted(() => ({
   httpsRequest: vi.fn(),
   exit: vi.fn(),
   quit: vi.fn(),
-  dialog: vi.fn()
+  dialog: vi.fn(),
+  choose: vi.fn()
 }));
 vi.mock("electron", () => {
   const protocol = {
@@ -31,6 +32,7 @@ vi.mock("electron", () => {
   const session = { defaultSession: { protocol } };
   class BrowserWindow {
     static getAllWindows = () => mocks.windows;
+    static fromWebContents = () => mocks.windows[0];
     options;
     loadURL = vi.fn(async () => {});
     webContents = {
@@ -73,7 +75,11 @@ vi.mock("electron", () => {
     protocol,
     net: { fetch: mocks.netFetch },
     nativeImage: {},
-    dialog: { showMessageBox: mocks.dialog, showMessageBoxSync: mocks.dialog },
+    dialog: {
+      showMessageBox: mocks.dialog,
+      showMessageBoxSync: mocks.dialog,
+      showOpenDialog: mocks.choose
+    },
     shell: { openExternal: vi.fn(), showItemInFolder: vi.fn() }
   };
 });
@@ -370,6 +376,55 @@ it.each(["fal", "text", "vision"])(
     expect(mocks.exit).not.toHaveBeenCalled();
     expect(mocks.quit).not.toHaveBeenCalled();
     expect(mocks.dialog).not.toHaveBeenCalled();
+    // Exercise the actual composed library hooks: successful replacement resets
+    // VLM, whereas failed opening leaves it (and the Director owners) suspended.
+    const replacement = path.join(root, "replacement");
+    await seed.open(replacement);
+    await seed.get().insert(assets).values({
+      id: "asset",
+      name: "Reused",
+      type: "image",
+      sourcePath: "fixture",
+      status: "available"
+    });
+    seed.close();
+    mocks.choose.mockResolvedValue({
+      canceled: false,
+      filePaths: [replacement]
+    });
+    await invoke(IPC_CHANNELS.libraryChoose);
+    await expect(
+      invoke(IPC_CHANNELS.vlmSaveAutoPrompt, {
+        assetId: "asset",
+        videoAssetId: "video",
+        version: "img2img_mago",
+        positivePrompt: "replacement prompt"
+      })
+    ).resolves.toMatchObject({
+      id: "asset",
+      data: { auto_prompt: [{ positive_prompt: "replacement prompt" }] }
+    });
+    const failed = path.join(root, "failed-replacement");
+    await mkdir(failed);
+    const open = vi
+      .spyOn(DatabaseManager.prototype, "open")
+      .mockRejectedValueOnce(new Error("fixture failed open"));
+    mocks.choose.mockResolvedValue({ canceled: false, filePaths: [failed] });
+    await expect(invoke(IPC_CHANNELS.libraryChoose)).rejects.toThrow(
+      "fixture failed open"
+    );
+    await expect(
+      invoke(IPC_CHANNELS.vlmSaveAutoPrompt, {
+        assetId: "asset",
+        videoAssetId: "video",
+        version: "img2img_mago",
+        positivePrompt: "stale prompt"
+      })
+    ).rejects.toThrow();
+    await expect(invoke(IPC_CHANNELS.vlmStatus)).rejects.toThrow();
+    expect(transport).not.toHaveBeenCalled();
+    expect(mocks.key).not.toHaveBeenCalled();
+    open.mockRestore();
     // This harness does not execute Chromium or assert renderer-wide containment.
     mocks.appListeners.get("before-quit")?.();
     mocks.appListeners.delete("before-quit");

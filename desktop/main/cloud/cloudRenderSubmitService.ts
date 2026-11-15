@@ -158,10 +158,14 @@ export class CloudRenderSubmitService {
     private readonly manager: DatabaseManager,
     private readonly getLibraryRoot: () => Promise<string | null>,
     /** Told about every downloaded image render, e.g. to caption it. Must not throw. */
-    private readonly onImageAvailable?: (assetId: string) => void,
+    private readonly onImageAvailable?: (
+      assetId: string,
+      origin?: AbortSignal
+    ) => void,
     private readonly probeRenderedVideo: (
       filePath: string
-    ) => Promise<RenderedVideoMetadata | null> = probeRenderedVideoMetadata
+    ) => Promise<RenderedVideoMetadata | null> = probeRenderedVideoMetadata,
+    private readonly captureImageSession?: () => AbortSignal
   ) {}
 
   async register(
@@ -415,11 +419,16 @@ export class CloudRenderSubmitService {
    * Turns a downloaded render into an ordinary local asset. Called after the
    * output has actually landed on disk, so playback works offline from here on.
    */
-  async complete(input: {
-    jobId: string;
-    relativePath: string;
-    sizeBytes: number;
-  }): Promise<void> {
+  async complete(
+    input: {
+      jobId: string;
+      relativePath: string;
+      sizeBytes: number;
+    },
+    descriptionSession = this.captureImageSession?.()
+  ): Promise<void> {
+    // Description ownership begins before any asynchronous ingestion lookup.
+    // Transfer/write ownership itself is audited separately.
     const libraryRoot = await this.getLibraryRoot();
     if (!libraryRoot) throw new Error("Choose a Mago library folder first");
 
@@ -613,7 +622,7 @@ export class CloudRenderSubmitService {
         })
         .where(eq(cloudRenderJobs.id, input.jobId));
     });
-    if (isImage) this.onImageAvailable?.(job.assetId);
+    if (isImage) this.onImageAvailable?.(job.assetId, descriptionSession);
   }
 
   /** Records a failure against both the job and the placeholder asset. */

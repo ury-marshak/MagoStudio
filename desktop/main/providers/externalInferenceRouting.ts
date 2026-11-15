@@ -19,20 +19,27 @@ export const createExternalInferenceRouting = (
     "getForInference"
   >,
   legacyVision: VisionGenerator,
-  probeLegacyVision: () => Promise<VlmModelStatus>,
+  probeLegacyVision: (signal?: AbortSignal) => Promise<VlmModelStatus>,
   readKey: (account: string) => Promise<string> = readExternalProviderKey
 ) => {
-  const getGenerator = async (capability: ExternalModelCapability) => {
+  const getGenerator = async (
+    capability: ExternalModelCapability,
+    signal?: AbortSignal
+  ) => {
+    signal?.throwIfAborted();
     const config = await settings.getForInference(capability);
-    return config
-      ? generateOpenAiCompatible(config, await readKey(config.keychainAccount))
-      : null;
+    signal?.throwIfAborted();
+    if (!config) return null;
+    const key = await readKey(config.keychainAccount);
+    signal?.throwIfAborted();
+    return generateOpenAiCompatible(config, key);
   };
   const generate =
     (capability: ExternalModelCapability): VisionGenerator =>
     async (request) => {
       request.signal?.throwIfAborted();
-      const generator = (await getGenerator(capability)) ?? legacyVision;
+      const generator =
+        (await getGenerator(capability, request.signal)) ?? legacyVision;
       request.signal?.throwIfAborted();
       return generator(request);
     };
@@ -40,15 +47,16 @@ export const createExternalInferenceRouting = (
     getGenerator,
     generateVision: generate("vision"),
     generateEnhancement: generate("text"),
-    probeVision: async (): Promise<VlmModelStatus> => {
+    probeVision: async (signal?: AbortSignal): Promise<VlmModelStatus> => {
+      signal?.throwIfAborted();
       try {
         const config = await settings.getForInference("vision");
-        if (!config) return await probeLegacyVision();
-        await probeOpenAiCompatible(
-          config,
-          await readKey(config.keychainAccount),
-          "vision"
-        );
+        signal?.throwIfAborted();
+        if (!config) return await probeLegacyVision(signal);
+        const key = await readKey(config.keychainAccount);
+        signal?.throwIfAborted();
+        await probeOpenAiCompatible(config, key, "vision", signal);
+        signal?.throwIfAborted();
         return {
           backend: "external",
           ready: true,
@@ -56,6 +64,7 @@ export const createExternalInferenceRouting = (
           message: null
         };
       } catch (error) {
+        signal?.throwIfAborted();
         return {
           backend: "external",
           ready: false,

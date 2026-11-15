@@ -47,6 +47,7 @@ const requestJson = async (
   const signal = callerSignal
     ? AbortSignal.any([timeout, callerSignal])
     : timeout;
+  signal.throwIfAborted();
   let response: Response;
   try {
     response = await fetch(`${config.baseUrl}/${route}`, {
@@ -146,10 +147,18 @@ export const generateOpenAiCompatible =
 export const probeOpenAiCompatible = async (
   config: ExternalModelConfig,
   apiKey: string,
-  capability: ExternalModelCapability
+  capability: ExternalModelCapability,
+  signal?: AbortSignal
 ): Promise<void> => {
   const response = modelsSchema.safeParse(
-    await requestJson(config, apiKey, "models", probeTimeoutMs)
+    await requestJson(
+      config,
+      apiKey,
+      "models",
+      probeTimeoutMs,
+      undefined,
+      signal
+    )
   );
   if (!response.success)
     throw new Error("External provider returned an invalid model list");
@@ -169,5 +178,5 @@ export const probeOpenAiCompatible = async (
   // The OpenRouter model catalog is public, so a successful listing alone
   // does not verify the saved credential.
   if (isOpenRouter(config))
-    await requestJson(config, apiKey, "key", probeTimeoutMs);
+    await requestJson(config, apiKey, "key", probeTimeoutMs, undefined, signal);
 };

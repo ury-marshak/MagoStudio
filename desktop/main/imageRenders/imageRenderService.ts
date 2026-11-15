@@ -378,9 +378,13 @@ export class ImageRenderService {
     private readonly getLibraryRoot: () => Promise<string | null>,
     private readonly getComfyEndpoint: () => Promise<string>,
     /** Told about every image that lands, e.g. to caption it. Must not throw. */
-    private readonly onImageAvailable?: (assetId: string) => void,
+    private readonly onImageAvailable?: (
+      assetId: string,
+      origin?: AbortSignal
+    ) => void,
     /** Gates saved endpoints too, not only endpoint lookup for new renders. */
-    private readonly assertInferenceAvailable: () => Promise<void> = async () => {}
+    private readonly assertInferenceAvailable: () => Promise<void> = async () => {},
+    private readonly captureImageSession?: () => AbortSignal
   ) {}
 
   /** Policy pauses are not failed jobs and must not make a clean external
@@ -410,6 +414,7 @@ export class ImageRenderService {
   }
 
   async reconcileInterruptedRenders(): Promise<void> {
+    const descriptionSession = this.captureImageSession?.();
     if (!(await this.canProcessInference())) return;
     this.processing = true;
     try {
@@ -450,7 +455,12 @@ export class ImageRenderService {
             const bytes = await readFile(asset.sourcePath);
             if (nativeImage.createFromBuffer(bytes).isEmpty())
               throw new Error("Interrupted render output is unreadable.");
-            await this.completeImageBytes(job, bytes, "Recovered render");
+            await this.completeImageBytes(
+              job,
+              bytes,
+              "Recovered render",
+              descriptionSession
+            );
           } else {
             await validateVideo(asset.sourcePath);
             const request = parseJson<CompletableVideoRequest>(job.requestJson);
@@ -1033,6 +1043,7 @@ export class ImageRenderService {
   }
 
   async kick(): Promise<void> {
+    const descriptionSession = this.captureImageSession?.();
     if (!this.manager.isOpen()) return;
     if (this.processing) {
       this.isKickRequestedDuringProcessing = true;
@@ -1051,7 +1062,7 @@ export class ImageRenderService {
         // A changed profile pauses the queue without marking saved jobs failed.
         if (!(await this.canProcessInference())) return;
         try {
-          await this.process(job);
+          await this.process(job, descriptionSession);
           clearLibraryIssue(`render-poll:${job.id}`);
         } catch (error) {
           const rawMessage =
@@ -1094,11 +1105,12 @@ export class ImageRenderService {
   }
 
   private async process(
-    job: typeof imageRenderJobs.$inferSelect
+    job: typeof imageRenderJobs.$inferSelect,
+    descriptionSession?: AbortSignal
   ): Promise<void> {
     readRenderRequest(job.requestJson);
     if (job.model === "qwen") {
-      await this.processComfyQwen(job);
+      await this.processComfyQwen(job, descriptionSession);
       return;
     }
     if (job.model === "wan_animate_2_2") {
@@ -1131,7 +1143,8 @@ export class ImageRenderService {
   }
 
   private async processComfyQwen(
-    job: typeof imageRenderJobs.$inferSelect
+    job: typeof imageRenderJobs.$inferSelect,
+    descriptionSession?: AbortSignal
   ): Promise<void> {
     const request = parseJson<StoredImageRequest>(job.requestJson);
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
@@ -1193,7 +1206,12 @@ export class ImageRenderService {
       client.poll(promptId)
     );
     if (result.state === "finished") {
-      await this.completeImageBytes(job, result.bytes, "ComfyUI");
+      await this.completeImageBytes(
+        job,
+        result.bytes,
+        "ComfyUI",
+        descriptionSession
+      );
       return;
     }
     if (result.state === "error") {
@@ -2156,7 +2174,8 @@ export class ImageRenderService {
   private async completeImageBytes(
     job: typeof imageRenderJobs.$inferSelect,
     bytes: Buffer,
-    providerName: string
+    providerName: string,
+    descriptionSession?: AbortSignal
   ): Promise<void> {
     const image = nativeImage.createFromBuffer(bytes);
     if (image.isEmpty())
@@ -2224,7 +2243,7 @@ export class ImageRenderService {
         })
         .where(eq(clips.id, job.clipId));
     });
-    this.onImageAvailable?.(job.assetId);
+    this.onImageAvailable?.(job.assetId, descriptionSession);
   }
 
   private async completeVideoFile(

@@ -1,4 +1,4 @@
-import { ipcMain } from "electron";
+import { ipcMain, type WebContents } from "electron";
 
 import {
   IPC_CHANNELS,
@@ -9,6 +9,7 @@ import {
   type LocalAutoPromptVersion,
   type LocalEnhancePromptInput
 } from "../../shared/contracts";
+import { waitForInference } from "../providers/sharedInference";
 import type { LocalI2vPromptAdapter } from "../vlm/localI2vPromptAdapter";
 import { VlmService } from "../vlm/vlmService";
 
@@ -106,6 +107,20 @@ export const registerVlmHandlers = (
   hasExternalText: () => Promise<boolean>
 ): (() => void) => {
   const requests = new InferenceRequests();
+  const run = <T>(
+    sender: WebContents,
+    requestId: unknown,
+    task: (signal: AbortSignal) => Promise<T>
+  ) =>
+    service.libraryWork.run(() => {
+      // Capture before InferenceRequests schedules its start microtask.
+      const lifetime = service.libraryWork.capture();
+      return requests.run(sender, requestId, (caller) => {
+        const signal = AbortSignal.any([caller, lifetime]);
+        signal.throwIfAborted();
+        return waitForInference(task(signal), signal);
+      });
+    });
   ipcMain.handle(IPC_CHANNELS.vlmCancel, (event, requestId) => {
     requireTrustedSender(event);
     requests.cancel(event.sender, requestId);
@@ -123,7 +138,7 @@ export const registerVlmHandlers = (
     async (event, assetId, requestId) => {
       requireTrustedSender(event);
       const id = text(assetId, "assetId");
-      return requests.run(event.sender, requestId, (signal) =>
+      return run(event.sender, requestId, (signal) =>
         service.captionAsset(id, signal)
       );
     }
@@ -133,7 +148,7 @@ export const registerVlmHandlers = (
     async (event, input, requestId) => {
       requireTrustedSender(event);
       const parsed = autoPromptInput(input);
-      return requests.run(event.sender, requestId, (signal) =>
+      return run(event.sender, requestId, (signal) =>
         service.autoPrompt(parsed, signal)
       );
     }
@@ -147,7 +162,7 @@ export const registerVlmHandlers = (
     async (event, input, requestId) => {
       requireTrustedSender(event);
       const parsed = enhancePromptInput(input);
-      return requests.run(event.sender, requestId, (signal) =>
+      return run(event.sender, requestId, (signal) =>
         service.enhancePrompt(parsed, signal)
       );
     }
@@ -157,7 +172,7 @@ export const registerVlmHandlers = (
     async (event, input, requestId) => {
       requireTrustedSender(event);
       const parsed = adaptI2vPromptInput(input);
-      return requests.run(event.sender, requestId, (signal) =>
+      return run(event.sender, requestId, (signal) =>
         i2vPromptAdapter.adapt(parsed, signal)
       );
     }

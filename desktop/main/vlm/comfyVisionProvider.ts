@@ -11,22 +11,32 @@ import {
 export const generateComfyVision =
   (settings: LibrarySettings): VisionGenerator =>
   async (request) => {
+    request.signal?.throwIfAborted();
     const [endpoint, model] = await Promise.all([
       settings.getComfyEndpoint(),
       settings.getVlmBackend()
     ]);
+    request.signal?.throwIfAborted();
     const text = await new ComfyVlmClient(endpoint, model).generate(request);
+    request.signal?.throwIfAborted();
     return { text, model };
   };
 
 /** Probe models outside the generation queue so settings can check readiness. */
 export const probeComfyVision = async (
-  settings: LibrarySettings
+  settings: LibrarySettings,
+  signal?: AbortSignal
 ): Promise<VlmModelStatus> => {
+  signal?.throwIfAborted();
   try {
     const endpoint = await settings.getComfyEndpoint();
+    signal?.throwIfAborted();
     const backend = await settings.getVlmBackend();
-    const models = await new ComfyVlmClient(endpoint, backend).probeModels();
+    signal?.throwIfAborted();
+    const models = await new ComfyVlmClient(endpoint, backend).probeModels(
+      signal
+    );
+    signal?.throwIfAborted();
     const installMessage =
       backend === "qwen3-vl-4b-heretic-int8"
         ? `Download ${models.missing.join(" and ")} from ${QWEN3_VL_HERETIC_MODEL_SOURCE} into ComfyUI/models/text_encoders/`
@@ -38,9 +48,12 @@ export const probeComfyVision = async (
       message: models.installed ? null : installMessage
     };
   } catch (error) {
+    signal?.throwIfAborted();
     // Missing node, or ComfyUI went away between the endpoint check and here.
+    const backend = await settings.getVlmBackend();
+    signal?.throwIfAborted();
     return {
-      backend: await settings.getVlmBackend(),
+      backend,
       ready: false,
       missingModels: [],
       message:

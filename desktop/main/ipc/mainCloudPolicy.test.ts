@@ -74,6 +74,7 @@ const event = {
 const invoke = (channel: string, ...args: unknown[]) =>
   state.handlers.get(channel)!(event, ...args);
 let settings: LibrarySettings;
+let imageSession: AbortController;
 const effects = {
   getLink: vi.fn(),
   putLink: vi.fn(),
@@ -103,6 +104,7 @@ beforeEach(async () => {
   state.protocols.clear();
   state.profile = await mkdtemp(path.join(tmpdir(), "mago-cloud-policy-"));
   settings = new LibrarySettings();
+  imageSession = new AbortController();
   effects.root.mockResolvedValue(state.profile);
   effects.resolve.mockResolvedValue("/fixture/input.mp4");
   effects.prepare.mockResolvedValue({
@@ -144,7 +146,8 @@ beforeEach(async () => {
     } as unknown as CloudRenderSubmitService,
     databaseManager: {} as DatabaseManager,
     getLibraryRoot: effects.root,
-    settings
+    settings,
+    captureImageDescriptionSession: () => imageSession.signal
   });
   registerProjectHandlers(
     {} as ProjectRepository,
@@ -522,4 +525,28 @@ test("an aborted storage request cannot dispatch after a delayed permission read
   release();
   await rejected;
   expect(fetchTrap).not.toHaveBeenCalled();
+});
+
+test("cloud-finish IPC captures description ownership before the account/root/download awaits", async () => {
+  const old = imageSession;
+  let release!: (mode: "cloud") => void;
+  vi.spyOn(settings, "getAppMode").mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      })
+  );
+  const pending = invoke(IPC_CHANNELS.cloudRenderFinish, {
+    jobId: "job",
+    url: remoteUrl
+  });
+  old.abort();
+  imageSession = new AbortController();
+  release("cloud");
+  await pending;
+  expect(effects.complete).toHaveBeenCalledExactlyOnceWith(
+    { jobId: "job", relativePath: "output.mp4", sizeBytes: 3 },
+    old.signal
+  );
+  vi.restoreAllMocks();
 });

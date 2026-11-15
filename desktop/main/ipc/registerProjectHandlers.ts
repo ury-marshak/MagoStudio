@@ -14,6 +14,7 @@ import { CloudProjectMirrorRepository } from "../database/cloudProjectMirrorRepo
 import { DatabaseManager } from "../database/databaseManager";
 import { ProjectRepository } from "../database/projectRepository";
 import { LibrarySettings } from "../librarySettings";
+import { LibraryWorkSession } from "../libraryWorkSession";
 
 import { requireTrustedSender } from "./trustedSender";
 
@@ -96,7 +97,11 @@ export const registerProjectHandlers = (
   databaseManager: DatabaseManager,
   settings: LibrarySettings,
   /** Told about every imported image, e.g. to caption it. Must not throw. */
-  onImageImported?: (assetId: string) => void
+  onImageImported?: (assetId: string) => void,
+  importWork: Pick<
+    LibraryWorkSession<unknown>,
+    "run" | "boundary" | "capture"
+  > = new LibraryWorkSession(() => undefined)
 ): void => {
   const ensureDatabase = async (required = false): Promise<boolean> => {
     if (databaseManager.isOpen()) return true;
@@ -118,32 +123,45 @@ export const registerProjectHandlers = (
     IPC_CHANNELS.assetsImportImage,
     async (event, value: unknown) => {
       requireTrustedSender(event);
-      await ensureDatabase(true);
-      const input = requireRecord(value);
-      const number = (name: string) => {
-        const candidate = input[name];
-        if (
-          typeof candidate !== "number" ||
-          !Number.isFinite(candidate) ||
-          candidate <= 0
-        ) {
-          throw new Error(`${name} must be a positive number`);
+      return importWork.run(async () => {
+        // Own the request before the first asynchronous root lookup. An issued
+        // import drains in full, but a stale root result cannot open another DB.
+        if (!databaseManager.isOpen()) {
+          const root = await importWork.boundary(() =>
+            settings.getLibraryRoot()
+          );
+          if (!root) throw new Error("Choose a Mago library folder first");
+          await importWork.boundary(() => databaseManager.open(root));
         }
-        return candidate;
-      };
-      const asset = await repository.importImage({
-        projectId: requireString(input.projectId, "projectId"),
-        sourcePath: requireString(input.sourcePath, "sourcePath"),
-        name: requireString(input.name, "name"),
-        width: number("width"),
-        height: number("height"),
-        thumbnailDataUrl: requireString(
-          input.thumbnailDataUrl,
-          "thumbnailDataUrl"
-        )
-      } satisfies LocalImageImport);
-      onImageImported?.(asset.id);
-      return asset;
+        const input = requireRecord(value);
+        const number = (name: string) => {
+          const candidate = input[name];
+          if (
+            typeof candidate !== "number" ||
+            !Number.isFinite(candidate) ||
+            candidate <= 0
+          ) {
+            throw new Error(`${name} must be a positive number`);
+          }
+          return candidate;
+        };
+        const asset = await importWork.boundary(() =>
+          repository.importImage({
+            projectId: requireString(input.projectId, "projectId"),
+            sourcePath: requireString(input.sourcePath, "sourcePath"),
+            name: requireString(input.name, "name"),
+            width: number("width"),
+            height: number("height"),
+            thumbnailDataUrl: requireString(
+              input.thumbnailDataUrl,
+              "thumbnailDataUrl"
+            )
+          } satisfies LocalImageImport)
+        );
+        importWork.capture();
+        onImageImported?.(asset.id);
+        return asset;
+      });
     }
   );
 
