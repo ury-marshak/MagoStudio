@@ -1,3 +1,4 @@
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 import { readableDesktopStorageUrl } from "@/platform/rendererMediaAccess";
 
 import { getCachedVideoBlob } from "./getCachedVideoBlob";
@@ -9,12 +10,15 @@ export const cacheVideoUrl = async (
   url: string,
   cacheKey: string
 ): Promise<{ urlToUse: string; isCached: boolean }> => {
+  const work = rendererLibrary.capture();
   try {
-    const blob = await getCachedVideoBlob(url, cacheKey);
+    const blob = await getCachedVideoBlob(url, cacheKey, work);
+    work.check();
 
     const blobUrl = URL.createObjectURL(blob);
     return { urlToUse: blobUrl, isCached: true };
   } catch (error) {
+    work.check();
     console.warn("Error downloading/caching video, using direct URL:", error);
     return { urlToUse: readableDesktopStorageUrl(url), isCached: false };
   }

@@ -51,9 +51,15 @@ describe("getCachedVideoBlob", () => {
       URL_VALUE,
       undefined,
       URL_VALUE,
-      expect.any(AbortSignal)
+      expect.any(AbortSignal),
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
-    expect(cacheSetMock).toHaveBeenCalledWith("video", URL_VALUE, fetched);
+    expect(cacheSetMock).toHaveBeenCalledWith(
+      "video",
+      URL_VALUE,
+      fetched,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
   });
 
   it("uses the explicit cache key when provided", async () => {
@@ -62,11 +68,16 @@ describe("getCachedVideoBlob", () => {
 
     await getCachedVideoBlob(URL_VALUE, "custom-key");
 
-    expect(cacheGetMock).toHaveBeenCalledWith("video", "custom-key");
+    expect(cacheGetMock).toHaveBeenCalledWith(
+      "video",
+      "custom-key",
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(cacheSetMock).toHaveBeenCalledWith(
       "video",
       "custom-key",
-      expect.any(Blob)
+      expect.any(Blob),
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
   });
 
@@ -88,7 +99,12 @@ describe("getCachedVideoBlob", () => {
     const result = await getCachedVideoBlob(URL_VALUE);
 
     expect(result).toBe(fetched);
-    expect(cacheSetMock).toHaveBeenCalledWith("video", URL_VALUE, fetched);
+    expect(cacheSetMock).toHaveBeenCalledWith(
+      "video",
+      URL_VALUE,
+      fetched,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
   });
 
   it("still returns the downloaded Blob when the cache write-through fails", async () => {

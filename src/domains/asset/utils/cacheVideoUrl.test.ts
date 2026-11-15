@@ -52,7 +52,12 @@ describe("cacheVideoUrl", () => {
     const result = await cacheVideoUrl(VIDEO_URL, CACHE_KEY);
 
     expect(result).toEqual({ urlToUse: OBJECT_URL, isCached: true });
-    expect(cacheSetMock).toHaveBeenCalledWith("video", CACHE_KEY, fetched);
+    expect(cacheSetMock).toHaveBeenCalledWith(
+      "video",
+      CACHE_KEY,
+      fetched,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
   });
 
   it("leaves a render that answered with no bytes uncached, on the direct URL", async () => {
@@ -73,7 +78,12 @@ describe("cacheVideoUrl", () => {
     const result = await cacheVideoUrl(VIDEO_URL, CACHE_KEY);
 
     expect(result).toEqual({ urlToUse: OBJECT_URL, isCached: true });
-    expect(cacheSetMock).toHaveBeenCalledWith("video", CACHE_KEY, fetched);
+    expect(cacheSetMock).toHaveBeenCalledWith(
+      "video",
+      CACHE_KEY,
+      fetched,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
   });
 
   it("falls back to the direct URL when the download fails", async () => {

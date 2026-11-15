@@ -1,5 +1,7 @@
 import { extractFrameFromVideo } from "@app/services/mediaBunny";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 import { cacheGet } from "./cacheStorage";
 import { getFrameFromCache, saveFrameToCache } from "./frameCache";
 import { getCachedVideoBlob } from "./getCachedVideoBlob";
@@ -35,18 +37,23 @@ export const resolveCachedVideoPreview = async ({
   fps: number;
   loadVideo?: boolean;
 }): Promise<CachedVideoPreview> => {
+  const work = rendererLibrary.capture();
+  work.check();
   const cachedFirstFrameUrl = await getFrameFromCache(
     assetId,
     FIRST_FRAME_NUMBER,
-    fps
+    fps,
+    work
   );
+  work.check();
 
   // Thumbnail-only callers must not reopen or download the video when the
   // persisted first frame already exists.
   if (cachedFirstFrameUrl && !loadVideo) {
     const isVideoAvailable =
       isLocalVideoUrl(videoUrl) ||
-      ((await cacheGet("video", assetId))?.size ?? 0) > 0;
+      ((await cacheGet("video", assetId, work))?.size ?? 0) > 0;
+    work.check();
     return {
       videoObjectUrl: null,
       firstFrameUrl: cachedFirstFrameUrl,
@@ -56,7 +63,8 @@ export const resolveCachedVideoPreview = async ({
 
   const videoSource = isLocalVideoUrl(videoUrl)
     ? videoUrl
-    : await getCachedVideoBlob(videoUrl, assetId);
+    : await getCachedVideoBlob(videoUrl, assetId, work);
+  work.check();
   const videoObjectUrl = loadVideo
     ? typeof videoSource === "string"
       ? videoSource
@@ -76,11 +84,13 @@ export const resolveCachedVideoPreview = async ({
       frameNumber: FIRST_FRAME_NUMBER,
       fps
     });
+    work.check();
     await saveFrameToCache(
       assetId,
       FIRST_FRAME_NUMBER,
       extractedFirstFrameUrl,
-      fps
+      fps,
+      work
     );
     return {
       videoObjectUrl,
@@ -88,6 +98,7 @@ export const resolveCachedVideoPreview = async ({
       isVideoAvailable: true
     };
   } catch {
+    work.check();
     return { videoObjectUrl, firstFrameUrl: null, isVideoAvailable: true };
   }
 };

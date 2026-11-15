@@ -72,7 +72,12 @@ describe("cacheImageUrl", () => {
     const result = await cacheImageUrl(IMAGE_URL, CACHE_KEY);
 
     expect(result).toEqual({ urlToUse: OBJECT_URL, isCached: true });
-    expect(cacheSetMock).toHaveBeenCalledWith("image", CACHE_KEY, fetched);
+    expect(cacheSetMock).toHaveBeenCalledWith(
+      "image",
+      CACHE_KEY,
+      fetched,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
   });
 
   it("reads a presigned S3 image through the desktop media protocol", async () => {

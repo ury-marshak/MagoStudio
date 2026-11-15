@@ -1,3 +1,9 @@
+import {
+  rendererLibrary,
+  type RendererLibrarySession,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+
 type Kind = "video" | "image";
 export const DOWNLOAD_PRIORITY = {
   background: 0,
@@ -15,8 +21,10 @@ type Request<T> = Context & {
   kind: Kind;
   run: (signal: AbortSignal) => Promise<T>;
   signal?: AbortSignal;
+  work?: RendererLibraryWork;
 };
 type Job = Request<unknown> & {
+  work: RendererLibraryWork;
   order: number;
   controller?: AbortController;
   promise: Promise<unknown>;
@@ -42,6 +50,25 @@ export class MediaDownloadScheduler {
   private workScheduled = false;
   private publicationScheduled = false;
   private snapshot = { queued: 0, downloading: 0, ready: 0, failed: 0 };
+
+  constructor(private library: RendererLibrarySession = rendererLibrary) {
+    library.onSuspend(async () => {
+      for (const job of this.jobs.values()) {
+        job.controller?.abort();
+        job.reject(new DOMException("Library changed", "AbortError"));
+      }
+      this.jobs.clear();
+      this.contexts.clear();
+      this.demands.clear();
+      this.states.clear();
+      this.stateAssetIds.clear();
+      this.assetStates.clear();
+      this.failures.clear();
+      this.projectId = undefined;
+      this.timelineId = undefined;
+      this.publish();
+    });
+  }
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -74,7 +101,8 @@ export class MediaDownloadScheduler {
     this.schedulePump();
     return () => {
       leases.delete(token);
-      if (!leases.size) this.demands.delete(assetId);
+      if (!leases.size && this.demands.get(assetId) === leases)
+        this.demands.delete(assetId);
       this.schedulePump();
     };
   }
@@ -93,6 +121,13 @@ export class MediaDownloadScheduler {
     return 0;
   }
   enqueue<T>(request: Request<T>): Promise<T> {
+    let work: RendererLibraryWork;
+    try {
+      work = request.work ?? this.library.capture();
+      work.check();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const existing = this.jobs.get(request.key);
     if (existing) return existing.promise as Promise<T>;
     if (request.signal?.aborted)
@@ -105,6 +140,7 @@ export class MediaDownloadScheduler {
     });
     const job: Job = {
       ...request,
+      work,
       controller: undefined,
       order: this.order++,
       promise,
@@ -116,6 +152,7 @@ export class MediaDownloadScheduler {
     this.states.set(job.key, "queued");
     this.stateAssetIds.set(job.key, job.assetId);
     const cancel = () => {
+      if (this.jobs.get(job.key) !== job) return;
       if (job.controller) job.controller.abort();
       else {
         this.jobs.delete(job.key);
@@ -208,9 +245,14 @@ export class MediaDownloadScheduler {
     job.controller = controller;
     this.states.set(job.key, "downloading");
     this.publish();
-    void Promise.resolve()
-      .then(() => job.run(controller.signal))
+    void job.work
+      .boundary(() => {
+        controller.signal.throwIfAborted();
+        return job.run(controller.signal);
+      })
       .then((value) => {
+        job.work.check();
+        if (this.jobs.get(job.key) !== job) return;
         if (controller.signal.aborted)
           throw new DOMException("Interrupted", "AbortError");
         this.jobs.delete(job.key);
@@ -218,6 +260,7 @@ export class MediaDownloadScheduler {
         job.resolve(value);
       })
       .catch((error) => {
+        if (this.jobs.get(job.key) !== job) return;
         if (controller.signal.aborted && !job.signal?.aborted) {
           // IPC cancellation is awaited by run(), so the video slot is only
           // released once its old transfer has actually stopped.

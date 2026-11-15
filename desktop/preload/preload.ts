@@ -17,6 +17,26 @@ const readAppMode = (): "cloud" | "offline" | "unchosen" => {
   return mode === "cloud" || mode === "offline" ? mode : "unchosen";
 };
 
+const libraryStops = new Set<() => Promise<void>>();
+const libraryResets = new Set<() => void>();
+let librarySuspended = false;
+ipcRenderer.on("library:will-change", async (_event, id: string | null) => {
+  librarySuspended = true;
+  const results = await Promise.allSettled(
+    [...libraryStops].map(async (stop) => stop())
+  );
+  if (id !== null)
+    await ipcRenderer.invoke(
+      "library:drained",
+      id,
+      results.some((result) => result.status === "rejected")
+    );
+});
+ipcRenderer.on("library:did-change", () => {
+  librarySuspended = false;
+  libraryResets.forEach((reset) => reset());
+});
+
 const ipcChannels = {
   textModelRequest: "text-model:request",
   textModelResponse: "text-model:response",
@@ -218,7 +238,20 @@ const api: MagoDesktopApi = {
     reveal: () => ipcRenderer.invoke(ipcChannels.libraryReveal),
     issues: () => ipcRenderer.invoke(ipcChannels.libraryIssues),
     openLogs: () => ipcRenderer.invoke(ipcChannels.libraryOpenLogs),
-    restoreBackup: () => ipcRenderer.invoke(ipcChannels.libraryRestoreBackup)
+    restoreBackup: () => ipcRenderer.invoke(ipcChannels.libraryRestoreBackup),
+    onWillChange: async (listener) => {
+      libraryStops.add(listener);
+      await ipcRenderer.invoke("library:watch");
+      if (librarySuspended) {
+        librarySuspended = true;
+        // Do not await this drain: it may itself be waiting for registration.
+        void listener().catch(() => {});
+      }
+    },
+    onDidChange: (listener) => {
+      libraryResets.add(listener);
+      return () => libraryResets.delete(listener);
+    }
   },
   files: {
     getPath: (file) => webUtils.getPathForFile(file),

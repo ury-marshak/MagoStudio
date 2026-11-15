@@ -90,7 +90,11 @@ describe("resolveCachedVideoPreview", () => {
     const videoUrl =
       "mago-media://cloud-storage/?url=https%3A%2F%2Fcdn.example%2Fvideo.mp4";
     await resolveCachedVideoPreview({ assetId: ASSET_ID, videoUrl, fps: FPS });
-    expect(getCachedVideoBlobMock).toHaveBeenCalledWith(videoUrl, ASSET_ID);
+    expect(getCachedVideoBlobMock).toHaveBeenCalledWith(
+      videoUrl,
+      ASSET_ID,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
   });
   let videoBlob: Blob;
 
@@ -117,7 +121,11 @@ describe("resolveCachedVideoPreview", () => {
       fps: FPS
     });
 
-    expect(getCachedVideoBlobMock).toHaveBeenCalledWith(VIDEO_URL, ASSET_ID);
+    expect(getCachedVideoBlobMock).toHaveBeenCalledWith(
+      VIDEO_URL,
+      ASSET_ID,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
   });
 
   it("returns the cached first frame without decoding the video again", async () => {
@@ -180,7 +188,8 @@ describe("resolveCachedVideoPreview", () => {
       ASSET_ID,
       0,
       FIRST_FRAME_DATA_URL,
-      FPS
+      FPS,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
   });
 
@@ -203,7 +212,8 @@ describe("resolveCachedVideoPreview", () => {
       ASSET_ID,
       0,
       FIRST_FRAME_DATA_URL,
-      FPS
+      FPS,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
     expect(preview.firstFrameUrl).toBe(FIRST_FRAME_DATA_URL);
   });

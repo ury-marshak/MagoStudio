@@ -684,6 +684,8 @@ export interface MagoDesktopApi {
     issues: () => Promise<LibraryIssue[]>;
     openLogs: () => Promise<void>;
     restoreBackup: () => Promise<void>;
+    onWillChange: (listener: () => Promise<void>) => Promise<void>;
+    onDidChange: (listener: () => void) => () => void;
   };
   files: {
     getPath: (file: File) => string;

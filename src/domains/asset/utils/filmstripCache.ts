@@ -1,32 +1,19 @@
-import { fetchRendererMedia } from "@/platform/rendererMediaAccess";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
-import { cacheGet, cacheSet } from "./cacheStorage";
-
-function getFilmstripCacheKey(assetId: string, width: number): string {
-  return `${assetId}_${width}`;
-}
+import { readCachedDataUrl, saveCachedDataUrl } from "./cachedDataUrl";
 
 export async function getFilmstripFromCache(
   assetId: string,
-  width: number
+  width: number,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<string | null> {
   try {
-    const key = getFilmstripCacheKey(assetId, width);
-    const blob = await cacheGet("filmstrip", key);
-
-    if (!blob) return null;
-
-    return new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        resolve(reader.result as string);
-      };
-      reader.onerror = () => {
-        resolve(null);
-      };
-      reader.readAsDataURL(blob);
-    });
+    return await readCachedDataUrl("filmstrip", `${assetId}_${width}`, work);
   } catch {
+    work.check();
     return null;
   }
 }
@@ -34,14 +21,13 @@ export async function getFilmstripFromCache(
 export async function saveFilmstripToCache(
   assetId: string,
   width: number,
-  dataUrl: string
+  dataUrl: string,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<void> {
   try {
-    const key = getFilmstripCacheKey(assetId, width);
-    const response = await fetchRendererMedia(dataUrl);
-    const blob = await response.blob();
-    await cacheSet("filmstrip", key, blob);
+    await saveCachedDataUrl("filmstrip", `${assetId}_${width}`, dataUrl, work);
   } catch (error) {
+    work.check();
     console.warn("Failed to save filmstrip to cache:", error);
   }
 }

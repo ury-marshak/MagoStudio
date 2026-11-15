@@ -1,3 +1,8 @@
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+
 import { cacheGet, cacheSet } from "./cacheStorage";
 import { downloadVideoInChunks } from "./downloadVideoInChunks";
 import { mediaDownloads } from "./mediaDownloadScheduler";
@@ -7,27 +12,34 @@ import { mediaDownloads } from "./mediaDownloadScheduler";
  * so an empty body is thrown rather than kept, leaving the caller on the direct URL. */
 export const getCachedVideoBlob = async (
   url: string,
-  cacheKey: string = url
+  cacheKey: string = url,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<Blob> => {
-  const cached = await cacheGet("video", cacheKey);
+  work.check();
+  const cached = await cacheGet("video", cacheKey, work);
+  work.check();
   if (cached?.size) return cached;
 
   return mediaDownloads.enqueue({
     key: `video:${cacheKey}`,
     assetId: cacheKey,
     kind: "video",
+    work,
     run: async (signal) => {
       const blob = await downloadVideoInChunks(
         url,
         undefined,
         cacheKey,
-        signal
+        signal,
+        work
       );
+      work.check();
+      signal.throwIfAborted();
       if (!blob.size) {
         throw new Error(`Video has no bytes yet: ${url}`);
       }
 
-      await cacheSet("video", cacheKey, blob).catch((cacheError) => {
+      await cacheSet("video", cacheKey, blob, work).catch((cacheError) => {
         console.warn("Failed to cache video:", cacheError);
       });
       return blob;

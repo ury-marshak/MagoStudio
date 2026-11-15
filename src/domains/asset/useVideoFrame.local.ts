@@ -1,6 +1,8 @@
 import { extractFrameFromVideo } from "@app/services/mediaBunny";
 import { useQuery } from "@tanstack/react-query";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { useVideoAsset } from "./useVideoAsset";
 import { getFrameFromCache, saveFrameToCache } from "./utils/frameCache";
 
@@ -20,14 +22,15 @@ export function useVideoFrame({
   frameNumber,
   fps
 }: UseVideoFrameProps) {
+  const { work, libraryVersion } = useRendererLibraryWork();
   const {
     data: cachedFrame,
     isLoading: isCheckingCache,
     error: cacheError
   } = useQuery({
-    queryKey: ["frame-cache", assetId, frameNumber, fps],
-    queryFn: () => getFrameFromCache(assetId!, frameNumber, fps),
-    enabled: enabled && !!assetId,
+    queryKey: ["frame-cache", assetId, frameNumber, fps, libraryVersion],
+    queryFn: () => getFrameFromCache(assetId!, frameNumber, fps, work),
+    enabled: !work.signal.aborted && enabled && !!assetId,
     staleTime: Infinity,
     gcTime: Infinity
   });
@@ -37,7 +40,12 @@ export function useVideoFrame({
   const { data: videoAsset, isLoading: isVideoAssetLoading } = useVideoAsset({
     assetId,
     selectedLayerId,
-    enabled: enabled && cacheChecked && !hasCachedFrame && !!assetId
+    enabled:
+      !work.signal.aborted &&
+      enabled &&
+      cacheChecked &&
+      !hasCachedFrame &&
+      !!assetId
   });
   const videoUrl = (() => {
     if (!videoAsset) return undefined;
@@ -51,8 +59,10 @@ export function useVideoFrame({
     isLoading: isGenerating,
     error: generateError
   } = useQuery({
-    queryKey: ["frame-generate", assetId, frameNumber, fps],
+    queryKey: ["frame-generate", assetId, frameNumber, fps, libraryVersion],
     queryFn: async () => {
+      await work.ready();
+      work.check();
       const frame = videoUrl?.startsWith("mago-media:")
         ? await window.mago.assets.extractVideoFrame({
             assetId: assetId!,
@@ -64,10 +74,12 @@ export function useVideoFrame({
             frameNumber,
             fps
           });
-      saveFrameToCache(assetId!, frameNumber, frame, fps).catch(() => {});
+      work.check();
+      saveFrameToCache(assetId!, frameNumber, frame, fps, work).catch(() => {});
       return frame;
     },
     enabled:
+      !work.signal.aborted &&
       enabled &&
       cacheChecked &&
       !hasCachedFrame &&

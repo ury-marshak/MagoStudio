@@ -18,6 +18,7 @@ import { listLibraryIssues, reportLibraryIssue } from "../libraryHealth";
 import { LibrarySettings } from "../librarySettings";
 import { logStartup } from "../startupDiagnostics";
 
+import { registerRendererLibraryLifecycle } from "./rendererLibraryLifecycle";
 import { requireTrustedSender } from "./trustedSender";
 
 const toLibraryInfo = (rootPath: string): LibraryInfo => ({
@@ -39,6 +40,7 @@ export const registerLibraryHandlers = ({
   beforeLibraryChange?: () => Promise<void>;
   afterLibraryChange?: () => void;
 }): void => {
+  const rendererLifecycle = registerRendererLibraryLifecycle();
   ipcMain.handle(IPC_CHANNELS.libraryIssues, (event) => {
     requireTrustedSender(event);
     return listLibraryIssues();
@@ -72,6 +74,7 @@ export const registerLibraryHandlers = ({
       defaultId: backups.length
     });
     if (selected < 0 || selected >= backups.length) return;
+    await rendererLifecycle.suspend();
     await beforeLibraryChange?.();
     await databaseManager.suspendForRecovery();
     try {
@@ -209,10 +212,12 @@ export const registerLibraryHandlers = ({
     if (result.canceled || !rootPath) return null;
 
     await settings.assertWritable(rootPath);
+    await rendererLifecycle.suspend();
     await beforeLibraryChange?.();
     await databaseManager.open(rootPath);
     await settings.setLibraryRoot(rootPath);
     afterLibraryChange?.();
+    rendererLifecycle.reset();
     return toLibraryInfo(rootPath);
   });
 

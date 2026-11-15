@@ -1,6 +1,9 @@
-import { fetchRendererMedia } from "@/platform/rendererMediaAccess";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
-import { cacheGet, cacheSet } from "./cacheStorage";
+import { readCachedDataUrl, saveCachedDataUrl } from "./cachedDataUrl";
 
 function getFrameCacheKey(
   assetId: string,
@@ -15,25 +18,17 @@ function getFrameCacheKey(
 export async function getFrameFromCache(
   assetId: string,
   frameNumber: number,
-  fps?: number
+  fps?: number,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<string | null> {
   try {
-    const key = getFrameCacheKey(assetId, frameNumber, fps);
-    const blob = await cacheGet("frame", key);
-
-    if (!blob) return null;
-
-    return new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        resolve(reader.result as string);
-      };
-      reader.onerror = () => {
-        resolve(null);
-      };
-      reader.readAsDataURL(blob);
-    });
+    return await readCachedDataUrl(
+      "frame",
+      getFrameCacheKey(assetId, frameNumber, fps),
+      work
+    );
   } catch {
+    work.check();
     return null;
   }
 }
@@ -42,14 +37,18 @@ export async function saveFrameToCache(
   assetId: string,
   frameNumber: number,
   dataUrl: string,
-  fps?: number
+  fps?: number,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<void> {
   try {
-    const key = getFrameCacheKey(assetId, frameNumber, fps);
-    const response = await fetchRendererMedia(dataUrl);
-    const blob = await response.blob();
-    await cacheSet("frame", key, blob);
+    await saveCachedDataUrl(
+      "frame",
+      getFrameCacheKey(assetId, frameNumber, fps),
+      dataUrl,
+      work
+    );
   } catch (error) {
+    work.check();
     console.warn("Failed to save frame to cache:", error);
   }
 }

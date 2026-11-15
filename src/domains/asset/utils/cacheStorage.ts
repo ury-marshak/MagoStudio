@@ -1,4 +1,9 @@
 import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+
+import {
   isOPFSSupported,
   opfsClear,
   opfsGet,
@@ -13,12 +18,14 @@ import {
 export type { CacheType } from "./opfs";
 
 export async function cacheClear(type?: CacheType): Promise<void> {
+  const work = rendererLibrary.capture();
   const useOPFS = await isOPFSSupported();
+  work.check();
   if (!useOPFS) return;
-
   try {
-    await opfsClear(type);
+    await work.boundary(() => opfsClear(type));
   } catch (error) {
+    work.check();
     console.warn("OPFS clear failed:", error);
   }
 }
@@ -26,17 +33,21 @@ export async function cacheClear(type?: CacheType): Promise<void> {
 export async function cacheSet(
   type: CacheType,
   key: string,
-  blob: Blob
+  blob: Blob,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<void> {
+  work.check();
   const useOPFS = await isOPFSSupported();
+  work.check();
   if (!useOPFS) return;
-
+  const scopedKey = await work.cacheKey(key);
   try {
-    await opfsSet(type, key, blob);
+    await work.boundary(() => opfsSet(type, scopedKey, blob));
   } catch (error) {
+    work.check();
     if (isQuotaExceededError(error)) {
-      await handleQuotaExceeded();
-      await opfsSet(type, key, blob);
+      await work.boundary(handleQuotaExceeded);
+      await work.boundary(() => opfsSet(type, scopedKey, blob));
     } else {
       console.warn("OPFS write failed:", error);
     }
@@ -45,14 +56,18 @@ export async function cacheSet(
 
 export async function cacheGet(
   type: CacheType,
-  key: string
+  key: string,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<Blob | undefined> {
+  work.check();
   const useOPFS = await isOPFSSupported();
+  work.check();
   if (!useOPFS) return undefined;
-
+  const scopedKey = await work.cacheKey(key);
   try {
-    return await opfsGet(type, key);
+    return await work.boundary(() => opfsGet(type, scopedKey));
   } catch (error) {
+    work.check();
     console.warn("OPFS read failed:", error);
     return undefined;
   }

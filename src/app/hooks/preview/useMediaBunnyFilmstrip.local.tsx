@@ -7,6 +7,8 @@ import {
 } from "@domains/asset/utils/filmstripCache";
 import { useQuery } from "@tanstack/react-query";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 interface UseMediaBunnyFilmstripProps {
   assetId: string;
   trackId: string;
@@ -28,6 +30,7 @@ export function useMediaBunnyFilmstrip({
   enabled,
   videoUrl: directVideoUrl
 }: UseMediaBunnyFilmstripProps) {
+  const { work, libraryVersion } = useRendererLibraryWork();
   const isDirectVideoLocal = directVideoUrl?.startsWith("mago-media:") ?? false;
   const needsVideoAssetLookup = !directVideoUrl || isDirectVideoLocal;
   const {
@@ -35,9 +38,9 @@ export function useMediaBunnyFilmstrip({
     isLoading: isCheckingCache,
     error: cacheError
   } = useQuery({
-    queryKey: ["filmstrip-cache", assetId, width],
-    queryFn: () => getFilmstripFromCache(assetId, width),
-    enabled: enabled && !!assetId,
+    queryKey: ["filmstrip-cache", assetId, width, libraryVersion],
+    queryFn: () => getFilmstripFromCache(assetId, width, work),
+    enabled: !work.signal.aborted && enabled && !!assetId,
     staleTime: Infinity,
     gcTime: Infinity
   });
@@ -52,7 +55,11 @@ export function useMediaBunnyFilmstrip({
     assetId,
     selectedLayerId: trackId,
     enabled:
-      enabled && cacheChecked && !hasCachedFilmstrip && needsVideoAssetLookup
+      !work.signal.aborted &&
+      enabled &&
+      cacheChecked &&
+      !hasCachedFilmstrip &&
+      needsVideoAssetLookup
   });
   const videoUrl = (() => {
     if (directVideoUrl) return directVideoUrl;
@@ -81,8 +88,17 @@ export function useMediaBunnyFilmstrip({
     isLoading: isGenerating,
     error: generateError
   } = useQuery({
-    queryKey: ["filmstrip-generate", assetId, width, fps, localAssetRevision],
+    queryKey: [
+      "filmstrip-generate",
+      assetId,
+      width,
+      fps,
+      localAssetRevision,
+      libraryVersion
+    ],
     queryFn: async () => {
+      await work.ready();
+      work.check();
       const generateRemoteFilmstrip = async () => {
         const downloadedVideo = directVideoUrl
           ? await cacheVideoUrl(directVideoUrl, assetId)
@@ -90,6 +106,7 @@ export function useMediaBunnyFilmstrip({
         if (downloadedVideo && !downloadedVideo.isCached) {
           throw new Error("Shot video is not downloadable yet");
         }
+        work.check();
         const sourceUrl = downloadedVideo?.urlToUse ?? videoUrl!;
         try {
           return await generateFilmstrip(sourceUrl, {
@@ -108,10 +125,12 @@ export function useMediaBunnyFilmstrip({
             frameHeight: 65
           })
         : await generateRemoteFilmstrip();
-      saveFilmstripToCache(assetId, width, filmstrip).catch(() => {});
+      work.check();
+      saveFilmstripToCache(assetId, width, filmstrip, work).catch(() => {});
       return filmstrip;
     },
     enabled:
+      !work.signal.aborted &&
       enabled &&
       cacheChecked &&
       !hasCachedFilmstrip &&
