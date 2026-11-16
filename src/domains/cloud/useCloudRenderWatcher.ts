@@ -7,6 +7,7 @@ import { useEffect } from "react";
 import { backendApiClient } from "@/lib/backend-api-client";
 import { isLocalApp } from "@/platform/localDesktop";
 import { isCloudRenderAvailable } from "@/platform/renderTarget";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { pollCloudImageRenders } from "./pollCloudImageRenders";
@@ -28,57 +29,70 @@ import { pollCloudRenders } from "./pollCloudRenders";
 
 const POLL_INTERVAL_MS = 5000;
 
-const cloudApi = {
-  post: async <T>(url: string, body?: unknown): Promise<T> =>
-    (await backendApiClient.post<T>(url, body ?? {})).data,
-  get: async <T>(url: string): Promise<T> =>
-    (await backendApiClient.get<T>(url)).data
-};
-
 export const useCloudRenderWatcher = (): void => {
   const queryClient = useQueryClient();
+  const { work } = useRendererLibraryWork();
 
   useEffect(() => {
-    if (!isLocalApp || !isCloudRenderAvailable()) return;
+    if (!isLocalApp || !isCloudRenderAvailable() || work.signal.aborted) return;
 
+    // Each interval retains its origin; reset creates a separate interval/pass.
+    const cloudApi = {
+      post: async <T>(url: string, body?: unknown): Promise<T> => {
+        await work.ready();
+        const response = await backendApiClient.post<T>(url, body ?? {}, {
+          signal: work.signal
+        });
+        work.check();
+        return response.data;
+      },
+      get: async <T>(url: string): Promise<T> => {
+        await work.ready();
+        const response = await backendApiClient.get<T>(url, {
+          signal: work.signal
+        });
+        work.check();
+        return response.data;
+      }
+    };
     let cancelled = false;
     let running = false;
+    const invalidate = (queryKey: readonly unknown[]) => {
+      if (!cancelled && !work.signal.aborted)
+        return queryClient.invalidateQueries({ queryKey });
+    };
 
     const tick = async () => {
       // Never overlap: a slow download must not start a second pass.
-      if (running || cancelled) return;
+      if (
+        running ||
+        cancelled ||
+        work.signal.aborted ||
+        !isCloudRenderAvailable()
+      )
+        return;
       running = true;
       try {
         // Separate endpoints, separate pollers: img2img has no project-wide
         // queue the way video does (see pollCloudImageRenders.ts).
         const [videoOutcome, imageOutcome] = await Promise.all([
-          pollCloudRenders(cloudApi),
-          pollCloudImageRenders(cloudApi)
+          pollCloudRenders(cloudApi, work),
+          pollCloudImageRenders(cloudApi, work)
         ]);
+        work.check();
+        if (cancelled) return;
         const finished = videoOutcome.finished + imageOutcome.finished;
         const failed = videoOutcome.failed + imageOutcome.failed;
         if (videoOutcome.checked + imageOutcome.checked > 0) {
-          void queryClient.invalidateQueries({ queryKey: queryKeys.queue.all });
+          void invalidate(queryKeys.queue.all);
         }
         if (finished > 0 || failed > 0) {
-          void queryClient.invalidateQueries({
-            queryKey: queryKeys.balance.all
-          });
-          void queryClient.invalidateQueries({
-            queryKey: queryKeys.project.all
-          });
-          void queryClient.invalidateQueries({
-            queryKey: queryKeys.timelineList.all
-          });
-          void queryClient.invalidateQueries({
-            queryKey: queryKeys.videoAsset.all
-          });
-          void queryClient.invalidateQueries({
-            queryKey: queryKeys.assetLibraryItems.all
-          });
-          void queryClient.invalidateQueries({
-            queryKey: ["filmstrip-generate"]
-          });
+          void invalidate(queryKeys.balance.all);
+          void invalidate(queryKeys.project.all);
+          void invalidate(queryKeys.timelineList.all);
+          void invalidate(queryKeys.videoAsset.all);
+          void invalidate(queryKeys.assetLibraryItems.all);
+          void invalidate(["filmstrip-generate"]);
         }
       } catch {
         // A failed pass is not worth surfacing; the next tick tries again.
@@ -93,5 +107,5 @@ export const useCloudRenderWatcher = (): void => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [queryClient]);
+  }, [queryClient, work]);
 };

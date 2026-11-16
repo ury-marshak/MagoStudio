@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useSyncExternalStore } from "react";
 
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import {
@@ -24,6 +25,7 @@ export const useCloudProjectSync = (
   timelineId?: string
 ): { isSyncing: boolean } => {
   const queryClient = useQueryClient();
+  const { work } = useRendererLibraryWork();
   const isSyncing = useSyncExternalStore(
     subscribeCloudProjectSyncStatus,
     getCloudProjectSyncStatus,
@@ -31,64 +33,54 @@ export const useCloudProjectSync = (
   );
 
   useEffect(() => {
-    if (getLocalDesktopApi().account.mode !== "cloud") return;
+    if (getLocalDesktopApi().account.mode !== "cloud" || work.signal.aborted)
+      return;
+    const invalidate = (queryKey: readonly unknown[]) => {
+      if (!work.signal.aborted)
+        return queryClient.invalidateQueries({ queryKey });
+    };
     return subscribeCloudAssetReady((_readyProjectId, assetId) => {
-      void queryClient.invalidateQueries({
-        queryKey: queryKeys.videoAsset.byId(assetId)
-      });
-      void queryClient.invalidateQueries({
-        queryKey: queryKeys.imageAsset.byId(assetId)
-      });
-      void queryClient.invalidateQueries({
-        queryKey: ["frame-generate", assetId]
-      });
-      void queryClient.invalidateQueries({
-        queryKey: ["cached-video-preview", assetId]
-      });
+      if (work.signal.aborted) return;
+      void invalidate(queryKeys.videoAsset.byId(assetId));
+      void invalidate(queryKeys.imageAsset.byId(assetId));
+      void invalidate(["frame-generate", assetId]);
+      void invalidate(["cached-video-preview", assetId]);
     });
-  }, [queryClient]);
+  }, [queryClient, work]);
 
   useEffect(() => {
     const desktop = getLocalDesktopApi();
-    if (desktop.account.mode !== "cloud") return;
+    if (desktop.account.mode !== "cloud" || work.signal.aborted) return;
     let isActive = true;
+    const invalidate = (queryKey: readonly unknown[]) => {
+      if (isActive && !work.signal.aborted)
+        return queryClient.invalidateQueries({ queryKey });
+    };
     let catalogRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
     const refreshProjectDetails = async (metadataProjectId: string) => {
-      if (!isActive || metadataProjectId !== projectId) return;
+      if (!isActive || work.signal.aborted || metadataProjectId !== projectId)
+        return;
       await Promise.all([
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.project.byId(metadataProjectId)
-        }),
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.timelineList.byProjectId(metadataProjectId)
-        }),
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.projectState.byProjectId(metadataProjectId)
-        }),
-        queryClient.invalidateQueries({
-          queryKey:
-            queryKeys.projectScriptVersions.byProjectId(metadataProjectId)
-        }),
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.projectCut.byProjectId(metadataProjectId)
-        })
+        invalidate(queryKeys.project.byId(metadataProjectId)),
+        invalidate(queryKeys.timelineList.byProjectId(metadataProjectId)),
+        invalidate(queryKeys.projectState.byProjectId(metadataProjectId)),
+        invalidate(
+          queryKeys.projectScriptVersions.byProjectId(metadataProjectId)
+        ),
+        invalidate(queryKeys.projectCut.byProjectId(metadataProjectId))
       ]);
     };
     const unsubscribeMetadata = subscribeCloudProjectMetadata((syncedId) => {
+      if (!isActive || work.signal.aborted) return;
       void refreshProjectDetails(syncedId);
       if (!projectId && !catalogRefreshTimer) {
         catalogRefreshTimer = setTimeout(() => {
           catalogRefreshTimer = null;
-          void queryClient.invalidateQueries({
-            queryKey: queryKeys.homepage.all
-          });
-          void queryClient.invalidateQueries({
-            queryKey: queryKeys.projectList.all
-          });
-          void queryClient.invalidateQueries({
-            queryKey: queryKeys.projects.all
-          });
+          if (!isActive || work.signal.aborted) return;
+          void invalidate(queryKeys.homepage.all);
+          void invalidate(queryKeys.projectList.all);
+          void invalidate(queryKeys.projects.all);
         }, ASSET_REFRESH_DEBOUNCE_MS);
       }
     });
@@ -98,7 +90,8 @@ export const useCloudProjectSync = (
     // its player and thumbnails stop waiting.
     let projectRefreshTimer: ReturnType<typeof setTimeout> | null = null;
     const unsubscribeAssetReady = subscribeCloudAssetReady((readyProjectId) => {
-      if (!isActive || readyProjectId !== projectId) return;
+      if (!isActive || work.signal.aborted || readyProjectId !== projectId)
+        return;
       if (projectRefreshTimer) return;
       projectRefreshTimer = setTimeout(() => {
         projectRefreshTimer = null;
@@ -107,12 +100,12 @@ export const useCloudProjectSync = (
     });
 
     const refreshCatalog = async () => {
-      await syncCloudScriptProjects();
-      if (!isActive) return;
+      await syncCloudScriptProjects(work);
+      if (!isActive || work.signal.aborted) return;
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.projectList.all }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.projects.all }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.homepage.all })
+        invalidate(queryKeys.projectList.all),
+        invalidate(queryKeys.projects.all),
+        invalidate(queryKeys.homepage.all)
       ]);
     };
 
@@ -121,27 +114,33 @@ export const useCloudProjectSync = (
         // The homepage query reads the durable local catalog itself. Start the
         // cloud refresh afterward without making rendering or navigation await
         // it.
-        void refreshCatalog();
+        await refreshCatalog();
         return;
       }
 
       // Project routes read only the selected row. In particular, opening a
       // local-origin project must neither await the global catalog sync nor
       // invalidate and reload the project that is already on disk.
-      deferCloudProjectCatalogSync();
-      const localProject = await desktop.projects.get(projectId);
-      if (!isActive || localProject?.origin === "local") return;
+      deferCloudProjectCatalogSync(work);
+      const localProject = await work.boundary(() =>
+        desktop.projects.get(projectId)
+      );
+      if (!isActive || work.signal.aborted || localProject?.origin === "local")
+        return;
 
       // A cloud-origin (or not-yet-cached) project remains usable from its local
       // snapshot while its detail refresh proceeds independently.
-      void syncCloudProject(projectId).catch((error) => {
-        if (isActive) {
+      void syncCloudProject(projectId, undefined, work).catch((error) => {
+        if (isActive && !work.signal.aborted) {
           console.warn(`Failed to refresh cloud project ${projectId}`, error);
         }
       });
     };
 
-    void refresh();
+    void refresh().catch((error) => {
+      if (isActive && !work.signal.aborted)
+        console.warn("Failed to refresh cloud projects", error);
+    });
     return () => {
       isActive = false;
       unsubscribeMetadata();
@@ -150,16 +149,17 @@ export const useCloudProjectSync = (
       if (catalogRefreshTimer) clearTimeout(catalogRefreshTimer);
       // Navigation demotes the old project; its media continues in idle slots.
     };
-  }, [projectId, queryClient]);
+  }, [projectId, queryClient, work]);
 
   // The opened Shot's media is fetched first. This runs after the effect above
   // in the same commit, and that effect's sync starts asynchronously, so the
   // priority is already set when the first download is chosen.
   /* eslint-disable react-you-might-not-need-an-effect/no-event-handler -- priority hint for an external download queue */
   useEffect(() => {
+    if (work.signal.aborted) return;
     mediaDownloads.setForeground(projectId, timelineId);
     if (timelineId) promoteCloudTimeline(timelineId);
-  }, [projectId, timelineId]);
+  }, [projectId, timelineId, work]);
   /* eslint-enable react-you-might-not-need-an-effect/no-event-handler */
 
   return { isSyncing };

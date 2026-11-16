@@ -1,5 +1,9 @@
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { isCloudMirrorProjectSettings } from "./isCloudMirrorProjectSettings";
 import { toCloudMirrorProjectSettings } from "./toCloudMirrorProjectSettings";
@@ -13,17 +17,23 @@ interface CloudProjectDocument {
 export const markCloudMirrorProject = async ({
   localProjectId,
   cloudProjectId,
-  signal
+  signal,
+  work = rendererLibrary.capture()
 }: {
   localProjectId: string;
   cloudProjectId: string;
   signal: AbortSignal;
+  work?: RendererLibraryWork;
 }): Promise<void> => {
+  await work.ready();
+  if (signal.aborted) return;
   const { data: cloudProject } =
     await backendApiClient.get<CloudProjectDocument>(
       `/projects/${cloudProjectId}`,
       { signal }
     );
+  work.check();
+  if (signal.aborted) return;
   const cloudSettings = cloudProject.settings ?? {};
   if (!isCloudMirrorProjectSettings(cloudSettings)) {
     if (typeof cloudProject.name !== "string") {
@@ -42,9 +52,12 @@ export const markCloudMirrorProject = async ({
       { signal }
     );
   }
-  await getLocalDesktopApi().cloud.links.patch({
-    kind: "project",
-    localId: localProjectId,
-    patch: { isCloudProjectMarkedAsMirror: true }
-  });
+  if (signal.aborted) return;
+  await work.boundary(() =>
+    getLocalDesktopApi().cloud.links.patch({
+      kind: "project",
+      localId: localProjectId,
+      patch: { isCloudProjectMarkedAsMirror: true }
+    })
+  );
 };

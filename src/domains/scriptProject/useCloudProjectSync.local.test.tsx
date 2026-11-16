@@ -99,7 +99,11 @@ describe("useCloudProjectSync", () => {
     finishProjectRead(null);
 
     await waitFor(() =>
-      expect(mocks.syncProject).toHaveBeenCalledWith("project-1")
+      expect(mocks.syncProject).toHaveBeenCalledWith(
+        "project-1",
+        undefined,
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      )
     );
     expect(mocks.syncProjects).not.toHaveBeenCalled();
   });
@@ -113,7 +117,11 @@ describe("useCloudProjectSync", () => {
       { wrapper }
     );
     await waitFor(() =>
-      expect(mocks.syncProject).toHaveBeenCalledWith("background-project")
+      expect(mocks.syncProject).toHaveBeenCalledWith(
+        "background-project",
+        undefined,
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      )
     );
     unmount();
     expect(mocks.cancelProject).not.toHaveBeenCalled();

@@ -1,4 +1,8 @@
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { CloudApi } from "./mirrorService";
 import { findQueueItemForAsset, toJobStatus } from "./queueStatus";
@@ -48,10 +52,14 @@ const createUnfilteredQueueLoader = (api: CloudApi) => {
   };
 };
 
-export const pollCloudRenders = async (api: CloudApi): Promise<PollOutcome> => {
-  const jobs = (await bridge().cloud.renders.listActive()).filter(
-    (job) => job.kind !== "img2img"
-  );
+export const pollCloudRenders = async (
+  api: CloudApi,
+  work: RendererLibraryWork = rendererLibrary.capture()
+): Promise<PollOutcome> => {
+  await work.ready();
+  const jobs = (
+    await work.boundary(() => bridge().cloud.renders.listActive())
+  ).filter((job) => job.kind !== "img2img");
   const outcome: PollOutcome = { checked: jobs.length, finished: 0, failed: 0 };
   if (jobs.length === 0) return outcome;
 
@@ -65,13 +73,18 @@ export const pollCloudRenders = async (api: CloudApi): Promise<PollOutcome> => {
   const loadUnfilteredQueue = createUnfilteredQueueLoader(api);
 
   for (const [localProjectId, projectJobs] of byProject) {
-    const link = await bridge().cloud.links.get("project", localProjectId);
+    const link = await work.boundary(() =>
+      bridge().cloud.links.get("project", localProjectId)
+    );
     if (!link) continue;
 
     let queue: unknown;
     try {
+      work.check();
       queue = await api.get(`/queue/project/${link.cloudId}`);
+      work.check();
     } catch {
+      work.check();
       continue;
     }
 
@@ -84,6 +97,7 @@ export const pollCloudRenders = async (api: CloudApi): Promise<PollOutcome> => {
       const unfilteredQueue = projectQueueItem
         ? null
         : await loadUnfilteredQueue();
+      work.check();
       const isUnfilteredQueueUnavailable =
         !projectQueueItem && unfilteredQueue === null;
       if (isUnfilteredQueueUnavailable) continue;
@@ -95,7 +109,12 @@ export const pollCloudRenders = async (api: CloudApi): Promise<PollOutcome> => {
       if (!item) {
         recordSettlement(
           outcome,
-          await settleCloudRenderFromAsset(api, jobWithCloudAsset, "cancelled")
+          await settleCloudRenderFromAsset(
+            api,
+            jobWithCloudAsset,
+            "cancelled",
+            work
+          )
         );
         continue;
       }
@@ -108,7 +127,8 @@ export const pollCloudRenders = async (api: CloudApi): Promise<PollOutcome> => {
           await settleCloudRenderFromAsset(
             api,
             jobWithCloudAsset,
-            "still-rendering"
+            "still-rendering",
+            work
           )
         );
         continue;
@@ -119,10 +139,12 @@ export const pollCloudRenders = async (api: CloudApi): Promise<PollOutcome> => {
           status === "CANCELLED"
             ? CANCELLED_CLOUD_RENDER_MESSAGE
             : `The cloud render failed (queue item ${item.id})`;
-        await bridge().cloud.renders.fail({
-          jobId: job.id,
-          message: item.failure ?? fallback
-        });
+        await work.boundary(() =>
+          bridge().cloud.renders.fail({
+            jobId: job.id,
+            message: item.failure ?? fallback
+          })
+        );
         outcome.failed += 1;
         continue;
       }
@@ -133,14 +155,17 @@ export const pollCloudRenders = async (api: CloudApi): Promise<PollOutcome> => {
       const hasCloudRenderProgressChanged =
         progressPercent !== null && progressPercent !== job.progress;
       if (hasCloudRenderStatusChanged || hasCloudRenderProgressChanged) {
-        await bridge().cloud.renders.setStatus({
-          jobId: job.id,
-          status,
-          ...(progressPercent === null ? {} : { progress: progressPercent })
-        });
+        await work.boundary(() =>
+          bridge().cloud.renders.setStatus({
+            jobId: job.id,
+            status,
+            ...(progressPercent === null ? {} : { progress: progressPercent })
+          })
+        );
       }
     }
   }
 
+  work.check();
   return outcome;
 };

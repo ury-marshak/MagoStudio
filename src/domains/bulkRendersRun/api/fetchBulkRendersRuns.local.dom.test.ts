@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/platform/localDesktop", () => ({
+  isLocalApp: false,
   getLocalDesktopApi: () => ({
     account: { mode: mocks.mode },
     projects: {

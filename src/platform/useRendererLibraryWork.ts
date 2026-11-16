@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 
 import { rendererLibrary } from "./rendererLibraryWork";
 
@@ -10,6 +10,10 @@ export function useRendererLibraryWork() {
     rendererLibrary.getSnapshot,
     rendererLibrary.getSnapshot
   );
-  const work = rendererLibrary.capture();
-  return { work, libraryVersion: version };
+  // A stable effect dependency within one library; still freeze origin during
+  // render, before any queued callback or asynchronous dispatch can run.
+  return useMemo(
+    () => ({ work: rendererLibrary.capture(), libraryVersion: version }),
+    [version]
+  );
 }

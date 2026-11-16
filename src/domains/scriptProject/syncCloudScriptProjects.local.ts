@@ -10,6 +10,10 @@ import {
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { collectCloudReferenceAssetIds } from "../../../desktop/shared/collectCloudReferenceAssetIds";
 
@@ -22,6 +26,7 @@ let deferredSyncTimer: ReturnType<typeof setTimeout> | null = null;
 type ProjectSyncOperation = {
   promise: Promise<void>;
   controller: AbortController;
+  work: RendererLibraryWork;
 };
 const projectSyncsInFlight = new Map<string, ProjectSyncOperation>();
 const syncStatusListeners = new Set<() => void>();
@@ -40,6 +45,50 @@ const publishCatalogProgress = (progress: typeof catalogProgress): void => {
   catalogProgress = progress;
   catalogProgressListeners.forEach((listener) => listener());
 };
+const withSyncSignal = (
+  origin: RendererLibraryWork,
+  caller: AbortSignal
+): RendererLibraryWork => {
+  const signal = AbortSignal.any([origin.signal, caller]);
+  const check = () => {
+    origin.check();
+    signal.throwIfAborted();
+  };
+  return {
+    ...origin,
+    signal,
+    check,
+    ready: async () => {
+      await origin.ready();
+      check();
+    },
+    boundary: (run) =>
+      origin.boundary(async () => {
+        check();
+        const result = await run();
+        check();
+        return result;
+      })
+  };
+};
+
+// Reuse the acknowledged renderer lifecycle. Do not await uncooperative cloud
+// responses or cancel provider jobs. Issued IPC bodies drain via work.boundary.
+rendererLibrary.onSuspend(async () => {
+  syncAbortController?.abort();
+  syncAbortController = null;
+  syncInFlight = null;
+  if (deferredSyncTimer) clearTimeout(deferredSyncTimer);
+  deferredSyncTimer = null;
+  for (const operation of projectSyncsInFlight.values())
+    operation.controller.abort();
+  projectSyncsInFlight.clear();
+  projectMetadataListeners.clear();
+  assetReadyListeners.clear();
+  publishCatalogProgress(null);
+  publishSyncStatus();
+});
+
 const BACKGROUND_WRITE_INTERVAL_MS = 75;
 const NAVIGATION_GRACE_PERIOD_MS = 1500;
 
@@ -74,12 +123,23 @@ export const subscribeCloudProjectSyncStatus = (
 export const subscribeCloudProjectMetadata = (
   listener: (projectId: string) => void
 ): (() => void) => {
-  projectMetadataListeners.add(listener);
-  return () => projectMetadataListeners.delete(listener);
+  const work = rendererLibrary.capture();
+  const owned = (projectId: string) => {
+    if (!work.signal.aborted) listener(projectId);
+  };
+  if (!work.signal.aborted) projectMetadataListeners.add(owned);
+  return () => projectMetadataListeners.delete(owned);
 };
 
-const publishProjectMetadata = (projectId: string): void => {
-  projectMetadataListeners.forEach((listener) => listener(projectId));
+const publishProjectMetadata = (
+  projectId: string,
+  work: RendererLibraryWork
+): void => {
+  work.check();
+  projectMetadataListeners.forEach((listener) => {
+    work.check();
+    listener(projectId);
+  });
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -96,8 +156,12 @@ const assetReadyListeners = new Set<
 export const subscribeCloudAssetReady = (
   listener: (projectId: string, assetId: string) => void
 ): (() => void) => {
-  assetReadyListeners.add(listener);
-  return () => assetReadyListeners.delete(listener);
+  const work = rendererLibrary.capture();
+  const owned = (projectId: string, assetId: string) => {
+    if (!work.signal.aborted) listener(projectId, assetId);
+  };
+  if (!work.signal.aborted) assetReadyListeners.add(owned);
+  return () => assetReadyListeners.delete(owned);
 };
 
 /** Move an asset to the front of the download queue, e.g. its track is on screen. */
@@ -160,32 +224,40 @@ const resolveAssetUrls = async (
 const hydrateMediaJob = async (
   projectId: string,
   job: MediaJob,
-  signal: AbortSignal
+  work: RendererLibraryWork
 ): Promise<void> => {
+  const { signal } = work;
+  await work.ready();
   const urls = await resolveAssetUrls(job.assetId, job.isImage, signal);
+  work.check();
   signal.throwIfAborted();
   const desktop = getLocalDesktopApi();
-  const cancel = () => {
-    void desktop.projects
-      .cancelCloudAsset?.(projectId, job.assetId)
-      .catch(() => {});
-  };
-  signal.addEventListener("abort", cancel, { once: true });
-  try {
-    const cached = await desktop.projects.cacheCloudAsset({
-      projectId,
-      assetId: job.assetId,
-      isImage: job.isImage,
-      ...urls
-    });
-    if (cached) {
-      assetReadyListeners.forEach((listener) =>
-        listener(projectId, job.assetId)
-      );
-    } else throw new Error(`Cloud asset ${job.assetId} is not available yet`);
-  } finally {
-    signal.removeEventListener("abort", cancel);
-  }
+  const cached = await work.boundary(async () => {
+    let cancellation: Promise<unknown> | undefined;
+    const cancel = () => {
+      cancellation = desktop.projects
+        .cancelCloudAsset?.(projectId, job.assetId)
+        .catch(() => {});
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      return await desktop.projects.cacheCloudAsset({
+        projectId,
+        assetId: job.assetId,
+        isImage: job.isImage,
+        ...urls
+      });
+    } finally {
+      signal.removeEventListener("abort", cancel);
+      await cancellation;
+    }
+  });
+  if (!cached)
+    throw new Error(`Cloud asset ${job.assetId} is not available yet`);
+  assetReadyListeners.forEach((listener) => {
+    work.check();
+    listener(projectId, job.assetId);
+  });
 };
 
 /** Downloads a project's missing media a few assets at a time, always taking
@@ -193,8 +265,10 @@ const hydrateMediaJob = async (
 const hydrateProjectMedia = async (
   projectId: string,
   jobs: MediaJob[],
-  signal: AbortSignal
+  work: RendererLibraryWork
 ): Promise<void> => {
+  await work.ready();
+  const { signal } = work;
   jobs.forEach((job) =>
     mediaDownloads.registerAsset(job.assetId, {
       projectId,
@@ -211,8 +285,13 @@ const hydrateProjectMedia = async (
           timelineId: job.timelineId,
           kind: job.isImage ? "image" : "video",
           signal,
+          work,
           run: (downloadSignal) =>
-            hydrateMediaJob(projectId, job, downloadSignal)
+            hydrateMediaJob(
+              projectId,
+              job,
+              withSyncSignal(work, downloadSignal)
+            )
         })
         .catch((error) => {
           if (!signal.aborted)
@@ -225,8 +304,11 @@ const hydrateProjectMedia = async (
 export const hydrateScriptMedia = async (
   projectId: string,
   documents: unknown[],
-  signal: AbortSignal
+  signal: AbortSignal,
+  origin: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<void> => {
+  const work = withSyncSignal(origin, signal);
+  await work.ready();
   const jobs = new Map<
     string,
     { url: string; assetId: string; isImage: boolean }
@@ -272,26 +354,34 @@ export const hydrateScriptMedia = async (
           projectId,
           kind: job.isImage ? "image" : "video",
           signal,
+          work,
           run: async (downloadSignal) => {
             downloadSignal.throwIfAborted();
-            const cancel = () => {
-              void desktop.scriptProjects
-                .cancelMedia(projectId, job.url)
-                .catch(() => {});
-            };
-            downloadSignal.addEventListener("abort", cancel, { once: true });
-            try {
-              await desktop.scriptProjects.cacheMedia(projectId, job.url);
-              assetReadyListeners.forEach((listener) =>
-                listener(projectId, job.assetId)
-              );
-            } finally {
-              downloadSignal.removeEventListener("abort", cancel);
-            }
+            await work.boundary(async () => {
+              downloadSignal.throwIfAborted();
+              let cancellation: Promise<unknown> | undefined;
+              const cancel = () => {
+                cancellation = desktop.scriptProjects
+                  .cancelMedia(projectId, job.url)
+                  .catch(() => {});
+              };
+              downloadSignal.addEventListener("abort", cancel, { once: true });
+              try {
+                await desktop.scriptProjects.cacheMedia(projectId, job.url);
+              } finally {
+                downloadSignal.removeEventListener("abort", cancel);
+                await cancellation;
+              }
+            });
+            downloadSignal.throwIfAborted();
+            assetReadyListeners.forEach((listener) => {
+              work.check();
+              listener(projectId, job.assetId);
+            });
           }
         })
         .catch((error) => {
-          if (!signal.aborted)
+          if (!work.signal.aborted)
             console.warn(`Failed to cache script media ${job.assetId}`, error);
         });
     })
@@ -301,13 +391,16 @@ export const hydrateScriptMedia = async (
 const mirrorProjectContent = async (
   projectId: string,
   project: Record<string, unknown>,
-  signal: AbortSignal
+  work: RendererLibraryWork
 ): Promise<void> => {
+  await work.ready();
+  const { signal } = work;
   const [stateResponse, versionsResponse, cutResponse] = await Promise.all([
     backendApiClient.get(`/projects/${projectId}/state`, { signal }),
     backendApiClient.get(`/projects/${projectId}/script`, { signal }),
     backendApiClient.get(`/projects/${projectId}/cut`, { signal })
   ]);
+  work.check();
   const state = ProjectStateSchema.parse(stateResponse.data);
   const scriptVersions = ScriptVersionListSchema.parse(versionsResponse.data);
   const cut = ProjectCutSchema.parse(cutResponse.data);
@@ -321,24 +414,29 @@ const mirrorProjectContent = async (
   const desktop = getLocalDesktopApi();
   {
     // Open-tab content must not wait for historical casting plans.
-    await desktop.scriptProjects.put({
-      projectId,
-      metadataOnly: true,
-      project,
-      state,
-      scriptVersions,
-      cut
-    });
-    publishProjectMetadata(projectId);
+    await work.boundary(() =>
+      desktop.scriptProjects.put({
+        projectId,
+        metadataOnly: true,
+        project,
+        state,
+        scriptVersions,
+        cut
+      })
+    );
+    publishProjectMetadata(projectId, work);
   }
   const mediaReady = hydrateScriptMedia(
     projectId,
     [state, scriptVersions, cut],
-    signal
+    signal,
+    work
   );
+  void mediaReady.catch(() => {});
   const planEntries = await Promise.all(
     planIds.map(async (planId) => {
       try {
+        work.check();
         return [
           planId,
           (await backendApiClient.get(`/agent/plans/${planId}`, { signal }))
@@ -351,6 +449,7 @@ const mirrorProjectContent = async (
       }
     })
   );
+  work.check();
   const fetchedPlanDetails = Object.fromEntries(
     planEntries.filter(
       (entry): entry is readonly [string, Record<string, unknown>] => !!entry
@@ -359,40 +458,46 @@ const mirrorProjectContent = async (
   const someListedPlanFailedToFetch =
     Object.keys(fetchedPlanDetails).length < planIds.length;
   const cachedPlanDetails = someListedPlanFailedToFetch
-    ? ((await desktop.scriptProjects.get(projectId))?.planDetails ?? null)
+    ? ((await work.boundary(() => desktop.scriptProjects.get(projectId)))
+        ?.planDetails ?? null)
     : null;
   const planDetails = mergeMirroredPlanDetails({
     listedPlanIds: planIds,
     fetchedPlanDetails,
     cachedPlanDetails
   });
-  await desktop.scriptProjects.put({
-    projectId,
-    metadataOnly: true,
-    project,
-    state,
-    scriptVersions,
-    planDetails,
-    cut
-  });
-  publishProjectMetadata(projectId);
+  await work.boundary(() =>
+    desktop.scriptProjects.put({
+      projectId,
+      metadataOnly: true,
+      project,
+      state,
+      scriptVersions,
+      planDetails,
+      cut
+    })
+  );
+  publishProjectMetadata(projectId, work);
   await Promise.all([
     mediaReady,
-    hydrateScriptMedia(projectId, [planDetails], signal)
+    hydrateScriptMedia(projectId, [planDetails], signal, work)
   ]);
 };
 
 const performProjectSync = async (
   projectId: string,
-  signal: AbortSignal,
+  work: RendererLibraryWork,
   options: { timelineId?: string; hydrateMedia: boolean }
 ): Promise<void> => {
+  await work.ready();
+  const { signal } = work;
   const desktop = getLocalDesktopApi();
   if (desktop.account.mode !== "cloud") return;
 
   const response = await backendApiClient.get(`/projects/${projectId}`, {
     signal
   });
+  work.check();
   const parsed = ProjectSchema.safeParse(response.data);
   if (!parsed.success) return;
   const project = response.data as Record<string, unknown>;
@@ -400,42 +505,48 @@ const performProjectSync = async (
   if (parsed.data.type !== "script_to_shots") {
     // Commit the complete timeline graph before touching media. The project
     // is navigable immediately and every missing asset starts out pending.
-    const accepted = await desktop.projects.mirrorCloud({
-      project,
-      includeContent: true
-    });
+    const accepted = await work.boundary(() =>
+      desktop.projects.mirrorCloud({
+        project,
+        includeContent: true
+      })
+    );
     if (!accepted) return;
-    publishProjectMetadata(projectId);
+    publishProjectMetadata(projectId, work);
     if (signal.aborted || !options.hydrateMedia) return;
 
-    const jobs = collectPendingMediaJobs(await desktop.projects.get(projectId));
+    const jobs = collectPendingMediaJobs(
+      await work.boundary(() => desktop.projects.get(projectId))
+    );
     const queuedAssetIds = new Set(jobs.map(({ assetId }) => assetId));
     const timelines = Array.isArray(project.timelines) ? project.timelines : [];
     for (const assetId of collectCloudReferenceAssetIds(
       timelines.filter(isRecord)
     )) {
       if (queuedAssetIds.has(assetId)) continue;
-      const localAsset = await desktop.assets.get(assetId);
+      const localAsset = await work.boundary(() => desktop.assets.get(assetId));
       if (localAsset?.data.status === "ingested") continue;
       jobs.push({ assetId, timelineId: "", isImage: true });
     }
-    await hydrateProjectMedia(projectId, jobs, signal);
+    await hydrateProjectMedia(projectId, jobs, work);
     return;
   }
 
   // Metadata is committed first. Even if an early project has no cut yet, it
   // appears in the local project list and its richer snapshot can retry later.
-  await desktop.scriptProjects.put({ projectId, project });
-  publishProjectMetadata(projectId);
+  await work.boundary(() => desktop.scriptProjects.put({ projectId, project }));
+  publishProjectMetadata(projectId, work);
   if (signal.aborted) return;
-  await mirrorProjectContent(projectId, project, signal);
-  publishProjectMetadata(projectId);
+  await mirrorProjectContent(projectId, project, work);
+  publishProjectMetadata(projectId, work);
 };
 
 export const syncCloudScriptProject = (
   projectId: string,
-  timelineId?: string
+  timelineId?: string,
+  origin: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<void> => {
+  if (origin.signal.aborted) return Promise.reject(origin.signal.reason);
   if (timelineId) mediaDownloads.setForeground(projectId, timelineId);
   const existing = projectSyncsInFlight.get(projectId);
   if (existing && !existing.controller.signal.aborted) {
@@ -445,16 +556,20 @@ export const syncCloudScriptProject = (
   }
   existing?.controller.abort();
   const controller = new AbortController();
-  const promise = performProjectSync(projectId, controller.signal, {
-    timelineId,
-    hydrateMedia: true
-  }).finally(() => {
+  const promise = performProjectSync(
+    projectId,
+    withSyncSignal(origin, controller.signal),
+    {
+      timelineId,
+      hydrateMedia: true
+    }
+  ).finally(() => {
     if (projectSyncsInFlight.get(projectId)?.promise === promise) {
       projectSyncsInFlight.delete(projectId);
       publishSyncStatus();
     }
   });
-  const operation = { promise, controller };
+  const operation = { promise, controller, work: origin };
   projectSyncsInFlight.set(projectId, operation);
   publishSyncStatus();
   return promise;
@@ -463,12 +578,15 @@ export const syncCloudScriptProject = (
 export const cancelCloudProjectSync = (projectId: string): void => {
   const operation = projectSyncsInFlight.get(projectId);
   if (!operation) return;
+  operation.work.check();
   operation.controller.abort();
   const desktop = getLocalDesktopApi();
   if (desktop.projects.cancelCloudMirror) {
-    void desktop.projects.cancelCloudMirror(projectId).catch((error) => {
-      console.warn(`Failed to cancel cloud project sync ${projectId}`, error);
-    });
+    void operation.work
+      .boundary(() => desktop.projects.cancelCloudMirror(projectId))
+      .catch((error) => {
+        console.warn(`Failed to cancel cloud project sync ${projectId}`, error);
+      });
   }
 };
 
@@ -479,26 +597,33 @@ export const syncCloudProject = syncCloudScriptProject;
  * upload), where the caller needs the new shots and tracks locally but must not
  * wait for every video to download. The media follows from the project's
  * normal sync. */
-export const syncCloudProjectMetadata = (projectId: string): Promise<void> =>
-  performProjectSync(projectId, new AbortController().signal, {
+export const syncCloudProjectMetadata = (
+  projectId: string,
+  work: RendererLibraryWork = rendererLibrary.capture()
+): Promise<void> =>
+  performProjectSync(projectId, work, {
     hydrateMedia: false
   });
 
 const tidyCloudMirrorProjects = async ({
   catalogCloudProjectIds,
-  signal
+  work
 }: {
   catalogCloudProjectIds: ReadonlySet<string>;
-  signal: AbortSignal;
+  work: RendererLibraryWork;
 }): Promise<void> => {
+  const { signal } = work;
   try {
-    const libraryProjects = await getLocalDesktopApi().projects.list();
-    await markLinkedCloudMirrorProjects({ libraryProjects, signal });
+    const libraryProjects = await work.boundary(() =>
+      getLocalDesktopApi().projects.list()
+    );
+    await markLinkedCloudMirrorProjects({ libraryProjects, signal, work });
     if (signal.aborted) return;
     await removeImportedCloudMirrorProjects({
       libraryProjects,
       catalogCloudProjectIds,
-      signal
+      signal,
+      work
     });
   } catch (error) {
     if (signal.aborted) return;
@@ -506,7 +631,9 @@ const tidyCloudMirrorProjects = async ({
   }
 };
 
-const performSync = async (signal: AbortSignal): Promise<void> => {
+const performSync = async (work: RendererLibraryWork): Promise<void> => {
+  await work.ready();
+  const { signal } = work;
   const desktop = getLocalDesktopApi();
   if (desktop.account.mode !== "cloud") return;
 
@@ -520,6 +647,7 @@ const performSync = async (signal: AbortSignal): Promise<void> => {
         sort_order: "desc"
       }
     });
+    work.check();
     const items = isRecord(response.data) ? response.data.items : undefined;
     if (!Array.isArray(items)) return;
     const total = items.filter(
@@ -542,12 +670,15 @@ const performSync = async (signal: AbortSignal): Promise<void> => {
       await yieldToInteractiveWork();
       if (signal.aborted) return;
       try {
-        await desktop.projects.mirrorCloud({
-          project: candidate,
-          includeContent: false
-        });
-        publishProjectMetadata(candidate.id);
+        await work.boundary(() =>
+          desktop.projects.mirrorCloud({
+            project: candidate,
+            includeContent: false
+          })
+        );
+        publishProjectMetadata(candidate.id, work);
       } catch (error) {
+        work.check();
         console.warn(`Failed to mirror cloud project ${candidate.id}`, error);
       }
       completed += 1;
@@ -562,7 +693,7 @@ const performSync = async (signal: AbortSignal): Promise<void> => {
             : []
         )
       ),
-      signal
+      work
     });
   } catch (error) {
     if (signal.aborted) return;
@@ -575,7 +706,10 @@ const performSync = async (signal: AbortSignal): Promise<void> => {
   }
 };
 
-export const syncCloudScriptProjects = (): Promise<void> => {
+export const syncCloudScriptProjects = (
+  origin: RendererLibraryWork = rendererLibrary.capture()
+): Promise<void> => {
+  if (origin.signal.aborted) return Promise.reject(origin.signal.reason);
   if (deferredSyncTimer) {
     clearTimeout(deferredSyncTimer);
     deferredSyncTimer = null;
@@ -583,7 +717,9 @@ export const syncCloudScriptProjects = (): Promise<void> => {
   if (syncInFlight) return syncInFlight;
   const controller = new AbortController();
   syncAbortController = controller;
-  const operation = performSync(controller.signal).finally(() => {
+  const operation = performSync(
+    withSyncSignal(origin, controller.signal)
+  ).finally(() => {
     if (syncInFlight === operation) {
       syncInFlight = null;
       syncAbortController = null;
@@ -604,14 +740,25 @@ export const cancelCloudProjectCatalogSync = (): void => {
 
 /** Give project navigation a clean head start, then continue refreshing the
  * catalog in the background instead of waiting for another homepage visit. */
-export const deferCloudProjectCatalogSync = (): void => {
+export const deferCloudProjectCatalogSync = (
+  work: RendererLibraryWork = rendererLibrary.capture()
+): void => {
+  work.check();
   const interruptedSync = syncInFlight;
   cancelCloudProjectCatalogSync();
   if (deferredSyncTimer) clearTimeout(deferredSyncTimer);
   deferredSyncTimer = setTimeout(() => {
+    if (work.signal.aborted) return;
     deferredSyncTimer = null;
     void Promise.resolve(interruptedSync)
       .catch(() => undefined)
-      .then(() => syncCloudScriptProjects());
+      .then(() => {
+        work.check();
+        return syncCloudScriptProjects(work);
+      })
+      .catch((error) => {
+        if (!work.signal.aborted)
+          console.warn("Failed to resume cloud catalog", error);
+      });
   }, NAVIGATION_GRACE_PERIOD_MS);
 };

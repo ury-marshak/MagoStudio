@@ -1,4 +1,8 @@
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import type { LocalProjectListItem } from "../../../desktop/shared/contracts";
 
@@ -7,18 +11,25 @@ import { markCloudMirrorProject } from "./markCloudMirrorProject";
 
 export const markLinkedCloudMirrorProjects = async ({
   libraryProjects,
-  signal
+  signal,
+  work = rendererLibrary.capture()
 }: {
   libraryProjects: LocalProjectListItem[];
   signal: AbortSignal;
+  work?: RendererLibraryWork;
 }): Promise<void> => {
+  await work.ready();
+  if (signal.aborted) return;
   const desktop = getLocalDesktopApi();
   const localProjects = libraryProjects.filter(
     (project) => project.origin !== "cloud"
   );
   for (const localProject of localProjects) {
     if (signal.aborted) return;
-    const link = await desktop.cloud.links.get("project", localProject.id);
+    const link = await work.boundary(() =>
+      desktop.cloud.links.get("project", localProject.id)
+    );
+    if (signal.aborted) return;
     if (
       !link ||
       link.cloudId === localProject.id ||
@@ -29,7 +40,8 @@ export const markLinkedCloudMirrorProjects = async ({
       await markCloudMirrorProject({
         localProjectId: localProject.id,
         cloudProjectId: link.cloudId,
-        signal
+        signal,
+        work
       });
     } catch (err) {
       if (signal.aborted) return;

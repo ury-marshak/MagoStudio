@@ -1,4 +1,8 @@
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { classifyCloudRequestFailure } from "./classifyCloudRequestFailure";
 import { parseImg2ImgStatus, toImg2ImgJobStatus } from "./img2imgStatus";
@@ -25,28 +29,35 @@ const HTTP_NOT_FOUND = 404;
 const bridge = () => getLocalDesktopApi();
 
 export const pollCloudImageRenders = async (
-  api: CloudApi
+  api: CloudApi,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<PollOutcome> => {
-  const jobs = (await bridge().cloud.renders.listActive()).filter(
-    (job) => job.kind === "img2img"
-  );
+  await work.ready();
+  const jobs = (
+    await work.boundary(() => bridge().cloud.renders.listActive())
+  ).filter((job) => job.kind === "img2img");
   const outcome: PollOutcome = { checked: jobs.length, finished: 0, failed: 0 };
 
   for (const job of jobs) {
+    work.check();
     if (!job.cloudClipId) continue;
 
     let response: unknown;
     try {
       response = await api.get(`/assets/img2img/status/${job.cloudClipId}`);
+      work.check();
     } catch (err) {
+      work.check();
       const failure = classifyCloudRequestFailure(err);
       const isImageRenderGoneFromCloud =
         failure.kind === "rejected" && failure.httpStatus === HTTP_NOT_FOUND;
       if (!isImageRenderGoneFromCloud) continue;
-      await bridge().cloud.renders.fail({
-        jobId: job.id,
-        message: failure.reason || "The cloud render no longer exists"
-      });
+      await work.boundary(() =>
+        bridge().cloud.renders.fail({
+          jobId: job.id,
+          message: failure.reason || "The cloud render no longer exists"
+        })
+      );
       outcome.failed += 1;
       continue;
     }
@@ -55,14 +66,18 @@ export const pollCloudImageRenders = async (
     const status = toImg2ImgJobStatus(parsed.status);
 
     if (status === "SUCCESS") {
-      if (!parsed.outputUrl) continue; // Not downloadable yet; try next tick.
+      const outputUrl = parsed.outputUrl;
+      if (!outputUrl) continue; // Not downloadable yet; try next tick.
       try {
-        await bridge().cloud.renders.finish({
-          jobId: job.id,
-          url: parsed.outputUrl
-        });
+        await work.boundary(() =>
+          bridge().cloud.renders.finish({
+            jobId: job.id,
+            url: outputUrl
+          })
+        );
         outcome.finished += 1;
       } catch {
+        work.check();
         // A successful cloud render remains successful when only the local
         // download failed. Leave it active and retry on the next poll.
       }
@@ -70,13 +85,15 @@ export const pollCloudImageRenders = async (
     }
 
     if (status === "FAILED" || status === "CANCELLED") {
-      await bridge().cloud.renders.fail({
-        jobId: job.id,
-        message:
-          status === "CANCELLED"
-            ? "The cloud render was cancelled"
-            : (parsed.failureReason ?? "The cloud render failed")
-      });
+      await work.boundary(() =>
+        bridge().cloud.renders.fail({
+          jobId: job.id,
+          message:
+            status === "CANCELLED"
+              ? "The cloud render was cancelled"
+              : (parsed.failureReason ?? "The cloud render failed")
+        })
+      );
       outcome.failed += 1;
       continue;
     }
@@ -86,15 +103,18 @@ export const pollCloudImageRenders = async (
       parsed.progressPercent !== null &&
       parsed.progressPercent !== job.progress;
     if (hasCloudRenderStatusChanged || hasCloudRenderProgressChanged) {
-      await bridge().cloud.renders.setStatus({
-        jobId: job.id,
-        status,
-        ...(parsed.progressPercent === null
-          ? {}
-          : { progress: parsed.progressPercent })
-      });
+      await work.boundary(() =>
+        bridge().cloud.renders.setStatus({
+          jobId: job.id,
+          status,
+          ...(parsed.progressPercent === null
+            ? {}
+            : { progress: parsed.progressPercent })
+        })
+      );
     }
   }
 
+  work.check();
   return outcome;
 };

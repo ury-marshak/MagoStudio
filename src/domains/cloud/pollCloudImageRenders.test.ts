@@ -24,6 +24,10 @@ const makeBridge = () => {
       jobs = next;
     },
     api: {
+      library: {
+        onWillChange: vi.fn().mockResolvedValue(undefined),
+        onDidChange: vi.fn()
+      },
       cloud: {
         renders: {
           register: vi.fn(),

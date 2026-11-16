@@ -13,6 +13,7 @@ vi.mock("@/lib/backend-api-client", () => ({
 }));
 
 vi.mock("@/platform/localDesktop", () => ({
+  isLocalApp: false,
   getLocalDesktopApi: () => desktopApi
 }));
 

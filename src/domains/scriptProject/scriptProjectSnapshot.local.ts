@@ -1,4 +1,5 @@
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 import type {
   LocalScriptProjectSnapshot,
@@ -11,12 +12,16 @@ import { hydrateScriptMedia } from "./syncCloudScriptProjects.local";
 // in-flight IPC read; the next refresh must still observe edits and run status.
 const pendingReads = new WeakMap<
   object,
-  Map<string, Promise<LocalScriptProjectSnapshot | null>>
+  Map<
+    string,
+    { signal: AbortSignal; promise: Promise<LocalScriptProjectSnapshot | null> }
+  >
 >();
 
 export const readScriptProjectSnapshot = (
   projectId: string
 ): Promise<LocalScriptProjectSnapshot | null> => {
+  const work = rendererLibrary.capture();
   const snapshots = getLocalDesktopApi().scriptProjects;
   if (!snapshots) return Promise.resolve(null);
   let reads = pendingReads.get(snapshots);
@@ -25,41 +30,50 @@ export const readScriptProjectSnapshot = (
     pendingReads.set(snapshots, reads);
   }
   const pending = reads.get(projectId);
-  if (pending) return pending;
-  const read = snapshots.get(projectId).finally(() => {
-    if (reads.get(projectId) === read) reads.delete(projectId);
-  });
-  reads.set(projectId, read);
+  if (pending?.signal === work.signal) return pending.promise;
+  const read = work
+    .boundary(() => snapshots.get(projectId))
+    .finally(() => {
+      if (reads.get(projectId)?.promise === read) reads.delete(projectId);
+    });
+  reads.set(projectId, { signal: work.signal, promise: read });
   return read;
 };
 
 export const writeScriptProjectSnapshot = async (
   input: LocalScriptProjectSnapshotInput
 ): Promise<void> => {
+  const work = rendererLibrary.capture();
+  await work.ready();
   const desktop = getLocalDesktopApi();
   const snapshots = desktop.scriptProjects;
   if (!snapshots) return;
   // A read already in flight belongs to the pre-write state.
   pendingReads.get(snapshots)?.delete(input.projectId);
   try {
-    await snapshots.put(
-      desktop.account.mode === "cloud"
-        ? { ...input, metadataOnly: true }
-        : input
+    await work.boundary(() =>
+      snapshots.put(
+        desktop.account.mode === "cloud"
+          ? { ...input, metadataOnly: true }
+          : input
+      )
     );
   } finally {
-    pendingReads.get(snapshots)?.delete(input.projectId);
+    if (!work.signal.aborted)
+      pendingReads.get(snapshots)?.delete(input.projectId);
   }
   if (desktop.account.mode !== "cloud") return;
   // Read through the disk index before scheduling: cached files need neither
   // another transfer nor another completion event/refetch cycle.
-  const cached = await snapshots.get(input.projectId);
+  const cached = await work.boundary(() => snapshots.get(input.projectId));
   if (!cached) return;
   void hydrateScriptMedia(
     input.projectId,
     [cached.state, cached.scriptVersions, cached.planDetails, cached.cut],
-    new AbortController().signal
-  ).catch((error) =>
-    console.warn("Failed to schedule script snapshot media", error)
-  );
+    work.signal,
+    work
+  ).catch((error) => {
+    if (!work.signal.aborted)
+      console.warn("Failed to schedule script snapshot media", error);
+  });
 };

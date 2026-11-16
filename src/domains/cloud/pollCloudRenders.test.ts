@@ -24,6 +24,10 @@ const makeBridge = () => {
     },
     links,
     api: {
+      library: {
+        onWillChange: vi.fn().mockResolvedValue(undefined),
+        onDidChange: vi.fn()
+      },
       cloud: {
         links: {
           get: vi.fn(async (kind: string, localId: string) => {
