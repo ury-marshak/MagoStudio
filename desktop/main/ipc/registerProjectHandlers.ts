@@ -104,6 +104,24 @@ export const registerProjectHandlers = (
   > = new LibraryWorkSession(() => undefined),
   mediaWork = importWork
 ): void => {
+  const cloudWork = cloudProjects.libraryWork;
+  const handleCloud = (
+    channel: string,
+    handler: Parameters<typeof ipcMain.handle>[1]
+  ) => {
+    ipcMain.handle(channel, async (event, ...args: unknown[]) => {
+      requireTrustedSender(event);
+      return cloudWork.run(async () => handler(event, ...args));
+    });
+  };
+  const ensureCloudDatabase = async (): Promise<void> => {
+    cloudWork.capture();
+    if (databaseManager.isOpen()) return;
+    const root = await cloudWork.boundary(() => settings.getLibraryRoot());
+    if (!root) throw new Error("Choose a Mago library folder first");
+    await cloudWork.boundary(() => databaseManager.open(root));
+  };
+
   const ensureDatabase = async (required = false): Promise<boolean> => {
     if (databaseManager.isOpen()) return true;
     const libraryRoot = await settings.getLibraryRoot();
@@ -184,12 +202,12 @@ export const registerProjectHandlers = (
       return repository.get(requireString(projectId, "projectId"));
     }
   );
-  ipcMain.handle(
+  handleCloud(
     IPC_CHANNELS.projectsMirrorCloud,
     async (event, value: unknown) => {
       requireTrustedSender(event);
       await requireCloudAccount(settings);
-      await ensureDatabase(true);
+      await ensureCloudDatabase();
       const input = requireRecord(value);
       const project = requireRecord(input.project);
       return cloudProjects.put({
@@ -198,19 +216,19 @@ export const registerProjectHandlers = (
       });
     }
   );
-  ipcMain.handle(
+  handleCloud(
     IPC_CHANNELS.projectsCancelCloudMirror,
     async (event, projectId: unknown) => {
       requireTrustedSender(event);
       cloudProjects.cancel(requireString(projectId, "projectId"));
     }
   );
-  ipcMain.handle(
+  handleCloud(
     IPC_CHANNELS.projectsCacheCloudAsset,
     async (event, value: unknown) => {
       requireTrustedSender(event);
       await requireCloudAccount(settings);
-      await ensureDatabase(true);
+      await ensureCloudDatabase();
       const input = requireRecord(value);
       return cloudProjects.cacheAsset({
         projectId: requireString(input.projectId, "projectId"),
@@ -227,7 +245,7 @@ export const registerProjectHandlers = (
       });
     }
   );
-  ipcMain.handle(
+  handleCloud(
     IPC_CHANNELS.projectsCancelCloudAsset,
     async (event, projectId: unknown, assetId: unknown) => {
       requireTrustedSender(event);

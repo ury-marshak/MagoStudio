@@ -423,6 +423,13 @@ it.each(["fal", "text", "vision"])(
         message: "fixture"
       })
     ).resolves.toBeUndefined();
+    // The real application must reset the new repository owners as well.
+    await expect(
+      invoke(IPC_CHANNELS.projectsMirrorCloud, { project: { id: "asset" } })
+    ).rejects.toThrow("explicit cloud account");
+    await expect(
+      invoke(IPC_CHANNELS.scriptProjectsGet, "missing")
+    ).resolves.toBeNull();
     const failed = path.join(root, "failed-replacement");
     await mkdir(failed);
     const open = vi
@@ -458,6 +465,19 @@ it.each(["fal", "text", "vision"])(
         fps: 24
       })
     ).rejects.toThrow();
+    for (const [channel, args] of [
+      [IPC_CHANNELS.projectsMirrorCloud, [{ project: { id: "asset" } }]],
+      [
+        IPC_CHANNELS.projectsCacheCloudAsset,
+        [{ projectId: "asset", assetId: "asset", sourceUrl: historicalUrl }]
+      ],
+      [IPC_CHANNELS.scriptProjectsCacheMedia, ["asset", historicalUrl]],
+      [IPC_CHANNELS.scriptProjectsGet, ["asset"]]
+    ] as Array<[string, unknown[]]>) {
+      await expect(invoke(channel, ...args)).rejects.toMatchObject({
+        name: "AbortError"
+      });
+    }
     expect(transport).not.toHaveBeenCalled();
     expect(mocks.key).not.toHaveBeenCalled();
     open.mockRestore();

@@ -156,6 +156,7 @@ beforeEach(async () => {
   registerProjectHandlers(
     {} as ProjectRepository,
     {
+      libraryWork: new LibraryWorkSession(() => undefined),
       put: effects.mirror,
       cacheAsset: effects.cache
     } as unknown as CloudProjectMirrorRepository,

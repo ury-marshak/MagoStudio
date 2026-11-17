@@ -166,7 +166,10 @@ describe("ScriptProjectSnapshotRepository", () => {
     temporaryDirectories.push(libraryRoot);
     let deliverResponse: (response: Response) => void = () => {};
     const fetchFromCloudStorage = vi.fn<FetchCloudStorage>((_url, init) => {
-      expect(init.signal ?? undefined).toBeUndefined();
+      // Navigation cancellation still lets an active transfer finish; library
+      // teardown, unlike navigation, aborts the repository lifetime.
+      expect(init.signal).toBe(snapshots.libraryWork.signal);
+      expect(init.signal?.aborted).toBe(false);
       return new Promise((resolve) => {
         deliverResponse = resolve;
       });

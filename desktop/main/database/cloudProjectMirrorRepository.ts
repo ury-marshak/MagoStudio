@@ -14,10 +14,11 @@ import {
 } from "../../shared/collectCloudReferenceAssetIds";
 import type { LocalCloudProjectMirrorInput } from "../../shared/contracts";
 import {
-  openCloudStorageDownload,
+  withCloudStorageDownload,
   type CloudStorageAccess
 } from "../cloudStorage/openCloudStorageDownload";
 import { parseAllowedCloudStorageUrl } from "../cloudStorage/parseAllowedCloudStorageUrl";
+import { LibraryWorkSession } from "../libraryWorkSession";
 import { publishFile } from "../storage/atomicFile";
 
 import { DatabaseManager } from "./databaseManager";
@@ -148,9 +149,20 @@ type CachedFile = { absolutePath: string; relativePath: string; size: number };
  * Hidden backend mirrors of local projects are rejected via cloud_links, which
  * keeps the pull path from creating a second project card for local work. */
 export class CloudProjectMirrorRepository {
-  private readonly downloads = new Map<string, Promise<CachedFile>>();
-  private readonly assetSyncs = new Map<string, AbortController>();
-  private readonly assetProjects = new Map<string, string>();
+  readonly libraryWork = new LibraryWorkSession(() => ({
+    downloads: new Map<string, Promise<CachedFile>>(),
+    assetSyncs: new Map<string, Set<AbortController>>(),
+    assetProjects: new Map<string, string>()
+  }));
+  private get downloads() {
+    return this.libraryWork.state.downloads;
+  }
+  private get assetSyncs() {
+    return this.libraryWork.state.assetSyncs;
+  }
+  private get assetProjects() {
+    return this.libraryWork.state.assetProjects;
+  }
 
   constructor(
     private readonly manager: DatabaseManager,
@@ -158,7 +170,20 @@ export class CloudProjectMirrorRepository {
     private readonly cloudStorage: CloudStorageAccess = {
       allowedHosts: resolveCloudConfig().cloudStorageHosts
     }
-  ) {}
+  ) {
+    // Drain whole repository methods, including their internal multi-await
+    // writes. Detached callbacks retain this session and its private maps.
+    const owned = this.libraryWork.guard({
+      put: this.put.bind(this),
+      cacheAsset: this.cacheAsset.bind(this),
+      cancel: this.cancel.bind(this),
+      cancelAsset: this.cancelAsset.bind(this)
+    });
+    this.put = owned.put;
+    this.cacheAsset = owned.cacheAsset;
+    this.cancel = owned.cancel;
+    this.cancelAsset = owned.cancelAsset;
+  }
 
   async put(input: LocalCloudProjectMirrorInput): Promise<boolean> {
     const projectId = stringValue(input.project.id);
@@ -194,7 +219,13 @@ export class CloudProjectMirrorRepository {
   }): Promise<boolean> {
     const key = JSON.stringify([input.projectId, input.assetId]);
     const controller = new AbortController();
-    this.assetSyncs.set(key, controller);
+    const signal = AbortSignal.any([
+      controller.signal,
+      this.libraryWork.signal
+    ]);
+    const controllers = this.assetSyncs.get(key) ?? new Set<AbortController>();
+    controllers.add(controller);
+    this.assetSyncs.set(key, controllers);
     this.assetProjects.set(key, input.projectId);
     try {
       const prepared = await this.prepareAsset(
@@ -202,13 +233,14 @@ export class CloudProjectMirrorRepository {
         input.assetId,
         { type: input.isImage ? "IMAGE" : "VIDEO" },
         input.urls,
-        controller.signal
+        signal
       );
-      controller.signal.throwIfAborted();
+      signal.throwIfAborted();
       await this.persistPreparedAsset(input.assetId, prepared);
       return !!prepared.source;
     } finally {
-      if (this.assetSyncs.get(key) === controller) {
+      controllers.delete(controller);
+      if (controllers.size === 0 && this.assetSyncs.get(key) === controllers) {
         this.assetSyncs.delete(key);
         this.assetProjects.delete(key);
       }
@@ -217,12 +249,18 @@ export class CloudProjectMirrorRepository {
 
   cancel(projectId: string): void {
     for (const [key, owner] of this.assetProjects) {
-      if (owner === projectId) this.assetSyncs.get(key)?.abort();
+      if (owner === projectId) {
+        for (const controller of this.assetSyncs.get(key) ?? [])
+          controller.abort();
+      }
     }
   }
 
   cancelAsset(projectId: string, assetId: string): void {
-    this.assetSyncs.get(JSON.stringify([projectId, assetId]))?.abort();
+    for (const controller of this.assetSyncs.get(
+      JSON.stringify([projectId, assetId])
+    ) ?? [])
+      controller.abort();
   }
 
   private async isLocalProjectCloudCopy(
@@ -831,6 +869,7 @@ export class CloudProjectMirrorRepository {
           return null;
         })
       : null;
+    signal?.throwIfAborted();
     if (cachedThumbnail) {
       await this.persistPreparedAsset(assetId, {
         source: null,
@@ -927,31 +966,41 @@ export class CloudProjectMirrorRepository {
   ): Promise<CachedFile> {
     if (signal?.aborted) throw signal.reason;
     const libraryRoot = await this.getLibraryRoot();
+    signal?.throwIfAborted();
     const absolutePath = path.join(libraryRoot, relativePath);
     const existing = await stat(absolutePath).catch(() => null);
+    signal?.throwIfAborted();
     if (existing?.isFile() && existing.size > 0) {
       return { absolutePath, relativePath, size: existing.size };
     }
     const temporaryPath = `${absolutePath}.partial`;
     await mkdir(path.dirname(absolutePath), { recursive: true });
+    signal?.throwIfAborted();
     await unlink(temporaryPath).catch(() => {});
-    const download = await openCloudStorageDownload({
-      ...this.cloudStorage,
-      url: url.toString(),
-      signal
-    });
-    try {
-      await pipeline(download.body, createWriteStream(temporaryPath), {
+    return withCloudStorageDownload(
+      {
+        ...this.cloudStorage,
+        url: url.toString(),
         signal
-      });
-      const downloaded = await stat(temporaryPath);
-      if (downloaded.size <= 0)
-        throw new Error("Cloud project asset was empty");
-      await publishFile(temporaryPath, absolutePath);
-      return { absolutePath, relativePath, size: downloaded.size };
-    } catch (error) {
-      await unlink(temporaryPath).catch(() => {});
-      throw error;
-    }
+      },
+      async (download) => {
+        try {
+          await pipeline(download.body, createWriteStream(temporaryPath), {
+            signal
+          });
+          signal?.throwIfAborted();
+          const downloaded = await stat(temporaryPath);
+          signal?.throwIfAborted();
+          if (downloaded.size <= 0)
+            throw new Error("Cloud project asset was empty");
+          await publishFile(temporaryPath, absolutePath);
+          signal?.throwIfAborted();
+          return { absolutePath, relativePath, size: downloaded.size };
+        } catch (error) {
+          await unlink(temporaryPath).catch(() => {});
+          throw error;
+        }
+      }
+    );
   }
 }

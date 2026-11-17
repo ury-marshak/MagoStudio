@@ -531,6 +531,8 @@ void app
           vlmService.suspend(),
           videoFrameService.libraryWork.suspend(),
           cloudRenderSubmitService.libraryWork.suspend(),
+          cloudProjectMirrorRepository.libraryWork.suspend(),
+          scriptProjectSnapshotRepository.libraryWork.suspend(),
           imageRenderService.suspend()
         ]);
       },
@@ -543,6 +545,8 @@ void app
         vlmService.reset();
         videoFrameService.libraryWork.reset();
         cloudRenderSubmitService.libraryWork.reset();
+        cloudProjectMirrorRepository.libraryWork.reset();
+        scriptProjectSnapshotRepository.libraryWork.reset();
         imageRenderService.reset();
       }
     });
@@ -606,6 +610,8 @@ app.on("before-quit", () => {
   vlmService.stop();
   videoFrameService.libraryWork.stop();
   cloudRenderSubmitService.libraryWork.stop();
+  cloudProjectMirrorRepository.libraryWork.stop();
+  scriptProjectSnapshotRepository.libraryWork.stop();
   localScriptChatService.stop();
   localScriptProjectService.stopMetrics();
   localScriptProjectService.stopDescriptions();
