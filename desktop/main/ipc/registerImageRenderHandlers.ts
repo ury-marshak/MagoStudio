@@ -151,17 +151,23 @@ export const registerImageRenderHandlers = (
   });
   ipcMain.handle(IPC_CHANNELS.imageRendersCancel, async (event, jobId) => {
     requireTrustedSender(event);
-    const renderJobId = string(jobId, "jobId");
-    await service.cancel(renderJobId);
-    await cloudRenderJobs.cancelActive(renderJobId);
+    // Capture cloud bookkeeping before the local service/provider wait. This
+    // is context only: library switching must not wait for provider cancellation.
+    return cloudRenderJobs.libraryWork.run(async () => {
+      const renderJobId = string(jobId, "jobId");
+      await service.cancel(renderJobId);
+      await cloudRenderJobs.cancelActive(renderJobId);
+    });
   });
   ipcMain.handle(
     IPC_CHANNELS.imageRendersMarkInteracted,
     async (event, jobId) => {
       requireTrustedSender(event);
-      const renderJobId = string(jobId, "jobId");
-      await service.markInteracted(renderJobId);
-      await cloudRenderJobs.markInteracted(renderJobId);
+      return cloudRenderJobs.libraryWork.run(async () => {
+        const renderJobId = string(jobId, "jobId");
+        await service.markInteracted(renderJobId);
+        await cloudRenderJobs.markInteracted(renderJobId);
+      });
     }
   );
 };

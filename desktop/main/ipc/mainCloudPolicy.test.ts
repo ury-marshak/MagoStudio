@@ -124,6 +124,7 @@ beforeEach(async () => {
   });
   registerCloudHandlers({
     links: {
+      libraryWork: new LibraryWorkSession(() => undefined),
       get: effects.getLink,
       put: effects.putLink,
       patchData: effects.patchLink
@@ -136,6 +137,7 @@ beforeEach(async () => {
       resolveMediaPath: effects.resolve
     } as unknown as ProjectRepository,
     renderJobs: {
+      libraryWork: new LibraryWorkSession(() => undefined),
       listActive: effects.listActive,
       listQueue: effects.listQueue,
       update: effects.update,

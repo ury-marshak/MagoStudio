@@ -430,6 +430,24 @@ it.each(["fal", "text", "vision"])(
     await expect(
       invoke(IPC_CHANNELS.scriptProjectsGet, "missing")
     ).resolves.toBeNull();
+    await expect(invoke(IPC_CHANNELS.cloudRenderListActive)).resolves.toEqual(
+      []
+    );
+    await expect(invoke(IPC_CHANNELS.cloudRenderListQueue)).resolves.toEqual(
+      []
+    );
+    await invoke(IPC_CHANNELS.cloudLinkPut, {
+      kind: "project",
+      localId: "replacement",
+      cloudId: "fixture-remote",
+      data: { cached: true }
+    });
+    await expect(
+      invoke(IPC_CHANNELS.cloudLinkGet, "project", "replacement")
+    ).resolves.toMatchObject({
+      cloudId: "fixture-remote",
+      data: { cached: true }
+    });
     const failed = path.join(root, "failed-replacement");
     await mkdir(failed);
     const open = vi
@@ -472,6 +490,23 @@ it.each(["fal", "text", "vision"])(
         [{ projectId: "asset", assetId: "asset", sourceUrl: historicalUrl }]
       ],
       [IPC_CHANNELS.scriptProjectsCacheMedia, ["asset", historicalUrl]],
+      [IPC_CHANNELS.cloudLinkGet, ["project", "replacement"]],
+      [
+        IPC_CHANNELS.cloudLinkPut,
+        [{ kind: "project", localId: "replacement", cloudId: "late" }]
+      ],
+      [
+        IPC_CHANNELS.cloudLinkPatch,
+        [{ kind: "project", localId: "replacement", patch: { late: true } }]
+      ],
+      [IPC_CHANNELS.cloudRenderListActive, []],
+      [IPC_CHANNELS.cloudRenderListQueue, []],
+      [
+        IPC_CHANNELS.cloudRenderSetStatus,
+        [{ jobId: "missing", status: "SUCCESS" }]
+      ],
+      [IPC_CHANNELS.imageRendersCancel, ["missing"]],
+      [IPC_CHANNELS.imageRendersMarkInteracted, ["missing"]],
       [IPC_CHANNELS.scriptProjectsGet, ["asset"]]
     ] as Array<[string, unknown[]]>) {
       await expect(invoke(channel, ...args)).rejects.toMatchObject({

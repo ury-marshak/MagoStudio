@@ -10,6 +10,7 @@ import {
   shots,
   tracks
 } from "../database/schema";
+import { LibraryWorkSession } from "../libraryWorkSession";
 
 /**
  * Tracks renders submitted to cloud Mago.
@@ -90,7 +91,28 @@ export const readStoredCloudOutputLayerId = (
     : null;
 
 export class CloudRenderJobRepository {
-  constructor(private readonly manager: DatabaseManager) {}
+  readonly libraryWork = new LibraryWorkSession(() => undefined);
+
+  constructor(private readonly manager: DatabaseManager) {
+    const owned = this.libraryWork.guard({
+      create: this.create.bind(this),
+      listActive: this.listActive.bind(this),
+      listQueue: this.listQueue.bind(this),
+      get: this.get.bind(this),
+      update: this.update.bind(this),
+      cancelActive: this.cancelActive.bind(this),
+      markInteracted: this.markInteracted.bind(this),
+      deleteForClip: this.deleteForClip.bind(this)
+    });
+    this.create = owned.create;
+    this.listActive = owned.listActive;
+    this.listQueue = owned.listQueue;
+    this.get = owned.get;
+    this.update = owned.update;
+    this.cancelActive = owned.cancelActive;
+    this.markInteracted = owned.markInteracted;
+    this.deleteForClip = owned.deleteForClip;
+  }
 
   async create(input: {
     id: string;
@@ -166,24 +188,32 @@ export class CloudRenderJobRepository {
     return Promise.all(
       rows.map(async (job, index) => {
         const [[project], [shot], [track]] = await Promise.all([
-          this.manager
-            .get()
-            .select({ name: projects.name })
-            .from(projects)
-            .where(eq(projects.id, job.projectId))
-            .limit(1),
-          this.manager
-            .get()
-            .select({ name: shots.name })
-            .from(shots)
-            .where(eq(shots.id, job.shotId))
-            .limit(1),
-          this.manager
-            .get()
-            .select({ name: tracks.name })
-            .from(tracks)
-            .where(eq(tracks.id, job.trackId))
-            .limit(1)
+          // Track siblings separately: a rejected query must not release the
+          // other already-issued reads before DB replacement.
+          this.libraryWork.boundary(async () =>
+            this.manager
+              .get()
+              .select({ name: projects.name })
+              .from(projects)
+              .where(eq(projects.id, job.projectId))
+              .limit(1)
+          ),
+          this.libraryWork.boundary(async () =>
+            this.manager
+              .get()
+              .select({ name: shots.name })
+              .from(shots)
+              .where(eq(shots.id, job.shotId))
+              .limit(1)
+          ),
+          this.libraryWork.boundary(async () =>
+            this.manager
+              .get()
+              .select({ name: tracks.name })
+              .from(tracks)
+              .where(eq(tracks.id, job.trackId))
+              .limit(1)
+          )
         ]);
         const request = toRow(job).request;
         const isImageRenderJob = request.kind === "img2img";
@@ -245,6 +275,10 @@ export class CloudRenderJobRepository {
   }
 
   async get(jobId: string): Promise<CloudRenderJobRow | null> {
+    return this.readStored(jobId);
+  }
+
+  private async readStored(jobId: string): Promise<CloudRenderJobRow | null> {
     const [row] = await this.manager
       .get()
       .select()
@@ -282,7 +316,7 @@ export class CloudRenderJobRepository {
   }
 
   async cancelActive(jobId: string): Promise<void> {
-    const job = await this.get(jobId);
+    const job = await this.readStored(jobId);
     const isCloudRenderJobActive =
       job !== null &&
       ACTIVE_CLOUD_RENDER_STATUSES.includes(

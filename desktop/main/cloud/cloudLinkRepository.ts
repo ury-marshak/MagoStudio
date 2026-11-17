@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 
 import { DatabaseManager } from "../database/databaseManager";
 import { cloudLinks } from "../database/schema";
+import { LibraryWorkSession } from "../libraryWorkSession";
 
 /**
  * Reads and writes the local-to-cloud id mapping.
@@ -33,9 +34,29 @@ const parseData = (value: string): Record<string, unknown> => {
 };
 
 export class CloudLinkRepository {
-  constructor(private readonly manager: DatabaseManager) {}
+  readonly libraryWork = new LibraryWorkSession(() => undefined);
+
+  constructor(private readonly manager: DatabaseManager) {
+    const owned = this.libraryWork.guard({
+      get: this.get.bind(this),
+      put: this.put.bind(this),
+      patchData: this.patchData.bind(this),
+      delete: this.delete.bind(this)
+    });
+    this.get = owned.get;
+    this.put = owned.put;
+    this.patchData = owned.patchData;
+    this.delete = owned.delete;
+  }
 
   async get(kind: CloudLinkKind, localId: string): Promise<CloudLink | null> {
+    return this.readStored(kind, localId);
+  }
+
+  private async readStored(
+    kind: CloudLinkKind,
+    localId: string
+  ): Promise<CloudLink | null> {
     const database = this.manager.get();
     const [row] = await database
       .select()
@@ -57,6 +78,15 @@ export class CloudLinkRepository {
    * record that has gone away is simply superseded here.
    */
   async put(input: {
+    kind: CloudLinkKind;
+    localId: string;
+    cloudId: string;
+    data?: Record<string, unknown>;
+  }): Promise<void> {
+    return this.writeStored(input);
+  }
+
+  private async writeStored(input: {
     kind: CloudLinkKind;
     localId: string;
     cloudId: string;
@@ -92,9 +122,11 @@ export class CloudLinkRepository {
     localId: string,
     patch: Record<string, unknown>
   ): Promise<void> {
-    const existing = await this.get(kind, localId);
+    // One issued read/merge/write drains in full, even after suspension. Do not
+    // re-enter public guards halfway through this repository operation.
+    const existing = await this.readStored(kind, localId);
     if (!existing) throw new Error(`No cloud link for ${kind} ${localId}`);
-    await this.put({
+    await this.writeStored({
       kind,
       localId,
       cloudId: existing.cloudId,

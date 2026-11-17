@@ -99,35 +99,56 @@ export const registerCloudHandlers = (options: {
       channel,
       renderWork.bind(async (...args) => handler(...args))
     );
-
-  ipcMain.handle(IPC_CHANNELS.cloudLinkGet, async (event, kind, localId) => {
-    requireTrustedSender(event);
-    return links.get(requireKind(kind), requireId(localId, "localId"));
-  });
-
-  ipcMain.handle(IPC_CHANNELS.cloudLinkPut, async (event, input) => {
-    requireTrustedSender(event);
-    const value = (input ?? {}) as Record<string, unknown>;
-    await links.put({
-      kind: requireKind(value.kind),
-      localId: requireId(value.localId, "localId"),
-      cloudId: requireId(value.cloudId, "cloudId"),
-      data:
-        value.data && typeof value.data === "object"
-          ? (value.data as Record<string, unknown>)
-          : undefined
+  const handleLocal = (
+    work: CloudLinkRepository["libraryWork"],
+    channel: string,
+    handler: Parameters<typeof ipcMain.handle>[1]
+  ) =>
+    ipcMain.handle(channel, async (event, ...args: unknown[]) => {
+      requireTrustedSender(event);
+      return work.run(async () => handler(event, ...args));
     });
-  });
 
-  ipcMain.handle(IPC_CHANNELS.cloudLinkPatch, async (event, input) => {
-    requireTrustedSender(event);
-    const value = (input ?? {}) as Record<string, unknown>;
-    await links.patchData(
-      requireKind(value.kind),
-      requireId(value.localId, "localId"),
-      (value.patch ?? {}) as Record<string, unknown>
-    );
-  });
+  handleLocal(
+    links.libraryWork,
+    IPC_CHANNELS.cloudLinkGet,
+    async (event, kind, localId) => {
+      requireTrustedSender(event);
+      return links.get(requireKind(kind), requireId(localId, "localId"));
+    }
+  );
+
+  handleLocal(
+    links.libraryWork,
+    IPC_CHANNELS.cloudLinkPut,
+    async (event, input) => {
+      requireTrustedSender(event);
+      const value = (input ?? {}) as Record<string, unknown>;
+      await links.put({
+        kind: requireKind(value.kind),
+        localId: requireId(value.localId, "localId"),
+        cloudId: requireId(value.cloudId, "cloudId"),
+        data:
+          value.data && typeof value.data === "object"
+            ? (value.data as Record<string, unknown>)
+            : undefined
+      });
+    }
+  );
+
+  handleLocal(
+    links.libraryWork,
+    IPC_CHANNELS.cloudLinkPatch,
+    async (event, input) => {
+      requireTrustedSender(event);
+      const value = (input ?? {}) as Record<string, unknown>;
+      await links.patchData(
+        requireKind(value.kind),
+        requireId(value.localId, "localId"),
+        (value.patch ?? {}) as Record<string, unknown>
+      );
+    }
+  );
 
   ipcMain.handle(IPC_CHANNELS.cloudPrepareUpload, async (event, input) => {
     requireTrustedSender(event);
@@ -371,40 +392,53 @@ export const registerCloudHandlers = (options: {
     });
   });
 
-  ipcMain.handle(IPC_CHANNELS.cloudRenderListActive, async (event) => {
-    requireTrustedSender(event);
-    const rows = await renderJobs.listActive();
-    // The local ids are what the queue UI matches a track on, so they travel
-    // with the job rather than being looked up again in the renderer.
-    return rows.map((row) => ({
-      id: row.id,
-      cloudAssetId: row.cloudAssetId,
-      cloudClipId: row.cloudClipId,
-      kind: isImageJobRequest(row.request) ? "img2img" : "video",
-      projectId: row.projectId,
-      shotId: row.shotId,
-      model: row.model,
-      status: row.status,
-      progress: row.progress,
-      assetId: row.assetId,
-      trackId: row.trackId,
-      clipId: row.clipId
-    }));
-  });
+  handleLocal(
+    renderJobs.libraryWork,
+    IPC_CHANNELS.cloudRenderListActive,
+    async (event) => {
+      requireTrustedSender(event);
+      const rows = await renderJobs.listActive();
+      // The local ids are what the queue UI matches a track on, so they travel
+      // with the job rather than being looked up again in the renderer.
+      return rows.map((row) => ({
+        id: row.id,
+        cloudAssetId: row.cloudAssetId,
+        cloudClipId: row.cloudClipId,
+        kind: isImageJobRequest(row.request) ? "img2img" : "video",
+        projectId: row.projectId,
+        shotId: row.shotId,
+        model: row.model,
+        status: row.status,
+        progress: row.progress,
+        assetId: row.assetId,
+        trackId: row.trackId,
+        clipId: row.clipId
+      }));
+    }
+  );
 
-  ipcMain.handle(IPC_CHANNELS.cloudRenderListQueue, async (event) => {
-    requireTrustedSender(event);
-    return renderJobs.listQueue();
-  });
+  handleLocal(
+    renderJobs.libraryWork,
+    IPC_CHANNELS.cloudRenderListQueue,
+    async (event) => {
+      requireTrustedSender(event);
+      return renderJobs.listQueue();
+    }
+  );
 
-  ipcMain.handle(IPC_CHANNELS.cloudRenderSetStatus, async (event, input) => {
-    requireTrustedSender(event);
-    const value = (input ?? {}) as Record<string, unknown>;
-    await renderJobs.update(requireId(value.jobId, "jobId"), {
-      status: requireId(value.status, "status"),
-      progress: typeof value.progress === "number" ? value.progress : undefined
-    });
-  });
+  handleLocal(
+    renderJobs.libraryWork,
+    IPC_CHANNELS.cloudRenderSetStatus,
+    async (event, input) => {
+      requireTrustedSender(event);
+      const value = (input ?? {}) as Record<string, unknown>;
+      await renderJobs.update(requireId(value.jobId, "jobId"), {
+        status: requireId(value.status, "status"),
+        progress:
+          typeof value.progress === "number" ? value.progress : undefined
+      });
+    }
+  );
 
   handleRender(IPC_CHANNELS.cloudRenderFinish, async (event, input) => {
     requireTrustedSender(event);
