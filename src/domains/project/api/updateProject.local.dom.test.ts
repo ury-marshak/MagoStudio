@@ -85,7 +85,8 @@ describe("updateProject (desktop)", () => {
           "/projects/p",
           expect.objectContaining({
             settings: { rangeMin: 0, visual_style: "Ink" }
-          })
+          }),
+          { signal: expect.any(AbortSignal) }
         );
         expect(update).not.toHaveBeenCalled();
       }
@@ -116,12 +117,18 @@ describe("updateProject (desktop)", () => {
       settingsPatch: { pinnedTrackIds: { shot: "track" } }
     });
 
-    expect(get).toHaveBeenCalledWith("/projects/cloud-project");
-    expect(put).toHaveBeenCalledWith("/projects/cloud-project", {
-      name: "Renamed",
-      description: "",
-      settings: { ...freshCloudSettings, pinnedTrackIds: { shot: "track" } }
+    expect(get).toHaveBeenCalledWith("/projects/cloud-project", {
+      signal: expect.any(AbortSignal)
     });
+    expect(put).toHaveBeenCalledWith(
+      "/projects/cloud-project",
+      {
+        name: "Renamed",
+        description: "",
+        settings: { ...freshCloudSettings, pinnedTrackIds: { shot: "track" } }
+      },
+      { signal: get.mock.calls[0][1].signal }
+    );
   });
 
   it("sends a cloud project's visual style in the PUT the backend reads it from", async () => {
@@ -144,11 +151,15 @@ describe("updateProject (desktop)", () => {
       settingsPatch: { visual_style: "Ink wash" }
     });
 
-    expect(put).toHaveBeenCalledWith("/projects/cloud-project", {
-      name: "Project",
-      description: "",
-      settings: { ...freshCloudSettings, visual_style: "Ink wash" }
-    });
+    expect(put).toHaveBeenCalledWith(
+      "/projects/cloud-project",
+      {
+        name: "Project",
+        description: "",
+        settings: { ...freshCloudSettings, visual_style: "Ink wash" }
+      },
+      { signal: expect.any(AbortSignal) }
+    );
   });
 
   it("never sends local-only keys to the cloud even when the patch carries them", async () => {

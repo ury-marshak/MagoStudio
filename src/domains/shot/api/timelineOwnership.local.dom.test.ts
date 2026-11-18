@@ -26,6 +26,7 @@ const stubDesktop = (origin: "local" | "cloud") => {
     delete: vi.fn().mockResolvedValue(undefined)
   };
   vi.stubGlobal("mago", {
+    library: { onWillChange: async () => {}, onDidChange: vi.fn() },
     shots,
     projects: { get: vi.fn().mockResolvedValue({ id: "project-1", origin }) }
   });
@@ -48,8 +49,13 @@ describe("timeline writes in the desktop app", () => {
       project_id: "project-1"
     });
 
-    expect(put).toHaveBeenCalledWith("/timeline/shot-1", expect.anything());
-    expect(syncCloudProjectMetadata).toHaveBeenCalledWith("project-1");
+    expect(put).toHaveBeenCalledWith("/timeline/shot-1", expect.anything(), {
+      signal: expect.any(AbortSignal)
+    });
+    expect(syncCloudProjectMetadata).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ signal: put.mock.calls[0][2].signal })
+    );
     expect(shots.update).not.toHaveBeenCalled();
   });
 
@@ -71,8 +77,13 @@ describe("timeline writes in the desktop app", () => {
 
     await deleteTimeline("shot-1", "project-1");
 
-    expect(del).toHaveBeenCalledWith("/timeline/shot-1");
-    expect(syncCloudProjectMetadata).toHaveBeenCalledWith("project-1");
+    expect(del).toHaveBeenCalledWith("/timeline/shot-1", {
+      signal: expect.any(AbortSignal)
+    });
+    expect(syncCloudProjectMetadata).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ signal: del.mock.calls[0][1].signal })
+    );
     expect(shots.delete).not.toHaveBeenCalled();
   });
 

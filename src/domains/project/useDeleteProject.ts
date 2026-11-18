@@ -1,37 +1,40 @@
 import { ProjectListItem } from "@domains/project/api/fetchProjectList";
 import { Project } from "@schemas/project";
-import {
-  type InfiniteData,
-  useMutation,
-  useQueryClient
-} from "@tanstack/react-query";
+import { type InfiniteData, useQueryClient } from "@tanstack/react-query";
 
+import {
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 import { PaginatedResponse } from "@/schemas/pagination";
 
 import { backendApiClient } from "../../lib/backend-api-client";
 
-const deleteProject = async ({ projectId }: { projectId: Project["id"] }) => {
-  if (!window.mago) {
-    await backendApiClient.delete(`/projects/${projectId}`);
-    return;
-  }
-  const localProject = await window.mago.projects.get(projectId);
+const deleteProject = async (
+  { projectId }: { projectId: Project["id"] },
+  work: RendererLibraryWork
+) => {
+  const desktop = window.mago;
+  const localProject = desktop
+    ? await work.boundary(() => desktop.projects.get(projectId))
+    : null;
   if (
-    localProject?.origin === "cloud" &&
-    window.mago.account.mode === "cloud"
+    !desktop ||
+    (localProject?.origin === "cloud" && desktop.account.mode === "cloud")
   ) {
-    await backendApiClient.delete(`/projects/${projectId}`);
+    await runRendererLibraryRequest(work, (signal) =>
+      backendApiClient.delete(`/projects/${projectId}`, { signal })
+    );
   }
-  await window.mago.projects.delete(projectId);
+  if (desktop) await work.boundary(() => desktop.projects.delete(projectId));
 };
 
 export const useDeleteProject = (props?: { noInvalidation?: boolean }) => {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (params: { projectId: Project["id"] }) => {
-      return deleteProject(params);
-    },
+  return useRendererLibraryMutation({
+    mutationFn: deleteProject,
     onSuccess: (_, params) => {
       if (props?.noInvalidation) return;
       queryClient.setQueryData(queryKeys.projects.all, (old: Project[]) => {

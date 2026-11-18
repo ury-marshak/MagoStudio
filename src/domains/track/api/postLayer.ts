@@ -3,6 +3,10 @@ import { Layer, LayerType } from "@schemas/layer";
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi, isLocalApp } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest
+} from "@/platform/rendererLibraryWork";
 
 import { toCachedLayerAfterCloudWrite } from "./toCachedLayerAfterCloudWrite";
 
@@ -24,26 +28,38 @@ export const postTrack = async (
     parentTrackOrder,
     isOutputOfLocalProviderRender = false
   }: PostTrackParams,
-  projectId?: string
+  projectId?: string,
+  work = rendererLibrary.capture()
 ): Promise<Layer> => {
   const isTrackStoredLocally =
     isLocalApp &&
-    (isOutputOfLocalProviderRender || !(await isCloudProject(projectId)));
+    (isOutputOfLocalProviderRender ||
+      !(await work.boundary(() => isCloudProject(projectId))));
   if (isTrackStoredLocally) {
-    return (await getLocalDesktopApi().tracks.create({
-      shotId,
-      name: trackName,
-      type: trackType,
-      data: data as Record<string, unknown>,
-      parentTrackOrder
-    })) as Layer;
+    return work.boundary(
+      async () =>
+        (await getLocalDesktopApi().tracks.create({
+          shotId,
+          name: trackName,
+          type: trackType,
+          data: data as Record<string, unknown>,
+          parentTrackOrder
+        })) as Layer
+    );
   }
-  const response = await backendApiClient.post(`/layers`, {
-    timeline_id: shotId,
-    type: trackType,
-    name: trackName,
-    data: data,
-    parent_layer_order: parentTrackOrder
-  });
-  return toCachedLayerAfterCloudWrite(response.data, projectId);
+  const response = await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.post(
+      `/layers`,
+      {
+        timeline_id: shotId,
+        type: trackType,
+        name: trackName,
+        data,
+        parent_layer_order: parentTrackOrder
+      },
+      { signal }
+    )
+  );
+  work.check();
+  return toCachedLayerAfterCloudWrite(response.data, projectId, work);
 };

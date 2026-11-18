@@ -122,3 +122,19 @@ export interface RendererLibraryWork {
 }
 
 export const rendererLibrary = new RendererLibrarySession();
+
+/** A remote request is not part of the renderer acknowledgement drain.
+ * Carry origin into transport (including async credentials), and refuse even
+ * a response/rejection from a transport that ignores abort. */
+export const runRendererLibraryRequest = async <T>(
+  work: RendererLibraryWork,
+  request: (signal: AbortSignal) => Promise<T>
+): Promise<T> => {
+  await work.ready();
+  work.check();
+  try {
+    return await request(work.signal);
+  } finally {
+    work.check();
+  }
+};

@@ -3,6 +3,8 @@ import { currentFolderIdAtom } from "@store/atoms";
 import dayjs from "dayjs";
 import { useAtomValue } from "jotai";
 
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+
 import { FolderOrProject } from "./interface";
 import { useProjectFolders } from "./useProjectFolders";
 import { useUpdateProjectFolders } from "./useUpdateProjectFolders";
@@ -14,15 +16,18 @@ export const useCreateProjectFoldersProject = () => {
   const { data, isLoading, error: projectFoldersError } = useProjectFolders();
   const projectFoldersAndProjects = data?.projectFoldersAndProjects;
 
-  const createProjectFoldersProject = async ({
-    projectId,
-    projectName,
-    parentFolderId
-  }: {
-    projectId: Project["id"];
-    projectName: Project["name"];
-    parentFolderId?: string;
-  }) => {
+  const createProjectFoldersProject = async (
+    {
+      projectId,
+      projectName,
+      parentFolderId
+    }: {
+      projectId: Project["id"];
+      projectName: Project["name"];
+      parentFolderId?: string;
+    },
+    work?: RendererLibraryWork
+  ) => {
     const newProject: FolderOrProject = {
       id: projectId,
       name: projectName,
@@ -35,7 +40,7 @@ export const useCreateProjectFoldersProject = () => {
       ? [...projectFoldersAndProjects, newProject]
       : [newProject];
 
-    return updateFolders(updatedProjectFolders);
+    return updateFolders(updatedProjectFolders, work);
   };
 
   return {

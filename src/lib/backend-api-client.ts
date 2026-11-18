@@ -45,9 +45,13 @@ const ensureRequestInterceptor = (): void => {
     async (config) => {
       // Install this independently of BackendApiProvider: an accidental API
       // call must fail before credentials, a never-resolved key barrier or I/O.
-      requireCloudAccount();
+      const checkDispatch = () => {
+        if (config.signal?.aborted) throw new axios.CanceledError();
+        requireCloudAccount();
+      };
+      checkDispatch();
       if (apiKeyReadyPromise) await apiKeyReadyPromise;
-      requireCloudAccount();
+      checkDispatch();
 
       if (getTokenFunction) {
         try {
@@ -60,7 +64,7 @@ const ensureRequestInterceptor = (): void => {
 
       // Account choice normally rebuilds the window. Still refuse continuations
       // already waiting for credentials if the bridge has since changed.
-      requireCloudAccount();
+      checkDispatch();
       if (apiKey) config.headers["X-API-Key"] = apiKey;
       return config;
     },

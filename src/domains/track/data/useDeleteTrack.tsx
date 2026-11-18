@@ -1,8 +1,9 @@
 import { Layer } from "@schemas/layer";
 import { Project } from "@schemas/project";
 import { Shot } from "@schemas/shot";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { deleteTrack } from "../api/deleteTrack";
@@ -35,8 +36,8 @@ export const useDeleteTrack = () => {
       queryKey: queryKeys.project.byId(params.projectId)
     });
   };
-  return useMutation({
-    mutationFn: deleteTrack,
+  return useRendererLibraryMutation({
+    mutationFn: (params: DeleteTrackParams, work) => deleteTrack(params, work),
     onSuccess
   });
 };

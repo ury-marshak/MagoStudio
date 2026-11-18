@@ -1,7 +1,8 @@
 import { Layer } from "@schemas/layer";
 import { Project } from "@schemas/project";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { putTrack } from "../api/putTrack";
@@ -22,9 +23,11 @@ export const usePutTrack = ({
         buildUpdatedProjectAfterTrackPut(project, selectedShotId, data)
     );
   };
-  return useMutation({
-    mutationFn: (params: Omit<Parameters<typeof putTrack>[0], "projectId">) =>
-      putTrack({ ...params, projectId: selectedProjectId }),
+  return useRendererLibraryMutation({
+    mutationFn: (
+      params: Omit<Parameters<typeof putTrack>[0], "projectId">,
+      work
+    ) => putTrack({ ...params, projectId: selectedProjectId }, work),
     onSuccess
   });
 };

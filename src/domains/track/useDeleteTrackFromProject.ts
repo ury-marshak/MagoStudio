@@ -6,6 +6,8 @@ import { useDeleteQueueItem } from "@hooks/queue/useDeleteQueueItem";
 import { trackingUtils } from "@hooks/tracking/trackingUtils";
 import { Layer } from "@schemas/layer";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 import { useFilteredAndSortedTracks } from "./useFilteredAndSortedTracks";
 import { useSetSelectedTrackIds } from "./useSetSelectedTrackIds";
 import { getTrackClip } from "./utils/getTrackClip";
@@ -26,6 +28,9 @@ export const useDeleteTrackFromProject = () => {
     trackToDelete: Layer,
     queue: QueueItem[] | undefined
   ) => {
+    const work = rendererLibrary.capture();
+    await work.ready();
+    work.check();
     const clip = getTrackClip(trackToDelete);
     const queueItem = queue?.find(
       (queueItem: QueueItem) =>
@@ -40,11 +45,15 @@ export const useDeleteTrackFromProject = () => {
       });
     }
 
-    await deleteTrack({
-      trackId: trackToDelete.id,
-      shotId: selectedShotId,
-      projectId: selectedProjectId
-    });
+    await deleteTrack(
+      {
+        trackId: trackToDelete.id,
+        shotId: selectedShotId,
+        projectId: selectedProjectId
+      },
+      work
+    );
+    work.check();
 
     setSelectedTrackIds(videoTrack ? [videoTrack.id] : []);
 

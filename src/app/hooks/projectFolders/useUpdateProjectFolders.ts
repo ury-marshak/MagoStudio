@@ -5,6 +5,10 @@ import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { isLocalApp } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { FolderOrProject } from "./interface";
@@ -21,49 +25,55 @@ export const useUpdateProjectFolders = () => {
   const ensureLocalFolderDummyProject = useEnsureLocalFolderDummyProject();
 
   const mutation = useUpdateProject({
-    onMutate: async (variables: {
-      projectId: string;
-      settings: Project["settings"];
-    }) => {
+    onMutate: async (variables, work) => {
       await queryClient.cancelQueries({ queryKey: queryKeys.projects.all });
+      work.check();
+      const { projectId, settings } = variables;
+      if (!settings) return;
 
       queryClient.setQueryData(
         queryKeys.projects.all,
         (oldProjects: Project[] | undefined) =>
-          replaceProjectSettings(
-            oldProjects,
-            variables.projectId,
-            variables.settings
-          )
+          replaceProjectSettings(oldProjects, projectId, settings)
       );
     }
   });
   const queryClient = useQueryClient();
 
-  const resolveFolderDummyProjectToUpdate = async () => {
+  const resolveFolderDummyProjectToUpdate = async (
+    work: RendererLibraryWork
+  ) => {
     if (folderDummyProject) return folderDummyProject;
     if (!isFolderDummyProjectCreatedByThisApp || !user) return undefined;
-    return ensureLocalFolderDummyProject(user.id);
+    return ensureLocalFolderDummyProject(user.id, work);
   };
 
-  const updateProjectFolders = async (projectFolders: FolderOrProject[]) => {
+  const updateProjectFolders = async (
+    projectFolders: FolderOrProject[],
+    work = rendererLibrary.capture()
+  ) => {
+    work.check();
     const folderDummyProjectToUpdate =
-      await resolveFolderDummyProjectToUpdate();
+      await resolveFolderDummyProjectToUpdate(work);
+    work.check();
     if (!folderDummyProjectToUpdate) return;
 
-    await mutation.mutateAsync({
-      projectId: folderDummyProjectToUpdate.id,
-      projectName: folderDummyProjectToUpdate.name,
-      projectDescription: folderDummyProjectToUpdate.description,
-      settings: {
-        ...folderDummyProjectToUpdate.settings,
-        folders: projectFolders
+    await mutation.mutateAsync(
+      {
+        projectId: folderDummyProjectToUpdate.id,
+        projectName: folderDummyProjectToUpdate.name,
+        projectDescription: folderDummyProjectToUpdate.description,
+        settings: {
+          ...folderDummyProjectToUpdate.settings,
+          folders: projectFolders
+        },
+        settingsPatch: { folders: projectFolders },
+        settingsMergeBase: {
+          folders: folderDummyProjectToUpdate.settings.folders ?? []
+        }
       },
-      settingsPatch: { folders: projectFolders },
-      settingsMergeBase: {
-        folders: folderDummyProjectToUpdate.settings.folders ?? []
-      }
-    });
+      work
+    );
   };
 
   return {

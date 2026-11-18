@@ -128,12 +128,16 @@ describe("createProject (desktop)", () => {
       createProject({ ...input, projectType: "script_to_shots" })
     ).resolves.toMatchObject({ id: "cloud-script" });
 
-    expect(post).toHaveBeenCalledWith("/projects", {
-      name: "Untitled",
-      description: "",
-      type: "script_to_shots",
-      settings: { rangeMin: 0, rangeMax: 99 }
-    });
+    expect(post).toHaveBeenCalledWith(
+      "/projects",
+      {
+        name: "Untitled",
+        description: "",
+        type: "script_to_shots",
+        settings: { rangeMin: 0, rangeMax: 99 }
+      },
+      { signal: expect.any(AbortSignal) }
+    );
     expect(create).not.toHaveBeenCalled();
     expect(putSnapshot).toHaveBeenCalledWith({
       projectId: "cloud-script",
@@ -177,11 +181,18 @@ describe("createProject (desktop)", () => {
       createProject({ ...input, creationTarget: "cloud" })
     ).resolves.toMatchObject({ id: "cloud-project" });
 
-    expect(post).toHaveBeenCalledWith("/projects", {
-      name: "Untitled",
-      description: "",
-      settings: { rangeMin: 0, rangeMax: 99 }
-    });
-    expect(syncCloudProjectMetadata).toHaveBeenCalledWith("cloud-project");
+    expect(post).toHaveBeenCalledWith(
+      "/projects",
+      {
+        name: "Untitled",
+        description: "",
+        settings: { rangeMin: 0, rangeMax: 99 }
+      },
+      { signal: expect.any(AbortSignal) }
+    );
+    expect(syncCloudProjectMetadata).toHaveBeenCalledWith(
+      "cloud-project",
+      expect.objectContaining({ signal: post.mock.calls[0][2].signal })
+    );
   });
 });

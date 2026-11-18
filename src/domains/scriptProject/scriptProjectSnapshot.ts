@@ -1,3 +1,5 @@
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+
 import type {
   LocalScriptProjectSnapshot,
   LocalScriptProjectSnapshotInput
@@ -8,5 +10,6 @@ export const readScriptProjectSnapshot = async (
 ): Promise<LocalScriptProjectSnapshot | null> => null;
 
 export const writeScriptProjectSnapshot = async (
-  _input: LocalScriptProjectSnapshotInput
+  _input: LocalScriptProjectSnapshotInput,
+  _work?: RendererLibraryWork
 ): Promise<void> => {};

@@ -1,3 +1,5 @@
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+
 export const syncCloudScriptProjects = async (): Promise<void> => {};
 
 export const cancelCloudProjectCatalogSync = (): void => {};
@@ -12,7 +14,8 @@ export const syncCloudScriptProject = async (
 export const syncCloudProject = syncCloudScriptProject;
 
 export const syncCloudProjectMetadata = async (
-  _projectId: string
+  _projectId: string,
+  _work?: RendererLibraryWork
 ): Promise<void> => {};
 
 export const getCloudProjectSyncStatus = (): boolean => false;

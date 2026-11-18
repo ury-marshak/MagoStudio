@@ -1,7 +1,8 @@
 import { Layer, LayerType } from "@schemas/layer";
 import { Project } from "@schemas/project";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { postTrack, PostTrackParams } from "../api/postLayer";
@@ -16,9 +17,6 @@ export const usePostTrack = ({
   parentVideoTrackId?: string;
 }) => {
   const queryClient = useQueryClient();
-  const mutationFn = (params: PostTrackParams) => {
-    return postTrack(params, selectedProjectId);
-  };
   const onSuccess = (newTrack: Layer, variables: PostTrackParams) => {
     queryClient.setQueryData(
       queryKeys.project.byId(selectedProjectId),
@@ -64,8 +62,9 @@ export const usePostTrack = ({
       }
     );
   };
-  return useMutation({
-    mutationFn,
+  return useRendererLibraryMutation({
+    mutationFn: (params: PostTrackParams, work) =>
+      postTrack(params, selectedProjectId, work),
     onSuccess
   });
 };

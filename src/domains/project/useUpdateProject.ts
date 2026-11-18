@@ -1,21 +1,30 @@
 import { Project } from "@schemas/project";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { UpdateProjectParams, updateProject } from "./api/updateProject";
 import { applyProjectUpdateToCache } from "./utils/applyProjectUpdateToCache";
 
-export const useUpdateProject = ({
+export const useUpdateProject = <Context = unknown>({
   onMutate,
   onError
 }: {
-  onMutate?: (variables: any) => unknown;
-  onError?: (error: unknown, variables: any, context: unknown) => void;
+  onMutate?: (
+    variables: UpdateProjectParams,
+    work: RendererLibraryWork
+  ) => Context | Promise<Context>;
+  onError?: (
+    error: unknown,
+    variables: UpdateProjectParams,
+    context: Context | undefined
+  ) => void;
 } = {}) => {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (params: UpdateProjectParams) => updateProject(params),
+  return useRendererLibraryMutation({
+    mutationFn: updateProject,
     onMutate,
     onError,
     onSuccess: (persistedSettings, variables) => {

@@ -1,11 +1,12 @@
 import { Project } from "@schemas/project";
 import { ProjectType } from "@schemas/scriptProject";
 import { useToast } from "@store/useToast";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { useTranslation } from "react-i18next";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { ProjectCreationTarget } from "./projectCreationTarget";
@@ -46,10 +47,8 @@ export const useCreateProject = () => {
   const { showToast } = useToast();
   const { t } = useTranslation();
 
-  return useMutation({
-    mutationFn: (params: CreateProjectParams) => {
-      return createProject(params);
-    },
+  return useRendererLibraryMutation({
+    mutationFn: createProject,
     onSuccess: (newProject) => {
       queryClient.setQueryData(queryKeys.projects.all, (old: Project[]) => {
         return [...old, newProject];

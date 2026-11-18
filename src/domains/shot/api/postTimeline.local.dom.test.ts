@@ -15,6 +15,7 @@ import { postTimeline } from "./postTimeline";
 const stubDesktop = (origin: "local" | "cloud") => {
   const shots = { create: vi.fn().mockResolvedValue({ id: "local-shot" }) };
   vi.stubGlobal("mago", {
+    library: { onWillChange: async () => {}, onDidChange: vi.fn() },
     shots,
     projects: { get: vi.fn().mockResolvedValue({ id: "project-1", origin }) }
   });
@@ -46,9 +47,11 @@ describe("postTimeline in the desktop app", () => {
 
     const shot = await postTimeline("project-1", "Image to Video");
 
-    expect(post).toHaveBeenCalledWith("/timelines/project-1", {
-      name: "Image to Video"
-    });
+    expect(post).toHaveBeenCalledWith(
+      "/timelines/project-1",
+      { name: "Image to Video" },
+      { signal: expect.any(AbortSignal) }
+    );
     expect(shot).toEqual({ id: "cloud-shot" });
     expect(shots.create).not.toHaveBeenCalled();
   });

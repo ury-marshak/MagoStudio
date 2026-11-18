@@ -6,6 +6,8 @@ import { useRenderSettingsAtoms } from "@store/renderSettingsStore";
 import { useAtomValue } from "jotai";
 import { useTranslation } from "react-i18next";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 import { ProjectCreationTarget } from "./projectCreationTarget";
 import { useCreateProject } from "./useCreateProject";
 import { useProjects } from "./useProjects";
@@ -22,41 +24,53 @@ export const useCreateNewProject = () => {
     useCreateProjectFoldersProject();
   const { selectedModelAtom } = useRenderSettingsAtoms();
   const selectedModel = useAtomValue(selectedModelAtom);
-  const createNewProject = async ({
-    parentFolderId,
-    projectType,
-    creationTarget
-  }: {
-    parentFolderId?: string;
-    projectType?: ProjectType;
-    creationTarget?: ProjectCreationTarget;
-  } = {}) => {
+  const createNewProject = async (
+    {
+      parentFolderId,
+      projectType,
+      creationTarget
+    }: {
+      parentFolderId?: string;
+      projectType?: ProjectType;
+      creationTarget?: ProjectCreationTarget;
+    } = {},
+    work = rendererLibrary.capture()
+  ) => {
+    work.check();
     const projectName = generateUntitledName(
       allProjects?.map((p) => p.name) ?? [],
       t("titles.untitled_project.label")
     );
 
-    const newProject = await createProject({
-      projectName,
-      projectDescription: "",
-      projectType,
-      creationTarget,
-      rangeMin: DEFAULT_START_FRAME,
-      rangeMax: getDefaultRenderFrames(
-        selectedModel.renderDurationLimits.defaultFrameRange,
-        DEFAULT_FPS
-      )
-    });
+    const newProject = await createProject(
+      {
+        projectName,
+        projectDescription: "",
+        projectType,
+        creationTarget,
+        rangeMin: DEFAULT_START_FRAME,
+        rangeMax: getDefaultRenderFrames(
+          selectedModel.renderDurationLimits.defaultFrameRange,
+          DEFAULT_FPS
+        )
+      },
+      work
+    );
+    work.check();
 
     if (!newProject) return undefined;
 
     trackingUtils.projectActions.create(newProject.id, newProject.name);
 
-    await createProjectFoldersProject({
-      projectId: newProject.id,
-      projectName: newProject.name,
-      parentFolderId
-    });
+    await createProjectFoldersProject(
+      {
+        projectId: newProject.id,
+        projectName: newProject.name,
+        parentFolderId
+      },
+      work
+    );
+    work.check();
 
     return newProject;
   };

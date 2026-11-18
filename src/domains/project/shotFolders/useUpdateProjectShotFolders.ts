@@ -1,6 +1,7 @@
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { useUpdateProject } from "../useUpdateProject";
@@ -14,10 +15,11 @@ export const useUpdateProjectShotFolders = (projectId: string | undefined) => {
   const queryClient = useQueryClient();
 
   const mutation = useUpdateProject({
-    onMutate: async (updatedProject: Project) => {
+    onMutate: async (updatedProject, work) => {
       await queryClient.cancelQueries({
         queryKey: queryKeys.project.byId(projectId)
       });
+      work.check();
 
       queryClient.setQueryData(
         queryKeys.project.byId(projectId),
@@ -32,23 +34,30 @@ export const useUpdateProjectShotFolders = (projectId: string | undefined) => {
     }
   });
 
-  const updateShotFolders = async (shotFolders: ShotFolderOrShot[]) => {
+  const updateShotFolders = async (
+    shotFolders: ShotFolderOrShot[],
+    work = rendererLibrary.capture()
+  ) => {
+    work.check();
     const current =
       queryClient.getQueryData<Project>(queryKeys.project.byId(projectId)) ??
       project;
     if (!current) return;
 
-    await mutation.mutateAsync({
-      projectId: current.id,
-      projectName: current.name,
-      projectDescription: current.description,
-      settings: {
-        ...current.settings,
-        shotFolders
+    await mutation.mutateAsync(
+      {
+        projectId: current.id,
+        projectName: current.name,
+        projectDescription: current.description,
+        settings: {
+          ...current.settings,
+          shotFolders
+        },
+        settingsPatch: { shotFolders },
+        settingsMergeBase: { shotFolders: current.settings.shotFolders ?? [] }
       },
-      settingsPatch: { shotFolders },
-      settingsMergeBase: { shotFolders: current.settings.shotFolders ?? [] }
-    });
+      work
+    );
   };
 
   return {

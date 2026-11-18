@@ -2,6 +2,10 @@ import { syncCloudProjectMetadata } from "@domains/scriptProject/syncCloudScript
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi, isLocalApp } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest
+} from "@/platform/rendererLibraryWork";
 
 import { isCloudProject } from "../utils/isCloudProject";
 
@@ -9,12 +13,17 @@ import { isCloudProject } from "../utils/isCloudProject";
  * mirrored) from a local one; without it the desktop app assumes local. */
 export const deleteTimeline = async (
   timelineId: string,
-  projectId?: string
+  projectId?: string,
+  work = rendererLibrary.capture()
 ) => {
-  if (isLocalApp && !(await isCloudProject(projectId))) {
-    await getLocalDesktopApi().shots.delete(timelineId);
+  if (isLocalApp && !(await work.boundary(() => isCloudProject(projectId)))) {
+    await work.boundary(() => getLocalDesktopApi().shots.delete(timelineId));
     return;
   }
-  await backendApiClient.delete(`/timeline/${timelineId}`);
-  if (projectId) await syncCloudProjectMetadata(projectId);
+  await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.delete(`/timeline/${timelineId}`, { signal })
+  );
+  work.check();
+  if (projectId) await syncCloudProjectMetadata(projectId, work);
+  work.check();
 };

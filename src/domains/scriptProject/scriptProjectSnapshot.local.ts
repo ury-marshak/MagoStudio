@@ -41,10 +41,11 @@ export const readScriptProjectSnapshot = (
 };
 
 export const writeScriptProjectSnapshot = async (
-  input: LocalScriptProjectSnapshotInput
+  input: LocalScriptProjectSnapshotInput,
+  work = rendererLibrary.capture()
 ): Promise<void> => {
-  const work = rendererLibrary.capture();
   await work.ready();
+  work.check();
   const desktop = getLocalDesktopApi();
   const snapshots = desktop.scriptProjects;
   if (!snapshots) return;

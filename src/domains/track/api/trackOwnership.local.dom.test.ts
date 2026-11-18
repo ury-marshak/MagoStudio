@@ -36,6 +36,7 @@ const stubDesktop = (
     delete: vi.fn().mockResolvedValue(undefined)
   };
   vi.stubGlobal("mago", {
+    library: { onWillChange: async () => {}, onDidChange: vi.fn() },
     tracks,
     projects: {
       get: vi.fn().mockResolvedValue({
@@ -74,14 +75,21 @@ describe("track writes in the desktop app", () => {
     const created = await postTrack(newTrack, "project-1");
 
     expect(created).toEqual({ id: "cloud-track" });
-    expect(post).toHaveBeenCalledWith("/layers", {
-      timeline_id: "shot-1",
-      type: LayerType.RENDER,
-      name: "Render",
-      data: { renderEngine: "magov2" },
-      parent_layer_order: 1
-    });
-    expect(syncCloudProjectMetadata).toHaveBeenCalledWith("project-1");
+    expect(post).toHaveBeenCalledWith(
+      "/layers",
+      {
+        timeline_id: "shot-1",
+        type: LayerType.RENDER,
+        name: "Render",
+        data: { renderEngine: "magov2" },
+        parent_layer_order: 1
+      },
+      { signal: expect.any(AbortSignal) }
+    );
+    expect(syncCloudProjectMetadata).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ signal: post.mock.calls[0][2].signal })
+    );
     expect(tracks.create).not.toHaveBeenCalled();
   });
 
@@ -148,12 +156,19 @@ describe("track writes in the desktop app", () => {
       projectId: "project-1"
     });
 
-    expect(put).toHaveBeenCalledWith("/layers/track-1", {
-      name: "Hero",
-      data: {},
-      rating: RatingType.THREE_STARS
-    });
-    expect(syncCloudProjectMetadata).toHaveBeenCalledWith("project-1");
+    expect(put).toHaveBeenCalledWith(
+      "/layers/track-1",
+      {
+        name: "Hero",
+        data: {},
+        rating: RatingType.THREE_STARS
+      },
+      { signal: expect.any(AbortSignal) }
+    );
+    expect(syncCloudProjectMetadata).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ signal: put.mock.calls[0][2].signal })
+    );
     expect(tracks.update).not.toHaveBeenCalled();
   });
 
@@ -231,7 +246,10 @@ describe("track writes in the desktop app", () => {
       projectId: "project-1"
     });
 
-    expect(syncCloudProjectMetadata).toHaveBeenCalledWith("project-1");
+    expect(syncCloudProjectMetadata).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ signal: put.mock.calls[0][2].signal })
+    );
     expect(layer).toEqual(mirroredSourceTrack);
   });
 
@@ -240,8 +258,13 @@ describe("track writes in the desktop app", () => {
 
     await deleteTrack({ trackId: "track-1", projectId: "project-1" });
 
-    expect(del).toHaveBeenCalledWith("/layers/track-1");
-    expect(syncCloudProjectMetadata).toHaveBeenCalledWith("project-1");
+    expect(del).toHaveBeenCalledWith("/layers/track-1", {
+      signal: expect.any(AbortSignal)
+    });
+    expect(syncCloudProjectMetadata).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ signal: del.mock.calls[0][1].signal })
+    );
     expect(tracks.delete).not.toHaveBeenCalled();
   });
 

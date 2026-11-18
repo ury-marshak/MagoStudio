@@ -11,10 +11,11 @@ export const useUpdatePinnedTrackIds = (projectId: string | undefined) => {
   const queryClient = useQueryClient();
 
   const mutation = useUpdateProject({
-    onMutate: async (updatedProject: Project) => {
+    onMutate: async (updatedProject, work) => {
       await queryClient.cancelQueries({
         queryKey: queryKeys.project.byId(projectId)
       });
+      work.check();
 
       queryClient.setQueryData(
         queryKeys.project.byId(projectId),

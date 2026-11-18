@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const desktopApi = vi.hoisted(() => ({ createProject: vi.fn() }));
 
 vi.mock("@/platform/localDesktop", () => ({
+  isLocalApp: false,
   getLocalDesktopApi: () => ({
     projects: { create: desktopApi.createProject }
   })
@@ -56,6 +57,30 @@ describe("createLocalFolderDummyProjectOnce", () => {
     await expect(createLocalFolderDummyProjectOnce("local")).resolves.toEqual(
       expect.objectContaining({ id: "folder-project" })
     );
+    expect(desktopApi.createProject).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not reuse a successful folder project in the replacement library", async () => {
+    desktopApi.createProject
+      .mockResolvedValueOnce(createdFolderDummyProject)
+      .mockResolvedValueOnce({
+        ...createdFolderDummyProject,
+        id: "replacement-folder"
+      });
+    const create = await loadCreateLocalFolderDummyProjectOnce();
+    const { rendererLibrary } = await import("@/platform/rendererLibraryWork");
+    const original = rendererLibrary.capture();
+    await expect(create("local", original)).resolves.toMatchObject({
+      id: "folder-project"
+    });
+    await rendererLibrary.suspend();
+    rendererLibrary.reset();
+    await expect(create("local", original)).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await expect(create("local")).resolves.toMatchObject({
+      id: "replacement-folder"
+    });
     expect(desktopApi.createProject).toHaveBeenCalledTimes(2);
   });
 });

@@ -1,6 +1,7 @@
 import { deleteTimeline } from "@domains/shot/deleteTimeline";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { useProjectShotFolders } from "./shotFolders/useProjectShotFolders";
@@ -29,6 +30,8 @@ export const useDeleteShotItem = (projectId: string | undefined) => {
     itemId: string,
     options?: DeleteShotItemOptions
   ): Promise<DeleteShotItemResult> => {
+    const work = rendererLibrary.capture();
+    work.check();
     const allItems = data?.shotFoldersAndShots ?? [];
     const item = allItems.find((i) => i.id === itemId);
     if (!item) {
@@ -52,14 +55,16 @@ export const useDeleteShotItem = (projectId: string | undefined) => {
     const updated = allItems.filter((i) => !idsToRemove.has(i.id));
 
     try {
-      await updateShotFolders(updated);
+      await updateShotFolders(updated, work);
     } catch {
+      work.check();
       return { allShotDeletesSucceeded: false, willEmptyProject };
     }
 
     const results = await Promise.allSettled(
-      shotIdsToDelete.map((id) => deleteTimeline(id, projectId))
+      shotIdsToDelete.map((id) => deleteTimeline(id, projectId, work))
     );
+    work.check();
     const allShotDeletesSucceeded = results.every(
       (r) => r.status === "fulfilled"
     );
@@ -71,13 +76,15 @@ export const useDeleteShotItem = (projectId: string | undefined) => {
       !options?.skipProjectDelete
     ) {
       try {
-        await deleteProject({ projectId });
+        await deleteProject({ projectId }, work);
       } catch {}
     }
 
+    work.check();
     await queryClient.invalidateQueries({
       queryKey: queryKeys.project.byId(projectId)
     });
+    work.check();
 
     return { allShotDeletesSucceeded, willEmptyProject };
   };

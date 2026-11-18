@@ -1,9 +1,6 @@
 import { useProject } from "@domains/project/useProject";
 import { useUpdateProject } from "@domains/project/useUpdateProject";
-import {
-  ProjectUpdateVariables,
-  applyProjectUpdateToCache
-} from "@domains/project/utils/applyProjectUpdateToCache";
+import { applyProjectUpdateToCache } from "@domains/project/utils/applyProjectUpdateToCache";
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -22,10 +19,11 @@ export const useSaveProjectSettingsPatch = (projectId: string | undefined) => {
     mutateAsync: updateProjectAsync,
     isPending: isSavingProjectSettings
   } = useUpdateProject({
-    onMutate: async (variables: ProjectUpdateVariables) => {
+    onMutate: async (variables, work) => {
       await queryClient.cancelQueries({
         queryKey: queryKeys.project.byId(variables.projectId)
       });
+      work.check();
 
       const previousProject = queryClient.getQueryData<Project>(
         queryKeys.project.byId(variables.projectId)
@@ -40,8 +38,7 @@ export const useSaveProjectSettingsPatch = (projectId: string | undefined) => {
       return { previousProject };
     },
     onError: (_error, variables, context) => {
-      const { previousProject } =
-        (context as { previousProject?: Project } | undefined) ?? {};
+      const previousProject = context?.previousProject;
 
       queryClient.setQueryData(
         queryKeys.project.byId(variables.projectId),

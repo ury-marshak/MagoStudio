@@ -21,6 +21,8 @@ import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 import { pruneDescendantsFromSelection } from "../ProjectModal/utils/pruneDescendantsFromSelection";
 import { ProjectPreviewImage } from "../ProjectPreviewImage";
 import { TreeRowDragPreview } from "../shared/TreeRowDragPreview";
@@ -68,15 +70,19 @@ export const AllProjectsProjectItem: React.FC<Props> = ({
   const [isEditing, setIsEditing] = useState(false);
 
   const handleRenameProject = async (newName: string) => {
-    const fullProject = await fetchProject(project.id);
+    const work = rendererLibrary.capture();
+    const fullProject = await fetchProject(project.id, work);
     if (!fullProject) return;
-    await updateProject({
-      projectId: project.id,
-      projectName: newName,
-      projectDescription: fullProject.description,
-      settings: fullProject.settings,
-      settingsPatch: {}
-    });
+    await updateProject(
+      {
+        projectId: project.id,
+        projectName: newName,
+        projectDescription: fullProject.description,
+        settings: fullProject.settings,
+        settingsPatch: {}
+      },
+      work
+    );
   };
 
   useMountEffect(() => {

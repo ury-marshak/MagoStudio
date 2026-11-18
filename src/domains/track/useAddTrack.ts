@@ -8,6 +8,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useAtomValue, useSetAtom } from "jotai";
 
 import { usePostTrack } from "@/domains/track/data/usePostTrack";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 import { videoRenderTarget } from "@/platform/renderTarget";
 import { queryKeys } from "@/queryKeys";
 
@@ -42,11 +43,15 @@ export const useAddTrack = () => {
   const { inputTrack } = useInputTrack();
   const { selectedModelAtom } = useRenderSettingsAtoms();
   const selectedModel = useAtomValue(selectedModelAtom);
-  const addTrack = async (options?: {
-    parentTrackOrder?: number;
-    shotIdOverride?: string;
-    shotNameWhenMissingFromCache?: string;
-  }) => {
+  const addTrack = async (
+    options?: {
+      parentTrackOrder?: number;
+      shotIdOverride?: string;
+      shotNameWhenMissingFromCache?: string;
+    },
+    work = rendererLibrary.capture()
+  ) => {
+    work.check();
     const targetShotId = options?.shotIdOverride ?? selectedShotId;
     if (!targetShotId || !selectedProjectId || !selectedProject) return;
 
@@ -78,14 +83,18 @@ export const useAddTrack = () => {
 
     const isOutputOfLocalProviderRender =
       videoRenderTarget(selectedModel.name) === "local";
-    const newTrack = await addTrackMutation({
-      shotId: targetShotId,
-      trackType: LayerType.RENDER,
-      trackName,
-      data: { renderEngine: "magov2" },
-      parentTrackOrder: options?.parentTrackOrder ?? 1,
-      isOutputOfLocalProviderRender
-    });
+    const newTrack = await addTrackMutation(
+      {
+        shotId: targetShotId,
+        trackType: LayerType.RENDER,
+        trackName,
+        data: { renderEngine: "magov2" },
+        parentTrackOrder: options?.parentTrackOrder ?? 1,
+        isOutputOfLocalProviderRender
+      },
+      work
+    );
+    work.check();
 
     trackingUtils.trackActions.create(
       newTrack.id,
@@ -102,6 +111,7 @@ export const useAddTrack = () => {
     });
 
     await new Promise((resolve) => setTimeout(resolve, STATE_SYNC_DELAY));
+    work.check();
 
     if (isWritingToSelectedShot) {
       setIsTrackSettingsDrawerOpen(true);
