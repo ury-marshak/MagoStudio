@@ -24,7 +24,8 @@ vi.mock("node:child_process", async () => {
     spawn: (_executable: string, args: string[]) => {
       ffmpegInvocations.push(args);
       const child = Object.assign(new EventEmitter(), {
-        stderr: new EventEmitter()
+        stderr: new EventEmitter(),
+        kill: vi.fn()
       });
       const outputPath = args[args.length - 1]!;
       const trimStartIndex = args.indexOf("-ss");
@@ -35,9 +36,10 @@ vi.mock("node:child_process", async () => {
         trimDurationSeconds:
           trimDurationIndex === -1 ? null : args[trimDurationIndex + 1]
       });
-      void writeEncodedFile(outputPath, encodedTrimDescription).then(() =>
-        child.emit("exit", 0)
-      );
+      void writeEncodedFile(outputPath, encodedTrimDescription).then(() => {
+        child.emit("exit", 0);
+        child.emit("close", 0);
+      });
       return child;
     }
   };
@@ -174,5 +176,21 @@ describe("UploadService.prepare", () => {
     const prepared = await uploads.prepare({ assetId: "asset", sourcePath });
 
     expect(prepared.encoded).toBe(true);
+  });
+
+  it("serializes equivalent cache writers and still honors a later force request", async () => {
+    const uploads = makeUploadService();
+    const input = { assetId: "asset", sourcePath, trimEndSeconds: 3 };
+    const [encoded, reused] = await Promise.all([
+      uploads.prepare(input),
+      uploads.prepare(input)
+    ]);
+    expect(encoded.encoded).toBe(true);
+    expect(reused).toEqual({ ...encoded, encoded: false });
+    expect(ffmpegInvocations).toHaveLength(1);
+    await expect(uploads.prepare({ ...input, force: true })).resolves.toEqual(
+      encoded
+    );
+    expect(ffmpegInvocations).toHaveLength(2);
   });
 });

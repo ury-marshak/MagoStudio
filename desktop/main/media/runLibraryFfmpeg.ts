@@ -9,7 +9,8 @@ export const runLibraryFfmpeg = (
   executable: string,
   args: string[],
   signal: AbortSignal | undefined,
-  message: string
+  message: string,
+  timeoutMs: number | null = TIMEOUT_MS
 ): Promise<void> =>
   new Promise((resolve, reject) => {
     signal?.throwIfAborted();
@@ -25,10 +26,10 @@ export const runLibraryFfmpeg = (
       child.kill("SIGKILL");
     };
     const abort = () => fail(signal?.reason);
-    const timer = setTimeout(
-      () => fail(new Error(`Timed out: ${message}`)),
-      TIMEOUT_MS
-    );
+    const timer =
+      timeoutMs === null
+        ? undefined
+        : setTimeout(() => fail(new Error(`Timed out: ${message}`)), timeoutMs);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     child.stderr.on("data", (chunk: Buffer) => {

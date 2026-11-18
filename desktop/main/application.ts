@@ -531,6 +531,7 @@ void app
           vlmService.suspend(),
           videoFrameService.libraryWork.suspend(),
           cloudRenderSubmitService.libraryWork.suspend(),
+          uploadService.libraryWork.suspend(),
           cloudLinkRepository.libraryWork.suspend(),
           cloudRenderJobRepository.libraryWork.suspend(),
           cloudProjectMirrorRepository.libraryWork.suspend(),
@@ -547,6 +548,7 @@ void app
         vlmService.reset();
         videoFrameService.libraryWork.reset();
         cloudRenderSubmitService.libraryWork.reset();
+        uploadService.libraryWork.reset();
         cloudLinkRepository.libraryWork.reset();
         cloudRenderJobRepository.libraryWork.reset();
         cloudProjectMirrorRepository.libraryWork.reset();
@@ -614,6 +616,7 @@ app.on("before-quit", () => {
   vlmService.stop();
   videoFrameService.libraryWork.stop();
   cloudRenderSubmitService.libraryWork.stop();
+  uploadService.libraryWork.stop();
   cloudLinkRepository.libraryWork.stop();
   cloudRenderJobRepository.libraryWork.stop();
   cloudProjectMirrorRepository.libraryWork.stop();

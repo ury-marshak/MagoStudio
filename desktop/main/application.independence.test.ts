@@ -197,6 +197,8 @@ it.each(["fal", "text", "vision"])(
         name: "Fixture",
         type: "image",
         sourcePath: path.join(library, "missing.png"),
+        width: 640,
+        height: 480,
         status: "INQUEUE"
       });
       await db.insert(clips).values({
@@ -283,7 +285,7 @@ it.each(["fal", "text", "vision"])(
         },
         ...args
       );
-    for (const [channel, args] of [
+    const uploadRequests: Array<[string, unknown[]]> = [
       [IPC_CHANNELS.cloudPrepareUpload, [{ assetId: "asset" }]],
       [
         IPC_CHANNELS.cloudUploadPrepared,
@@ -303,7 +305,10 @@ it.each(["fal", "text", "vision"])(
       [
         IPC_CHANNELS.cloudUploadAsset,
         [{ assetId: "asset", presignedUrl: "https://upload.invalid/" }]
-      ],
+      ]
+    ];
+    for (const [channel, args] of [
+      ...uploadRequests,
       [IPC_CHANNELS.cloudRenderRegister, [{}]],
       [IPC_CHANNELS.cloudImageRenderRegister, [{}]],
       [
@@ -331,6 +336,16 @@ it.each(["fal", "text", "vision"])(
         "explicit cloud account"
       );
     }
+    await expect(
+      invoke(IPC_CHANNELS.cloudAssetInfo, "asset")
+    ).resolves.toMatchObject({
+      id: "asset",
+      name: "Fixture",
+      width: 640
+    });
+    await expect(
+      invoke(IPC_CHANNELS.cloudCancelUploadBytes, "bytes")
+    ).resolves.toBeUndefined();
     await invoke(IPC_CHANNELS.scriptProjectsPut, {
       projectId: "cloud-history",
       state: {
@@ -387,6 +402,8 @@ it.each(["fal", "text", "vision"])(
       name: "Reused",
       type: "image",
       sourcePath: replacementMedia,
+      width: 1280,
+      height: 720,
       status: "available"
     });
     seed.close();
@@ -403,6 +420,16 @@ it.each(["fal", "text", "vision"])(
       new Request("mago-media://asset/asset")
     );
     expect(await replacementBody.text()).toBe("replacement local bytes");
+    await expect(
+      invoke(IPC_CHANNELS.cloudAssetInfo, "asset")
+    ).resolves.toMatchObject({
+      id: "asset",
+      name: "Reused",
+      width: 1280
+    });
+    await expect(
+      invoke(IPC_CHANNELS.cloudCancelUploadBytes, "bytes")
+    ).resolves.toBeUndefined();
     await expect(
       invoke(IPC_CHANNELS.vlmSaveAutoPrompt, {
         assetId: "asset",
@@ -484,6 +511,9 @@ it.each(["fal", "text", "vision"])(
       })
     ).rejects.toThrow();
     for (const [channel, args] of [
+      ...uploadRequests,
+      [IPC_CHANNELS.cloudAssetInfo, ["asset"]],
+      [IPC_CHANNELS.cloudCancelUploadBytes, ["bytes"]],
       [IPC_CHANNELS.projectsMirrorCloud, [{ project: { id: "asset" } }]],
       [
         IPC_CHANNELS.projectsCacheCloudAsset,

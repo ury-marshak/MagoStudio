@@ -1,17 +1,13 @@
+import type { EventEmitter } from "node:events";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
+import type { ClientRequest, IncomingMessage } from "node:http";
 import https, { Agent } from "node:https";
 import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
-/**
- * Streams a prepared file to a presigned S3 URL.
- *
- * The upload runs in the main process because that is where the file is: the
- * renderer never sees a native path, and streaming avoids holding a multi-
- * hundred-megabyte video in memory. S3 credentials are never involved — the
- * presigned URL arrives from the backend over the authenticated API.
- */
-
+/** Main-process streaming keeps native paths out of the renderer and avoids
+ * holding a large video in memory. The renderer supplies its presigned URL. */
 const HTTP_OK_MIN = 200;
 const HTTP_OK_MAX = 300;
 const ERROR_BODY_LIMIT = 500;
@@ -21,16 +17,12 @@ export interface PresignedUploadRequest {
   presignedUrl: string;
   contentType: string;
   onProgress?: (fraction: number) => void;
+  signal?: AbortSignal;
   /** Test seam: lets an integration test trust a local self-signed listener. */
   agent?: Agent;
   assertAccess?: () => Promise<void>;
 }
 
-/**
- * Rejects anything that is not a plain https URL. A presigned URL always is,
- * and this keeps a malformed or hostile value from turning into a request to
- * somewhere unintended.
- */
 export const assertUploadUrl = (value: string): URL => {
   let url: URL;
   try {
@@ -48,34 +40,35 @@ export const uploadHeaders = (
   contentType: string,
   sizeBytes: number
 ): Record<string, string | number> => ({
-  // Both are part of what S3 expects for a presigned PUT; omitting the length
-  // makes undici fall back to chunked encoding, which S3 rejects.
+  // The presigned PUT requires a declared length, not chunked encoding.
   "content-type": contentType,
   "content-length": sizeBytes
 });
 
+const cancellationError = () => new Error("The upload was cancelled");
+const checkCancelled = (signal?: AbortSignal) => {
+  if (signal?.aborted) throw cancellationError();
+};
+
 export const uploadFileToPresignedUrl = async (
   request: PresignedUploadRequest
 ): Promise<void> => {
+  checkCancelled(request.signal);
   const url = assertUploadUrl(request.presignedUrl);
   const { size } = await stat(request.filePath);
+  checkCancelled(request.signal);
   if (size === 0) throw new Error("Refusing to upload an empty file");
   await request.assertAccess?.();
+  checkCancelled(request.signal);
   await putToPresignedUrl({
+    ...request,
     url,
     size,
-    source: createReadStream(request.filePath),
-    contentType: request.contentType,
-    onProgress: request.onProgress,
-    agent: request.agent
+    source: createReadStream(request.filePath)
   });
 };
 
-/**
- * PUTs bytes the renderer already holds, e.g. a video the user just trimmed.
- * The renderer cannot PUT to S3 itself: its origin is not in the bucket's CORS
- * policy, and a main-process request is not subject to CORS at all.
- */
+/** PUTs bytes the renderer already holds, e.g. a video the user just trimmed. */
 export const uploadBytesToPresignedUrl = async (request: {
   bytes: Buffer;
   presignedUrl: string;
@@ -85,23 +78,27 @@ export const uploadBytesToPresignedUrl = async (request: {
   agent?: Agent;
   assertAccess?: () => Promise<void>;
 }): Promise<void> => {
+  checkCancelled(request.signal);
   const url = assertUploadUrl(request.presignedUrl);
   if (request.bytes.length === 0) {
     throw new Error("Refusing to upload an empty file");
   }
   await request.assertAccess?.();
+  checkCancelled(request.signal);
   await putToPresignedUrl({
+    ...request,
     url,
     size: request.bytes.length,
-    source: Readable.from([request.bytes]),
-    contentType: request.contentType,
-    onProgress: request.onProgress,
-    signal: request.signal,
-    agent: request.agent
+    source: Readable.from([request.bytes])
   });
 };
 
-const putToPresignedUrl = ({
+const waitForClose = (stream: EventEmitter): Promise<void> =>
+  new Promise((resolve) => stream.once("close", resolve));
+
+/** A response header, a stream error and destroy() do not release a file or
+ * a body. Wait through close on both success and cancellation. */
+const putToPresignedUrl = async ({
   url,
   size,
   source,
@@ -117,68 +114,104 @@ const putToPresignedUrl = ({
   onProgress?: (fraction: number) => void;
   signal?: AbortSignal;
   agent?: Agent;
-}): Promise<void> =>
-  new Promise<void>((resolve, reject) => {
-    if (signal?.aborted) {
-      source.destroy();
-      reject(new Error("The upload was cancelled"));
-      return;
+}): Promise<void> => {
+  let stopped = false;
+  let uploaded = 0;
+  const counter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      uploaded += chunk.length;
+      try {
+        if (!stopped && !signal?.aborted) onProgress?.(uploaded / size);
+      } catch (error) {
+        callback(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      callback(null, chunk);
     }
-    const outbound = https.request(
-      url,
-      {
-        method: "PUT",
-        headers: uploadHeaders(contentType, size),
-        agent
-      },
-      (response) => {
-        const status = response.statusCode ?? 0;
-        if (status >= HTTP_OK_MIN && status < HTTP_OK_MAX) {
-          response.resume();
-          resolve();
-          return;
-        }
-        let body = "";
-        response.on("data", (chunk: Buffer) => {
-          body = `${body}${chunk.toString()}`.slice(0, ERROR_BODY_LIMIT);
-        });
-        response.once("end", () =>
-          reject(
-            new Error(
-              `The upload was rejected with status ${status}${
-                body.trim() ? `: ${body.trim()}` : ""
-              }`
-            )
-          )
-        );
-      }
-    );
-
-    outbound.once("error", reject);
-
-    // Progress is counted in a pass-through rather than a "data" listener:
-    // attaching one alongside pipe() puts the stream into flowing mode twice
-    // and the read fails.
-    let uploaded = 0;
-    const counter = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        uploaded += chunk.length;
-        onProgress?.(uploaded / size);
-        callback(null, chunk);
-      }
-    });
-
-    const fail = (error: Error) => {
-      source.destroy();
-      outbound.destroy();
-      reject(error);
-    };
-    signal?.addEventListener(
-      "abort",
-      () => fail(new Error("The upload was cancelled")),
-      { once: true }
-    );
-    source.once("error", fail);
-    counter.once("error", fail);
-    source.pipe(counter).pipe(outbound);
   });
+  const sourceClosed = waitForClose(source);
+  const counterClosed = waitForClose(counter);
+  let outbound: ClientRequest | undefined;
+  let outboundClosed: Promise<void> | undefined;
+  let response: IncomingMessage | undefined;
+  let responseClosed: Promise<void> | undefined;
+  let rejectResponse!: (error: unknown) => void;
+  const responseDone = new Promise<void>((resolve, reject) => {
+    rejectResponse = reject;
+    // Also observe stream errors if request construction throws before pipeline.
+    source.on("error", reject);
+    checkCancelled(signal);
+    outbound = https.request(
+      url,
+      { method: "PUT", headers: uploadHeaders(contentType, size), agent },
+      (incoming) => {
+        response = incoming;
+        responseClosed = waitForClose(incoming);
+        const status = incoming.statusCode ?? 0;
+        const ok = status >= HTTP_OK_MIN && status < HTTP_OK_MAX;
+        let ended = false;
+        let body = "";
+        if (!ok) {
+          incoming.on("data", (chunk: Buffer) => {
+            body = `${body}${chunk.toString()}`.slice(0, ERROR_BODY_LIMIT);
+          });
+        }
+        incoming.on("error", reject);
+        incoming.once("end", () => {
+          ended = true;
+          if (ok) resolve();
+          else
+            reject(
+              new Error(
+                `The upload was rejected with status ${status}${body.trim() ? `: ${body.trim()}` : ""}`
+              )
+            );
+        });
+        incoming.once("close", () => {
+          if (!ended)
+            reject(new Error("The upload response closed before completion"));
+        });
+        if (stopped || signal?.aborted) incoming.destroy();
+        else incoming.resume();
+      }
+    );
+    outboundClosed = waitForClose(outbound);
+    outbound.on("error", reject);
+    outbound.once("close", () => {
+      if (!response) reject(new Error("The upload closed before a response"));
+    });
+  });
+  const stop = () => {
+    stopped = true;
+    source.destroy();
+    counter.destroy();
+    response?.destroy();
+    outbound?.destroy();
+  };
+  const abort = () => {
+    rejectResponse(cancellationError());
+    stop();
+  };
+  let sending: Promise<void> | undefined;
+  let completed = false;
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    if (signal?.aborted) abort();
+    if (!stopped && outbound) sending = pipeline(source, counter, outbound);
+    await Promise.all([responseDone, sending]);
+    completed = true;
+  } finally {
+    if (!completed) stop();
+    await Promise.allSettled([
+      sourceClosed,
+      counterClosed,
+      outboundClosed,
+      sending
+    ]);
+    // Node can deliver a response during abort/cleanup, but not after the
+    // request closes. Read this promise after draining the request itself.
+    await responseClosed;
+    signal?.removeEventListener("abort", abort);
+  }
+  checkCancelled(signal);
+};

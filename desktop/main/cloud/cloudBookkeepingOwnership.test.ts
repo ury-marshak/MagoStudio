@@ -43,7 +43,7 @@ import { LibraryWorkSession } from "../libraryWorkSession";
 import { CloudLinkRepository } from "./cloudLinkRepository";
 import { CloudRenderJobRepository } from "./cloudRenderJobRepository";
 import type { CloudRenderSubmitService } from "./cloudRenderSubmitService";
-import type { UploadService } from "./uploadService";
+import { UploadService } from "./uploadService";
 
 const deferred = <T = void>() => {
   let resolve!: (value: T) => void;
@@ -158,7 +158,7 @@ const fixture = async () => {
   registerCloudHandlers({
     links,
     renderJobs: jobs,
-    uploads: {} as UploadService,
+    uploads: new UploadService(settings.getLibraryRoot),
     repository: new ProjectRepository(manager, settings.getLibraryRoot),
     renderSubmits: {
       libraryWork: new LibraryWorkSession(() => undefined)

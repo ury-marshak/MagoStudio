@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Writable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
@@ -109,7 +109,7 @@ test("deliberate cloud choice permits a streamed file PUT, with exact fixture by
           callback();
         },
         final(callback) {
-          onResponse({ statusCode: 200, resume: vi.fn() });
+          onResponse(Object.assign(Readable.from([]), { statusCode: 200 }));
           callback();
         }
       })
@@ -139,3 +139,26 @@ test("account policy does not disable ordinary local upload-cache preparation", 
   ).toMatchObject({ filePath: cached, encoded: false });
   expect(mocks.request).not.toHaveBeenCalled();
 });
+
+test.each([uploadFileToPresignedUrl, uploadBytesToPresignedUrl])(
+  "%s refuses a PUT after cancellation during the dispatch permission wait",
+  async (upload) => {
+    const controller = new AbortController();
+    let release!: () => void;
+    const pending = upload({
+      ...uploadInput(),
+      bytes: Buffer.from("fixture"),
+      signal: controller.signal,
+      assertAccess: () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        })
+    });
+    const rejected = expect(pending).rejects.toThrow("cancelled");
+    await vi.waitFor(() => expect(release).toBeDefined());
+    controller.abort();
+    release();
+    await rejected;
+    expect(mocks.request).not.toHaveBeenCalled();
+  }
+);

@@ -49,7 +49,7 @@ import type { CloudLinkRepository } from "../cloud/cloudLinkRepository";
 import type { CloudRenderJobRepository } from "../cloud/cloudRenderJobRepository";
 import type { CloudRenderSubmitService } from "../cloud/cloudRenderSubmitService";
 import { requireCloudAccount } from "../cloud/requireCloudAccount";
-import type { UploadService } from "../cloud/uploadService";
+import { UploadService } from "../cloud/uploadService";
 import { fetchCloudStorageObject } from "../cloudStorage/fetchCloudStorageObject";
 import type { CloudProjectMirrorRepository } from "../database/cloudProjectMirrorRepository";
 import type { DatabaseManager } from "../database/databaseManager";
@@ -77,6 +77,7 @@ const invoke = (channel: string, ...args: unknown[]) =>
 let settings: LibrarySettings;
 let imageSession: AbortController;
 let renderWork: LibraryWorkSession<undefined>;
+let uploads: UploadService;
 const effects = {
   getLink: vi.fn(),
   putLink: vi.fn(),
@@ -122,6 +123,9 @@ beforeEach(async () => {
     relativePath: "output.mp4",
     sizeBytes: 3
   });
+  uploads = new UploadService(effects.root);
+  vi.spyOn(uploads, "prepare").mockImplementation(effects.prepare);
+  vi.spyOn(uploads, "upload").mockImplementation(effects.upload);
   registerCloudHandlers({
     links: {
       libraryWork: new LibraryWorkSession(() => undefined),
@@ -129,10 +133,7 @@ beforeEach(async () => {
       put: effects.putLink,
       patchData: effects.patchLink
     } as unknown as CloudLinkRepository,
-    uploads: {
-      prepare: effects.prepare,
-      upload: effects.upload
-    } as unknown as UploadService,
+    uploads,
     repository: {
       resolveMediaPath: effects.resolve
     } as unknown as ProjectRepository,
@@ -642,4 +643,35 @@ test("suspended ingestion refuses terminal failure and registration without new 
   expect(policy).not.toHaveBeenCalled();
   expect(effects.fail).not.toHaveBeenCalled();
   vi.restoreAllMocks();
+});
+
+test("stale upload progress cannot publish into the replacement with the same ID", async () => {
+  await settings.setAppMode("cloud");
+  let release!: () => void;
+  state.uploadBytes.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      })
+  );
+  const pending = invoke(IPC_CHANNELS.cloudUploadBytes, ...requests[2][1]);
+  const rejected = expect(pending).rejects.toThrow();
+  await vi.waitFor(() => expect(release).toBeDefined());
+  const old = state.uploadBytes.mock.calls[0][0];
+  const suspension = uploads.libraryWork.suspend();
+  old.onProgress(0.9);
+  expect(event.sender.send).not.toHaveBeenCalled();
+  release();
+  await suspension;
+  await rejected;
+  uploads.libraryWork.reset();
+  state.uploadBytes.mockImplementationOnce(async ({ onProgress }) =>
+    onProgress(1)
+  );
+  await invoke(IPC_CHANNELS.cloudUploadBytes, ...requests[2][1]);
+  old.onProgress(1);
+  expect(event.sender.send).toHaveBeenCalledExactlyOnceWith(
+    IPC_CHANNELS.cloudUploadProgress,
+    { assetId: "upload", fraction: 1 }
+  );
 });

@@ -37,18 +37,23 @@ const hasKnownDimensions = (
 
 const withProbedDimensions = async (
   info: LocalAssetInfo,
-  sourcePath: string | null
+  sourcePath: string | null,
+  signal?: AbortSignal
 ): Promise<LocalAssetInfo> => {
+  signal?.throwIfAborted();
   if (hasKnownDimensions(info.width, info.height) || !sourcePath) return info;
-  const probedDimensions = await probeImageDimensions(sourcePath);
+  const probedDimensions = await probeImageDimensions(sourcePath, signal);
+  signal?.throwIfAborted();
   return probedDimensions ? { ...info, ...probedDimensions } : info;
 };
 
 export const readLocalAssetInfo = async (
   manager: DatabaseManager,
   assetId: string,
-  options: { libraryRoot?: string | null } = {}
+  options: { libraryRoot?: string | null; signal?: AbortSignal } = {}
 ): Promise<LocalAssetInfo | null> => {
+  const { signal } = options;
+  signal?.throwIfAborted();
   if (!manager.isOpen()) return null;
   const [asset] = await manager
     .get()
@@ -56,8 +61,9 @@ export const readLocalAssetInfo = async (
     .from(assets)
     .where(eq(assets.id, assetId))
     .limit(1);
+  signal?.throwIfAborted();
   if (!asset) {
-    return readScriptProjectMediaInfo(manager, assetId, options.libraryRoot);
+    return readScriptProjectMediaInfo(manager, assetId, options);
   }
 
   const extension = path
@@ -76,7 +82,8 @@ export const readLocalAssetInfo = async (
       sizeBytes: asset.sizeBytes ?? null,
       frameCount: asset.frameCount ?? null
     },
-    asset.sourcePath || null
+    asset.sourcePath || null,
+    signal
   );
 };
 
@@ -96,20 +103,15 @@ const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp"]);
 const readScriptProjectMediaInfo = async (
   manager: DatabaseManager,
   mediaId: string,
-  libraryRoot: string | null | undefined
+  { libraryRoot, signal }: { libraryRoot?: string | null; signal?: AbortSignal }
 ): Promise<LocalAssetInfo | null> => {
-  const [media] = await manager
-    .get()
-    .select()
-    .from(scriptProjectMedia)
-    .where(eq(scriptProjectMedia.id, mediaId))
-    .limit(1);
+  const media = await readScriptProjectMedia(manager, mediaId, signal);
   if (!media) return null;
   const extension =
     path.extname(media.relativePath).replace(/^\./, "").toLowerCase() ||
     DEFAULT_IMAGE_EXTENSION;
   const sourcePath = libraryRoot
-    ? await resolveScriptProjectMediaPath(manager, libraryRoot, mediaId)
+    ? mediaPath(libraryRoot, media.relativePath)
     : null;
   return withProbedDimensions(
     {
@@ -122,16 +124,17 @@ const readScriptProjectMediaInfo = async (
       sizeBytes: null,
       frameCount: null
     },
-    sourcePath
+    sourcePath,
+    signal
   );
 };
 
-/** Where a script project's media lives, kept inside the library root. */
-export const resolveScriptProjectMediaPath = async (
+const readScriptProjectMedia = async (
   manager: DatabaseManager,
-  libraryRoot: string,
-  mediaId: string
-): Promise<string | null> => {
+  mediaId: string,
+  signal?: AbortSignal
+) => {
+  signal?.throwIfAborted();
   if (!manager.isOpen()) return null;
   const [media] = await manager
     .get()
@@ -139,8 +142,23 @@ export const resolveScriptProjectMediaPath = async (
     .from(scriptProjectMedia)
     .where(eq(scriptProjectMedia.id, mediaId))
     .limit(1);
-  if (!media) return null;
+  signal?.throwIfAborted();
+  return media ?? null;
+};
+
+/** Where a script project's media lives, kept inside the library root. */
+const mediaPath = (libraryRoot: string, relativePath: string) => {
   const root = path.resolve(libraryRoot);
-  const resolved = path.resolve(root, media.relativePath);
+  const resolved = path.resolve(root, relativePath);
   return resolved.startsWith(`${root}${path.sep}`) ? resolved : null;
+};
+
+export const resolveScriptProjectMediaPath = async (
+  manager: DatabaseManager,
+  libraryRoot: string,
+  mediaId: string,
+  signal?: AbortSignal
+): Promise<string | null> => {
+  const media = await readScriptProjectMedia(manager, mediaId, signal);
+  return media ? mediaPath(libraryRoot, media.relativePath) : null;
 };

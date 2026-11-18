@@ -27,35 +27,39 @@ export const parseFfmpegVideoStreamDimensions = (
 const ffmpegExecutablePath = (): string | null =>
   ffmpegPath ? ffmpegPath.replace("app.asar", "app.asar.unpacked") : null;
 
-export const probeImageDimensions = (
-  filePath: string
+export const probeImageDimensions = async (
+  filePath: string,
+  signal?: AbortSignal
 ): Promise<ImageDimensions | null> => {
+  signal?.throwIfAborted();
   const executablePath = ffmpegExecutablePath();
-  if (!executablePath) return Promise.resolve(null);
-  return new Promise((resolve) => {
+  if (!executablePath) return null;
+  return new Promise((resolve, reject) => {
     const child = spawn(executablePath, ["-hide_banner", "-i", filePath], {
       windowsHide: true,
       stdio: ["ignore", "ignore", "pipe"]
     });
     let probeOutput = "";
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(parseFfmpegVideoStreamDimensions(probeOutput));
+    const kill = () => {
+      if (!child.killed) child.kill("SIGKILL");
     };
-    const timer = setTimeout(() => {
-      child.kill();
-      finish();
-    }, FFMPEG_PROBE_TIMEOUT_MS);
+    const timer = setTimeout(kill, FFMPEG_PROBE_TIMEOUT_MS);
     child.stderr.on("data", (chunk: Buffer) => {
       probeOutput = `${probeOutput}${chunk.toString()}`.slice(
         0,
         MAX_PROBE_OUTPUT_LENGTH
       );
     });
-    child.once("error", finish);
-    child.once("close", finish);
+    // FFmpeg's probe-only invocation does not need a successful exit code.
+    // Spawn errors and timeouts still have to wait for stdio close.
+    child.on("error", () => {});
+    child.once("close", () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", kill);
+      if (signal?.aborted) reject(signal.reason);
+      else resolve(parseFfmpegVideoStreamDimensions(probeOutput));
+    });
+    signal?.addEventListener("abort", kill, { once: true });
+    if (signal?.aborted) kill();
   });
 };

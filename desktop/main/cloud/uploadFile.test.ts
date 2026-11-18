@@ -5,6 +5,7 @@
 // streams a real file over a real TLS connection -- runs in the node environment.
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import type { ServerResponse } from "node:http";
 import { createServer, Server } from "node:https";
 import { Agent } from "node:https";
 import { tmpdir } from "node:os";
@@ -29,6 +30,7 @@ const servers: Server[] = [];
 afterEach(async () => {
   for (const server of servers.splice(0)) {
     server.close();
+    server.closeAllConnections();
     await once(server, "close").catch(() => {});
   }
   await Promise.all(
@@ -48,11 +50,14 @@ const writeTemporaryFile = async (contents: string) => {
 
 /** A real TLS listener, using the app's own certificate generator. */
 const startReceiver = async (
-  handler: (received: {
-    method?: string;
-    headers: Record<string, unknown>;
-    body: Buffer;
-  }) => { status: number; body?: string }
+  handler: (
+    received: {
+      method?: string;
+      headers: Record<string, unknown>;
+      body: Buffer;
+    },
+    response: ServerResponse
+  ) => { status: number; body?: string } | void
 ) => {
   const { certificatePem, privateKeyPem } = generateSelfSignedCertificate({
     hostname: "localhost"
@@ -63,12 +68,15 @@ const startReceiver = async (
       const chunks: Buffer[] = [];
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
       request.once("end", () => {
-        const result = handler({
-          method: request.method,
-          headers: request.headers as Record<string, unknown>,
-          body: Buffer.concat(chunks)
-        });
-        response.writeHead(result.status).end(result.body ?? "");
+        const result = handler(
+          {
+            method: request.method,
+            headers: request.headers as Record<string, unknown>,
+            body: Buffer.concat(chunks)
+          },
+          response
+        );
+        if (result) response.writeHead(result.status).end(result.body ?? "");
       });
     }
   );
@@ -177,6 +185,36 @@ describe("uploadFileToPresignedUrl", () => {
         agent
       })
     ).rejects.toThrow(/status 403.*SignatureDoesNotMatch/s);
+  });
+
+  it("aborts a real TLS transfer while the response body is open", async () => {
+    const filePath = await writeTemporaryFile("fixture bytes");
+    let headersSent!: () => void;
+    const sent = new Promise<void>((resolve) => {
+      headersSent = resolve;
+    });
+    let socketClosed!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      socketClosed = resolve;
+    });
+    const { url, agent } = await startReceiver((_request, response) => {
+      response.once("close", socketClosed);
+      response.writeHead(200);
+      response.write("body pending", headersSent);
+    });
+    const controller = new AbortController();
+    const uploading = uploadFileToPresignedUrl({
+      filePath,
+      presignedUrl: url,
+      contentType: "video/mp4",
+      signal: controller.signal,
+      agent
+    });
+    const rejected = expect(uploading).rejects.toThrow("cancelled");
+    await sent;
+    controller.abort();
+    await rejected;
+    await closed;
   });
 
   it("refuses to upload an empty file", async () => {

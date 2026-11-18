@@ -1,5 +1,14 @@
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  utimes,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -109,5 +118,26 @@ describe("prepareCloudImageFile", () => {
     expect((await stat(prepared.filePath)).mtimeMs).toBe(
       firstConversion.mtimeMs
     );
+  });
+
+  it("does not replace a previous conversion with a failed encode or partial file", async () => {
+    const libraryRoot = await makeLibrary();
+    const sourcePath = path.join(libraryRoot, "broken.webp");
+    const cache = path.join(libraryRoot, "cloud", "images", "asset.png");
+    await mkdir(path.dirname(cache), { recursive: true });
+    await writeFile(cache, "previous conversion");
+    const stale = new Date(Date.now() - 60_000);
+    await utimes(cache, stale, stale);
+    await writeFile(sourcePath, "not an image");
+    await expect(
+      prepareCloudImageFile({
+        assetId: "asset",
+        sourcePath,
+        extension: "webp",
+        libraryRoot
+      })
+    ).rejects.toThrow("Unable to convert the image");
+    await expect(readFile(cache, "utf8")).resolves.toBe("previous conversion");
+    await expect(readdir(path.dirname(cache))).resolves.toEqual(["asset.png"]);
   });
 });

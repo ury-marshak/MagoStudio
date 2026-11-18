@@ -1,8 +1,7 @@
-import { ipcMain } from "electron";
+import { ipcMain, type IpcMainInvokeEvent } from "electron";
 
 import { resolveCloudConfig } from "../../shared/cloudConfig";
 import { IPC_CHANNELS } from "../../shared/contracts";
-import { prepareCloudImageFile } from "../cloud/cloudImageFile";
 import {
   CloudLinkKind,
   CloudLinkRepository
@@ -21,14 +20,11 @@ import {
 } from "../cloud/localAssetInfo";
 import { requireCloudAccount } from "../cloud/requireCloudAccount";
 import { toCloudImageOutputExtension } from "../cloud/toCloudImageOutputExtension";
-import {
-  uploadBytesToPresignedUrl,
-  uploadFileToPresignedUrl
-} from "../cloud/uploadFile";
 import { UploadService } from "../cloud/uploadService";
 import { DatabaseManager } from "../database/databaseManager";
 import { ProjectRepository } from "../database/projectRepository";
 import { LibrarySettings } from "../librarySettings";
+import type { LibraryWorkSession } from "../libraryWorkSession";
 
 import { requireTrustedSender } from "./trustedSender";
 
@@ -99,8 +95,8 @@ export const registerCloudHandlers = (options: {
       channel,
       renderWork.bind(async (...args) => handler(...args))
     );
-  const handleLocal = (
-    work: CloudLinkRepository["libraryWork"],
+  const handleLocal = <State>(
+    work: LibraryWorkSession<State>,
     channel: string,
     handler: Parameters<typeof ipcMain.handle>[1]
   ) =>
@@ -150,16 +146,40 @@ export const registerCloudHandlers = (options: {
     }
   );
 
-  ipcMain.handle(IPC_CHANNELS.cloudPrepareUpload, async (event, input) => {
-    requireTrustedSender(event);
-    await requireCloudAccount(options.settings);
-    const value = (input ?? {}) as Record<string, unknown>;
-    const assetId = requireId(value.assetId, "assetId");
-    // Resolved here rather than passed in, so the renderer never learns a path.
-    const sourcePath = await repository.resolveMediaPath("asset", assetId);
-    if (!sourcePath) throw new Error("The local asset could not be found");
+  const uploadWork = uploads.libraryWork;
+  const uploadRepository = uploadWork.guard(repository);
+  const handleUpload = (
+    channel: string,
+    handler: Parameters<typeof ipcMain.handle>[1]
+  ) => handleLocal(uploadWork, channel, handler);
 
-    const prepared = await uploads.prepare({
+  const assertUploadAccess = async () => {
+    uploadWork.capture();
+    await requireCloudAccount(options.settings);
+    uploadWork.capture();
+  };
+  const getUploadRoot = () => uploadWork.boundary(options.getLibraryRoot);
+  const progressFor =
+    (event: IpcMainInvokeEvent, assetId: string) => (fraction: number) => {
+      if (!event.sender.isDestroyed()) {
+        event.sender.send(IPC_CHANNELS.cloudUploadProgress, {
+          assetId,
+          fraction
+        });
+      }
+    };
+  const prepareVideo = async (
+    value: Record<string, unknown>,
+    assetId: string,
+    force?: boolean
+  ) => {
+    // Resolved here rather than passed in, so native paths stay in main.
+    const sourcePath = await uploadRepository.resolveMediaPath(
+      "asset",
+      assetId
+    );
+    if (!sourcePath) throw new Error("The local asset could not be found");
+    return uploads.prepare({
       assetId,
       sourcePath,
       trimStartSeconds: optionalSeconds(
@@ -167,126 +187,93 @@ export const registerCloudHandlers = (options: {
         "trimStartSeconds"
       ),
       trimEndSeconds: optionalSeconds(value.trimEndSeconds, "trimEndSeconds"),
-      force: value.force === true
+      force
     });
+  };
+
+  handleUpload(IPC_CHANNELS.cloudPrepareUpload, async (_event, input) => {
+    await assertUploadAccess();
+    const value = (input ?? {}) as Record<string, unknown>;
+    const prepared = await prepareVideo(
+      value,
+      requireId(value.assetId, "assetId"),
+      value.force === true
+    );
     return { sizeBytes: prepared.sizeBytes, encoded: prepared.encoded };
   });
 
-  ipcMain.handle(IPC_CHANNELS.cloudUploadPrepared, async (event, input) => {
-    requireTrustedSender(event);
-    await requireCloudAccount(options.settings);
+  handleUpload(IPC_CHANNELS.cloudUploadPrepared, async (event, input) => {
+    await assertUploadAccess();
     const value = (input ?? {}) as Record<string, unknown>;
     const assetId = requireId(value.assetId, "assetId");
     const presignedUrl = requireId(value.presignedUrl, "presignedUrl");
-    const sourcePath = await repository.resolveMediaPath("asset", assetId);
-    if (!sourcePath) throw new Error("The local asset could not be found");
-
     // Reuses the cached encode rather than re-encoding for the upload.
-    const prepared = await uploads.prepare({
-      assetId,
-      sourcePath,
-      trimStartSeconds: optionalSeconds(
-        value.trimStartSeconds,
-        "trimStartSeconds"
-      ),
-      trimEndSeconds: optionalSeconds(value.trimEndSeconds, "trimEndSeconds")
-    });
-    await requireCloudAccount(options.settings);
+    const prepared = await prepareVideo(value, assetId);
+    await assertUploadAccess();
     await uploads.upload({
-      assertAccess: () => requireCloudAccount(options.settings),
+      assertAccess: assertUploadAccess,
       filePath: prepared.filePath,
       presignedUrl,
-      onProgress: (fraction) => {
-        if (!event.sender.isDestroyed()) {
-          event.sender.send(IPC_CHANNELS.cloudUploadProgress, {
-            assetId,
-            fraction
-          });
-        }
-      }
+      onProgress: progressFor(event, assetId)
     });
   });
 
-  ipcMain.handle(IPC_CHANNELS.cloudAssetInfo, async (event, assetId) => {
-    requireTrustedSender(event);
-    const info = await readLocalAssetInfo(
-      options.databaseManager,
-      requireId(assetId, "assetId"),
-      { libraryRoot: await options.getLibraryRoot() }
+  handleUpload(IPC_CHANNELS.cloudAssetInfo, async (_event, input) => {
+    const assetId = requireId(input, "assetId");
+    const signal = uploadWork.signal;
+    const libraryRoot = await getUploadRoot();
+    const info = await uploadWork.boundary(() =>
+      readLocalAssetInfo(options.databaseManager, assetId, {
+        libraryRoot,
+        signal
+      })
     );
     if (!info) return null;
-    return {
-      id: info.id,
-      name: info.name,
-      extension: info.extension,
-      width: info.width,
-      height: info.height,
-      type: info.type,
-      frameCount: info.frameCount
-    };
+    const { id, name, extension, width, height, type, frameCount } = info;
+    return { id, name, extension, width, height, type, frameCount };
   });
 
-  const byteUploads = new Map<string, AbortController>();
-  ipcMain.handle(IPC_CHANNELS.cloudUploadBytes, async (event, input) => {
-    requireTrustedSender(event);
-    await requireCloudAccount(options.settings);
+  handleUpload(IPC_CHANNELS.cloudUploadBytes, async (event, input) => {
     const value = (input ?? {}) as Record<string, unknown>;
     const uploadId = requireId(value.uploadId, "uploadId");
-    const presignedUrl = requireId(value.presignedUrl, "presignedUrl");
-    const contentType = requireId(value.contentType, "contentType");
-    const bytes = requireBytes(value.bytes);
-    const controller = new AbortController();
-    byteUploads.get(uploadId)?.abort();
-    byteUploads.set(uploadId, controller);
-    try {
-      await uploadBytesToPresignedUrl({
-        assertAccess: () => requireCloudAccount(options.settings),
-        bytes,
-        presignedUrl,
-        contentType,
-        signal: controller.signal,
-        onProgress: (fraction) => {
-          if (!event.sender.isDestroyed()) {
-            event.sender.send(IPC_CHANNELS.cloudUploadProgress, {
-              assetId: uploadId,
-              fraction
-            });
-          }
-        }
-      });
-    } finally {
-      if (byteUploads.get(uploadId) === controller) {
-        byteUploads.delete(uploadId);
-      }
-    }
+    await uploads.uploadBytes(event.sender, {
+      uploadId,
+      bytes: requireBytes(value.bytes),
+      presignedUrl: requireId(value.presignedUrl, "presignedUrl"),
+      contentType: requireId(value.contentType, "contentType"),
+      assertAccess: assertUploadAccess,
+      onProgress: progressFor(event, uploadId)
+    });
   });
 
-  ipcMain.handle(
-    IPC_CHANNELS.cloudCancelUploadBytes,
-    async (event, uploadId: unknown) => {
-      requireTrustedSender(event);
-      byteUploads.get(requireId(uploadId, "uploadId"))?.abort();
-    }
-  );
+  handleUpload(IPC_CHANNELS.cloudCancelUploadBytes, async (event, input) => {
+    await uploads.cancelUploadBytes(event.sender, requireId(input, "uploadId"));
+  });
 
-  ipcMain.handle(IPC_CHANNELS.cloudUploadAsset, async (event, input) => {
-    requireTrustedSender(event);
-    await requireCloudAccount(options.settings);
+  handleUpload(IPC_CHANNELS.cloudUploadAsset, async (event, input) => {
+    await assertUploadAccess();
     const value = (input ?? {}) as Record<string, unknown>;
     const assetId = requireId(value.assetId, "assetId");
     const presignedUrl = requireId(value.presignedUrl, "presignedUrl");
+    const signal = uploadWork.signal;
+    // Drain each issued sibling even if the other read rejects first.
     const [libraryPath, info] = await Promise.all([
-      repository.resolveMediaPath("asset", assetId),
-      readLocalAssetInfo(options.databaseManager, assetId)
+      uploadRepository.resolveMediaPath("asset", assetId),
+      uploadWork.boundary(() =>
+        readLocalAssetInfo(options.databaseManager, assetId, { signal })
+      )
     ]);
-    const libraryRoot = libraryPath ? null : await options.getLibraryRoot();
+    const libraryRoot = libraryPath ? null : await getUploadRoot();
     const sourcePath =
       libraryPath ??
       (libraryRoot
-        ? await resolveScriptProjectMediaPath(
-            options.databaseManager,
-            libraryRoot,
-            assetId
+        ? await uploadWork.boundary(() =>
+            resolveScriptProjectMediaPath(
+              options.databaseManager,
+              libraryRoot,
+              assetId,
+              signal
+            )
           )
         : null);
     if (!sourcePath || !info) {
@@ -294,10 +281,10 @@ export const registerCloudHandlers = (options: {
     }
     const imageLibraryRoot =
       info.type.toUpperCase() === "IMAGE"
-        ? (libraryRoot ?? (await options.getLibraryRoot()))
+        ? (libraryRoot ?? (await getUploadRoot()))
         : null;
     const uploadFile = imageLibraryRoot
-      ? await prepareCloudImageFile({
+      ? await uploads.prepareImage({
           assetId,
           sourcePath,
           extension: info.extension,
@@ -307,20 +294,13 @@ export const registerCloudHandlers = (options: {
           filePath: sourcePath,
           contentType: contentTypeForExtension(info.extension)
         };
-    await requireCloudAccount(options.settings);
-    await uploadFileToPresignedUrl({
-      assertAccess: () => requireCloudAccount(options.settings),
+    await assertUploadAccess();
+    await uploads.upload({
+      assertAccess: assertUploadAccess,
       filePath: uploadFile.filePath,
       presignedUrl,
       contentType: uploadFile.contentType,
-      onProgress: (fraction) => {
-        if (!event.sender.isDestroyed()) {
-          event.sender.send(IPC_CHANNELS.cloudUploadProgress, {
-            assetId,
-            fraction
-          });
-        }
-      }
+      onProgress: progressFor(event, assetId)
     });
   });
 
