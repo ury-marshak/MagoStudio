@@ -1,6 +1,7 @@
 import { isCloudProject } from "@domains/shot/utils/isCloudProject";
 
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 import { alignFrameRangeDerivedSettings } from "./alignFrameRangeDerivedSettings";
 import { clampFrameRange } from "./clampFrameRange";
@@ -8,6 +9,7 @@ import { createCloudOutputLayer } from "./createCloudOutputLayer";
 import { deleteCloudLayer } from "./deleteCloudLayer";
 import { findCloudRenderAssetId } from "./findCloudRenderAssetId";
 import {
+  bindCloudApiToLibrary,
   CloudApi,
   ensureCloudImageAsset,
   ensureMirroredShot,
@@ -66,26 +68,33 @@ const bridge = () => getLocalDesktopApi();
 export const submitCloudRender = async (
   api: CloudApi,
   input: SubmitCloudRenderInput,
-  removeCloudLayer: (cloudLayerId: string) => Promise<void> = deleteCloudLayer
+  removeCloudLayer?: (cloudLayerId: string) => Promise<void>,
+  work = rendererLibrary.capture()
 ): Promise<{ jobId: string; cloudAssetId: string }> => {
-  const mirrored = await ensureMirroredShot(api, {
-    localProjectId: input.local.projectId,
-    projectName: input.local.projectName,
-    localShotId: input.local.shotId,
-    shotName: input.local.shotName,
-    localAssetId: input.local.assetId,
-    assetName: input.local.assetName,
-    trimStartSeconds: input.local.trimStartSeconds,
-    trimEndSeconds: input.local.trimEndSeconds,
-    onProgress: input.onProgress
-  });
+  const mirrored = await ensureMirroredShot(
+    api,
+    {
+      localProjectId: input.local.projectId,
+      projectName: input.local.projectName,
+      localShotId: input.local.shotId,
+      shotName: input.local.shotName,
+      localAssetId: input.local.assetId,
+      assetName: input.local.assetName,
+      trimStartSeconds: input.local.trimStartSeconds,
+      trimEndSeconds: input.local.trimEndSeconds,
+      onProgress: input.onProgress
+    },
+    work
+  );
   if (!mirrored.cloudLayerId) {
     throw new Error("The uploaded video has no cloud layer to render from");
   }
 
   // The cloud renderer rejects a range that runs past the last frame, unlike the
   // local ones, and reports nothing about why. Clamp to the frames that exist.
-  const sourceInfo = await bridge().cloud.assetInfo(input.local.assetId);
+  const sourceInfo = await work.boundary(() =>
+    bridge().cloud.assetInfo(input.local.assetId)
+  );
   const { range: frameRange, clamped: isFrameRangeClampedToSource } =
     clampFrameRange(input.frameRange, sourceInfo?.frameCount);
   const requestedRenderSettings = input.payload.render_settings.magov2;
@@ -104,25 +113,38 @@ export const submitCloudRender = async (
   const sources = await mirrorSourceImages(
     { ...(input.payload.sources as SourcesPayload) },
     (localAssetId) =>
-      ensureCloudImageAsset(api, localAssetId, mirrored.cloudProjectId)
+      ensureCloudImageAsset(
+        api,
+        localAssetId,
+        mirrored.cloudProjectId,
+        undefined,
+        work
+      )
   );
 
-  const isOutputLayerAlreadyInCloud = await isCloudProject(
-    input.local.projectId
+  const isOutputLayerAlreadyInCloud = await work.boundary(() =>
+    isCloudProject(input.local.projectId)
   );
   const outputLayerId = isOutputLayerAlreadyInCloud
     ? input.local.outputTrackId
-    : await createCloudOutputLayer(api, {
-        localOutputTrackId: input.local.outputTrackId,
-        shotName: input.local.shotName,
-        cloudTimelineId: mirrored.cloudTimelineId,
-        cloudSourceLayerId: mirrored.cloudLayerId
-      });
+    : await createCloudOutputLayer(
+        api,
+        {
+          localOutputTrackId: input.local.outputTrackId,
+          shotName: input.local.shotName,
+          cloudTimelineId: mirrored.cloudTimelineId,
+          cloudSourceLayerId: mirrored.cloudLayerId
+        },
+        work
+      );
   const removeOutputLayerCreatedHere = isOutputLayerAlreadyInCloud
     ? async () => undefined
-    : () => removeCloudLayer(outputLayerId);
+    : () =>
+        removeCloudLayer
+          ? removeCloudLayer(outputLayerId)
+          : deleteCloudLayer(outputLayerId, work);
 
-  const submitted = await api
+  const submitted = await bindCloudApiToLibrary(api, work)
     .post<unknown>("/assets/add_render", {
       ...input.payload,
       parent_layer_id: outputLayerId,
@@ -137,7 +159,11 @@ export const submitCloudRender = async (
       sources: { ...sources, video: mirrored.cloudLayerId }
     })
     .catch(async (submitError: unknown) => {
+      // The provider may already have accepted this POST. Library teardown
+      // neither deletes its output layer nor tries to submit it again.
+      work.check();
       await removeOutputLayerCreatedHere().catch(() => undefined);
+      work.check();
       throw submitError;
     });
   const cloudAssetId = findCloudRenderAssetId(submitted);
@@ -145,17 +171,19 @@ export const submitCloudRender = async (
     throw new Error("Cloud Mago did not return a render output asset");
   }
 
-  const registered = await bridge().cloud.renders.register({
-    outputTrackId: input.local.outputTrackId,
-    sourceAssetId: input.local.assetId,
-    model: input.model,
-    frameRange,
-    fps: input.fps,
-    cloudAssetId,
-    cloudOutputLayerId: outputLayerId,
-    settings: renderSettings,
-    sources: { ...(input.payload.sources as SourcesPayload) }
-  });
+  const registered = await work.boundary(() =>
+    bridge().cloud.renders.register({
+      outputTrackId: input.local.outputTrackId,
+      sourceAssetId: input.local.assetId,
+      model: input.model,
+      frameRange,
+      fps: input.fps,
+      cloudAssetId,
+      cloudOutputLayerId: outputLayerId,
+      settings: renderSettings,
+      sources: { ...(input.payload.sources as SourcesPayload) }
+    })
+  );
 
   return { jobId: registered.jobId, cloudAssetId };
 };

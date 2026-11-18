@@ -21,15 +21,23 @@ type PublishVideoIngestionJobResponse =
   | PublishVideoIngestionJobSuccess
   | PublishVideoIngestionJobError;
 
-const publishVideoIngestionJob = async (
-  assetId: string
-): Promise<PublishVideoIngestionJobResponse> => {
+const publishVideoIngestionJob = async ({
+  assetId,
+  signal
+}: {
+  assetId: string;
+  signal?: AbortSignal;
+}): Promise<PublishVideoIngestionJobResponse> => {
   try {
+    signal?.throwIfAborted();
     const response = await backendApiClient.post(
-      `/assets/${assetId}/ingestion`
+      `/assets/${assetId}/ingestion`,
+      undefined,
+      { signal }
     );
     return response.data;
   } catch (error) {
+    signal?.throwIfAborted();
     if (error instanceof AxiosError) {
       if (error.response?.status === HTTP_STATUS_BAD_REQUEST) {
         return { error: "Invalid asset type" };

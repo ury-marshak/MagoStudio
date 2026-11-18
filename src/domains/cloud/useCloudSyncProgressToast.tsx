@@ -3,6 +3,8 @@ import { useToast } from "@store/useToast";
 import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+
 import { MirrorProgress } from "./mirrorService";
 
 type MirrorStep = Parameters<MirrorProgress>[0];
@@ -25,16 +27,16 @@ export const useCloudSyncProgressToast = () => {
   const { showToast, updateToast, hideToast } = useToast();
   const toastIdRef = useRef<string | null>(null);
 
-  const dismiss = () => {
-    if (toastIdRef.current) {
-      hideToast(toastIdRef.current);
-      toastIdRef.current = null;
+  const dismissToast = (toast: { current: string | null }) => {
+    if (toast.current) {
+      hideToast(toast.current);
+      toast.current = null;
     }
   };
 
-  const onProgress: MirrorProgress = (step) => {
+  const showStep = (toast: { current: string | null }, step: MirrorStep) => {
     if (step === "done") {
-      dismiss();
+      dismissToast(toast);
       return;
     }
 
@@ -45,10 +47,10 @@ export const useCloudSyncProgressToast = () => {
       </div>
     );
 
-    if (toastIdRef.current) {
-      updateToast(toastIdRef.current, { message });
+    if (toast.current) {
+      updateToast(toast.current, { message });
     } else {
-      toastIdRef.current = showToast({
+      toast.current = showToast({
         message,
         showTimer: false,
         autoDismiss: false
@@ -56,5 +58,25 @@ export const useCloudSyncProgressToast = () => {
     }
   };
 
-  return { onProgress, dismiss };
+  const begin = (work: RendererLibraryWork) => {
+    // Each attempt owns only its own toast (including late finally callbacks).
+    const toast: { current: string | null } = { current: null };
+    let finished = false;
+    const dismiss = () => {
+      finished = true;
+      work.signal.removeEventListener("abort", dismiss);
+      dismissToast(toast);
+    };
+    work.signal.addEventListener("abort", dismiss, { once: true });
+    const onProgress: MirrorProgress = (step) => {
+      if (!finished && !work.signal.aborted) showStep(toast, step);
+    };
+    return { dismiss, onProgress };
+  };
+
+  return {
+    begin,
+    onProgress: (step: MirrorStep) => showStep(toastIdRef, step),
+    dismiss: () => dismissToast(toastIdRef)
+  };
 };

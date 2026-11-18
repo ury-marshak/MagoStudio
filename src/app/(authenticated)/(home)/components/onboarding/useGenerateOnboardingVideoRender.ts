@@ -13,9 +13,12 @@ import { useToast } from "@store/useToast";
 import { useAtomValue } from "jotai";
 import { useTranslation } from "react-i18next";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { useSubmitVideoRender } from "../SettingsEditor/hooks/useSubmitVideoRender";
 
 export const useGenerateOnboardingVideoRender = () => {
+  const { work } = useRendererLibraryWork();
   const { submitVideoRender } = useSubmitVideoRender();
   const { addTrack } = useAddTrack();
   const { showToast } = useToast();
@@ -48,13 +51,18 @@ export const useGenerateOnboardingVideoRender = () => {
     getInputVideoDimensions(sourceTrack);
 
   const generate = async (promptOverride?: string): Promise<boolean> => {
-    if (!selectedProjectId || !videoTrack) return false;
+    if (work.signal.aborted || !selectedProjectId || !videoTrack) return false;
     let track: Awaited<ReturnType<typeof addTrack>>;
     try {
-      track = await addTrack({
-        parentTrackOrder: sourceTrack?.layer_order
-      });
+      track = await addTrack(
+        {
+          parentTrackOrder: sourceTrack?.layer_order
+        },
+        work
+      );
+      work.check();
     } catch (error) {
+      if (work.signal.aborted) return false;
       console.error("Failed to create track:", error);
       showToast({
         message: t("notifications.failed_to_create_track.description")
@@ -71,19 +79,22 @@ export const useGenerateOnboardingVideoRender = () => {
       promptOverride === undefined
         ? renderSettingsValues
         : { ...renderSettingsValues, prompt: promptOverride };
-    return submitVideoRender({
-      layerId: track.id,
-      renderSettings,
-      range: renderRange,
-      sources,
-      model: selectedModel,
-      inputTrackId: inputTrackId || videoTrack.id,
-      inputVideoWidth,
-      inputVideoHeight,
-      fps,
-      isUnlimitedModeActive: false,
-      selectedProjectId
-    });
+    return submitVideoRender(
+      {
+        layerId: track.id,
+        renderSettings,
+        range: renderRange,
+        sources,
+        model: selectedModel,
+        inputTrackId: inputTrackId || videoTrack.id,
+        inputVideoWidth,
+        inputVideoHeight,
+        fps,
+        isUnlimitedModeActive: false,
+        selectedProjectId
+      },
+      work
+    );
   };
 
   return { generate };

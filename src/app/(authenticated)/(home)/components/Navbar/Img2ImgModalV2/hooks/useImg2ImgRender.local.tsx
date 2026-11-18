@@ -35,7 +35,12 @@ import { useRef } from "react";
 
 import { OPEN_CREDENTIALS_EVENT } from "@/platform/localDesktop";
 import { LocalImageModel } from "@/platform/localImageModels";
+import {
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 import { resolveImageRenderProvider } from "@/platform/renderTarget";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { getAdapter } from "../adapters";
@@ -49,6 +54,7 @@ import { resolveImg2ImgFrame } from "./utils/resolveImg2ImgFrame";
 
 export const useImg2ImgRender = (currentFrame: number) => {
   const queryClient = useQueryClient();
+  const { work } = useRendererLibraryWork();
   const isLocalDesktop = typeof window !== "undefined" && !!window.mago;
   const selectedProjectId = useSelectedProjectId();
   const { data: selectedProject } = useProject(selectedProjectId);
@@ -57,7 +63,9 @@ export const useImg2ImgRender = (currentFrame: number) => {
   const { isUnlimitedModeActive } = useIsUnlimitedModeActive();
   const isOnboardingActive = useIsOnboardingActive();
   const onboardingCapReached = useIsOnboardingImageCapReached();
-  const isOnboardingSubmittingRef = useRef(false);
+  const isOnboardingSubmittingRef = useRef<{
+    work: RendererLibraryWork;
+  } | null>(null);
   const { selectedShotId } = useSelectedShotId();
   const { data: selectedShot } = useSelectedShot();
   const { refreshRendersInProgressIfNeeded } = useRefreshRendersInProgress();
@@ -68,8 +76,7 @@ export const useImg2ImgRender = (currentFrame: number) => {
   });
   const { inputTrack } = useInputTrack();
   const { crop } = useShotCrop();
-  const { onProgress: onCloudSyncProgress, dismiss: dismissCloudSyncToast } =
-    useCloudSyncProgressToast();
+  const { begin } = useCloudSyncProgressToast();
 
   const videoAsset = getTrackAsset(inputTrack);
 
@@ -82,6 +89,7 @@ export const useImg2ImgRender = (currentFrame: number) => {
   const userCreditsCount = balanceData?.amount || 0;
 
   const submitRender = async (data: Img2ImgType) => {
+    if (work.signal.aborted) return;
     if (
       blockRenderWhileLocalSetupRuns(
         imageRenderPrecondition(data.model, { isLocalApp: isLocalDesktop }) ===
@@ -146,88 +154,99 @@ export const useImg2ImgRender = (currentFrame: number) => {
       return;
     }
 
+    const attempt = { work };
     if (isOnboardingActive) {
-      if (isOnboardingSubmittingRef.current) return;
-      isOnboardingSubmittingRef.current = true;
+      if (isOnboardingSubmittingRef.current?.work.signal === work.signal)
+        return;
+      isOnboardingSubmittingRef.current = attempt;
     }
+    const { onProgress, dismiss } = begin(work);
 
-    let inputImagePayload: Pick<
-      Img2ImgSettings,
-      "input_image_id" | "input_image"
-    >;
-    let didCropInputImage = false;
+    try {
+      await work.ready();
+      work.check();
+      let inputImagePayload: Pick<
+        Img2ImgSettings,
+        "input_image_id" | "input_image"
+      >;
+      let didCropInputImage = false;
 
-    if (frameType === "video") {
-      let inputImage = inputTrackFrameSrc || undefined;
-      if (hasDrawnMask && maskBaseFrameSrc && maskLayerDataUrl) {
-        inputImage = maskBaseFrameSrc;
-        try {
-          inputImage = await compositeMask(maskBaseFrameSrc, maskLayerDataUrl);
-        } catch (error) {
-          console.error(
-            "Mask compositing failed, using plain masked frame:",
-            error
+      if (frameType === "video") {
+        let inputImage = inputTrackFrameSrc || undefined;
+        if (hasDrawnMask && maskBaseFrameSrc && maskLayerDataUrl) {
+          inputImage = maskBaseFrameSrc;
+          try {
+            inputImage = await compositeMask(
+              maskBaseFrameSrc,
+              maskLayerDataUrl
+            );
+          } catch (error) {
+            work.check();
+            console.error(
+              "Mask compositing failed, using plain masked frame:",
+              error
+            );
+          }
+        }
+        work.check();
+        if (inputImage && isShotCroppedSectionOfInputVideo({ crop })) {
+          try {
+            inputImage = await cropImageToNormalizedRect({
+              imageSrc: inputImage,
+              crop: crop!
+            });
+            didCropInputImage = true;
+          } catch (error) {
+            work.check();
+            console.error("Frame crop failed, using full frame:", error);
+          }
+        }
+        work.check();
+        inputImagePayload = {
+          input_image: inputImage
+        };
+      } else {
+        if (iteratedAssetId) {
+          inputImagePayload = {
+            input_image_id: iteratedAssetId
+          };
+        } else if (uploadedImageId) {
+          inputImagePayload = {
+            input_image_id: uploadedImageId
+          };
+        } else {
+          throw new Error(
+            "Upload mode requires either an iterated or uploaded image"
           );
         }
       }
-      if (inputImage && isShotCroppedSectionOfInputVideo({ crop })) {
-        try {
-          inputImage = await cropImageToNormalizedRect({
-            imageSrc: inputImage,
-            crop: crop!
-          });
-          didCropInputImage = true;
-        } catch (error) {
-          console.error("Frame crop failed, using full frame:", error);
-        }
-      }
-      inputImagePayload = {
-        input_image: inputImage
+
+      const cropWireFields =
+        frameType === "video"
+          ? toCropWireFields({ crop, sourceWidth: width, sourceHeight: height })
+          : {};
+
+      const outputDimensions =
+        frameType === "video"
+          ? toCroppedOutputDimensions({
+              crop: didCropInputImage ? crop : undefined,
+              sourceWidth: width,
+              sourceHeight: height
+            })
+          : { width, height };
+
+      const settings: Img2ImgSettings = {
+        ...restDataWithoutImages,
+        render_model: model,
+        reference_images: referenceImages,
+        prompt: data.prompt,
+        width: outputDimensions.width,
+        height: outputDimensions.height,
+        ...adapter.buildSettings(data),
+        ...cropWireFields,
+        ...inputImagePayload
       };
-    } else {
-      if (iteratedAssetId) {
-        inputImagePayload = {
-          input_image_id: iteratedAssetId
-        };
-      } else if (uploadedImageId) {
-        inputImagePayload = {
-          input_image_id: uploadedImageId
-        };
-      } else {
-        isOnboardingSubmittingRef.current = false;
-        throw new Error(
-          "Upload mode requires either an iterated or uploaded image"
-        );
-      }
-    }
 
-    const cropWireFields =
-      frameType === "video"
-        ? toCropWireFields({ crop, sourceWidth: width, sourceHeight: height })
-        : {};
-
-    const outputDimensions =
-      frameType === "video"
-        ? toCroppedOutputDimensions({
-            crop: didCropInputImage ? crop : undefined,
-            sourceWidth: width,
-            sourceHeight: height
-          })
-        : { width, height };
-
-    const settings: Img2ImgSettings = {
-      ...restDataWithoutImages,
-      render_model: model,
-      reference_images: referenceImages,
-      prompt: data.prompt,
-      width: outputDimensions.width,
-      height: outputDimensions.height,
-      ...adapter.buildSettings(data),
-      ...cropWireFields,
-      ...inputImagePayload
-    };
-
-    try {
       const renderMode = isUnlimitedModeActive
         ? RenderMode.UNLIMITED
         : RenderMode.CREDITS;
@@ -258,7 +277,9 @@ export const useImg2ImgRender = (currentFrame: number) => {
           isLocalApp: true
         });
         if (precondition === "comfy") {
-          const comfy = await window.mago.comfy.check();
+          const comfy = await runRendererLibraryRequest(work, () =>
+            window.mago.comfy.check()
+          );
           if (!comfy.available) {
             window.dispatchEvent(
               new CustomEvent(OPEN_CREDENTIALS_EVENT, {
@@ -267,10 +288,12 @@ export const useImg2ImgRender = (currentFrame: number) => {
             );
             return;
           }
-          const modelStatus = await window.mago.comfy.modelStatus({
-            model: model as LocalImageModel,
-            settings: settings as unknown as Record<string, unknown>
-          });
+          const modelStatus = await runRendererLibraryRequest(work, () =>
+            window.mago.comfy.modelStatus({
+              model: model as LocalImageModel,
+              settings: settings as unknown as Record<string, unknown>
+            })
+          );
           if (!modelStatus.ready)
             throw new Error(
               modelStatus.message ?? "The selected ComfyUI model is not ready"
@@ -282,25 +305,30 @@ export const useImg2ImgRender = (currentFrame: number) => {
         if (!projectId) throw new Error("Local project is unavailable");
 
         if (isMagoCloudRender) {
-          await submitCloudImg2ImgRender(backendCloudApi(), {
-            payload: {
-              settings: settings as unknown as Img2ImgSettingsPayload,
-              frame,
-              img_file_type: "jpg",
-              render_mode: renderMode,
-              render_model: model,
-              name
+          await submitCloudImg2ImgRender(
+            backendCloudApi(),
+            {
+              payload: {
+                settings: settings as unknown as Img2ImgSettingsPayload,
+                frame,
+                img_file_type: "jpg",
+                render_mode: renderMode,
+                render_model: model,
+                name
+              },
+              local: {
+                projectId,
+                projectName: selectedProject?.name ?? name,
+                shotId: selectedShotId,
+                shotName: selectedShot?.name ?? name,
+                assetId: videoAsset.id,
+                assetName: videoAsset.name ?? name
+              },
+              onProgress
             },
-            local: {
-              projectId,
-              projectName: selectedProject?.name ?? name,
-              shotId: selectedShotId,
-              shotName: selectedShot?.name ?? name,
-              assetId: videoAsset.id,
-              assetName: videoAsset.name ?? name
-            },
-            onProgress: onCloudSyncProgress
-          });
+            work
+          );
+          work.check();
           await Promise.all([
             queryClient.invalidateQueries({ queryKey: queryKeys.queue.all }),
             queryClient.invalidateQueries({
@@ -310,20 +338,23 @@ export const useImg2ImgRender = (currentFrame: number) => {
           return;
         }
 
-        await window.mago.imageRenders.submit({
-          projectId,
-          shotId: selectedShotId,
-          sourceAssetId: videoAsset.id,
-          frame,
-          name,
-          model: model as LocalImageModel,
-          inputImage: inputImagePayload.input_image,
-          inputImageId: inputImagePayload.input_image_id,
-          referenceImageIds: referenceImages,
-          maskImageIds: maskImages,
-          estimatedCostUsd: 0,
-          settings: settings as unknown as Record<string, unknown>
-        });
+        await runRendererLibraryRequest(work, () =>
+          window.mago.imageRenders.submit({
+            projectId,
+            shotId: selectedShotId,
+            sourceAssetId: videoAsset.id,
+            frame,
+            name,
+            model: model as LocalImageModel,
+            inputImage: inputImagePayload.input_image,
+            inputImageId: inputImagePayload.input_image_id,
+            referenceImageIds: referenceImages,
+            maskImageIds: maskImages,
+            estimatedCostUsd: 0,
+            settings: settings as unknown as Record<string, unknown>
+          })
+        );
+        work.check();
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: queryKeys.queue.all }),
           queryClient.invalidateQueries({
@@ -333,15 +364,18 @@ export const useImg2ImgRender = (currentFrame: number) => {
         return;
       }
       await addImage2ImageRender(payload);
+      work.check();
       if (isUnlimitedModeActive) {
         await refreshRendersInProgressIfNeeded();
       }
     } catch (error) {
+      if (work.signal.aborted) return;
       console.error("Error generating image:", error);
       handleRenderSubmitError(error);
     } finally {
-      isOnboardingSubmittingRef.current = false;
-      dismissCloudSyncToast();
+      if (isOnboardingSubmittingRef.current === attempt)
+        isOnboardingSubmittingRef.current = null;
+      dismiss();
     }
   };
 

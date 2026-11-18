@@ -1,17 +1,23 @@
 import { isCloudProject } from "@domains/shot/utils/isCloudProject";
 
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { createCloudOutputLayer } from "./createCloudOutputLayer";
 import { deleteCloudLayer } from "./deleteCloudLayer";
 import { findCloudRenderAssetId } from "./findCloudRenderAssetId";
 import { mirrorImageToVideoFrameImages } from "./mirrorImageToVideoFrameImages";
 import {
+  bindCloudApiToLibrary,
   CloudApi,
   ensureCloudImageAsset,
   ensureCloudProject,
   ensureCloudTimeline,
-  MirrorProgress
+  MirrorProgress,
+  reportMirrorProgress
 } from "./mirrorService";
 import { LocalImageToVideoRenderContext } from "./resolveImageToVideoRenderContext";
 import { SubmitCloudRenderInput } from "./submitCloudRender";
@@ -38,54 +44,83 @@ const readStartImageAssetId = (
 const ensureCloudContainerShotOutputLayer = async (
   api: CloudApi,
   input: SubmitCloudImageToVideoRenderInput,
-  cloudProjectId: string
+  cloudProjectId: string,
+  work: RendererLibraryWork
 ): Promise<string> => {
-  input.onProgress?.("timeline");
-  const cloudTimelineId = await ensureCloudTimeline(api, {
-    localShotId: input.local.shotId,
-    localProjectId: input.local.projectId,
-    cloudProjectId,
-    name: input.local.shotName
-  });
-  return createCloudOutputLayer(api, {
-    localOutputTrackId: input.local.outputTrackId,
-    shotName: input.local.shotName,
-    cloudTimelineId,
-    cloudSourceLayerId: null
-  });
+  reportMirrorProgress(work, input.onProgress, "timeline");
+  const cloudTimelineId = await ensureCloudTimeline(
+    api,
+    {
+      localShotId: input.local.shotId,
+      localProjectId: input.local.projectId,
+      cloudProjectId,
+      name: input.local.shotName
+    },
+    work
+  );
+  return createCloudOutputLayer(
+    api,
+    {
+      localOutputTrackId: input.local.outputTrackId,
+      shotName: input.local.shotName,
+      cloudTimelineId,
+      cloudSourceLayerId: null
+    },
+    work
+  );
 };
 
 export const submitCloudImageToVideoRender = async (
   api: CloudApi,
   input: SubmitCloudImageToVideoRenderInput,
-  removeCloudLayer: (cloudLayerId: string) => Promise<void> = deleteCloudLayer
+  removeCloudLayer?: (cloudLayerId: string) => Promise<void>,
+  work = rendererLibrary.capture()
 ): Promise<{ jobId: string; cloudAssetId: string }> => {
   const renderSettings = input.payload.render_settings.magov2;
   const startImageAssetId = readStartImageAssetId(renderSettings);
 
-  input.onProgress?.("project");
-  const cloudProjectId = await ensureCloudProject(api, {
-    localProjectId: input.local.projectId,
-    name: input.local.projectName
-  });
+  await work.ready();
+  reportMirrorProgress(work, input.onProgress, "project");
+  const cloudProjectId = await ensureCloudProject(
+    api,
+    {
+      localProjectId: input.local.projectId,
+      name: input.local.projectName
+    },
+    work
+  );
 
   const cloudRenderSettings = await mirrorImageToVideoFrameImages(
     renderSettings,
     (localAssetId) =>
-      ensureCloudImageAsset(api, localAssetId, cloudProjectId, input.onProgress)
+      ensureCloudImageAsset(
+        api,
+        localAssetId,
+        cloudProjectId,
+        input.onProgress,
+        work
+      )
   );
 
-  const isOutputLayerAlreadyInCloud = await isCloudProject(
-    input.local.projectId
+  const isOutputLayerAlreadyInCloud = await work.boundary(() =>
+    isCloudProject(input.local.projectId)
   );
   const outputLayerId = isOutputLayerAlreadyInCloud
     ? input.local.outputTrackId
-    : await ensureCloudContainerShotOutputLayer(api, input, cloudProjectId);
+    : await ensureCloudContainerShotOutputLayer(
+        api,
+        input,
+        cloudProjectId,
+        work
+      );
   const removeOutputLayerCreatedHere = isOutputLayerAlreadyInCloud
     ? async () => undefined
-    : () => removeCloudLayer(outputLayerId);
+    : () =>
+        removeCloudLayer
+          ? removeCloudLayer(outputLayerId)
+          : deleteCloudLayer(outputLayerId, work);
 
-  const submitted = await api
+  const submitted = await bindCloudApiToLibrary(api, work)
     .post<unknown>("/assets/add_render", {
       ...input.payload,
       parent_layer_id: outputLayerId,
@@ -95,25 +130,31 @@ export const submitCloudImageToVideoRender = async (
       }
     })
     .catch(async (submitError: unknown) => {
+      // The provider may already have accepted this POST. Library teardown
+      // neither deletes its output layer nor tries to submit it again.
+      work.check();
       await removeOutputLayerCreatedHere().catch(() => undefined);
+      work.check();
       throw submitError;
     });
   const cloudAssetId = findCloudRenderAssetId(submitted);
   if (!cloudAssetId) {
     throw new Error("Cloud Mago did not return a render output asset");
   }
-  input.onProgress?.("done");
+  reportMirrorProgress(work, input.onProgress, "done");
 
-  const registered = await getLocalDesktopApi().cloud.renders.register({
-    outputTrackId: input.local.outputTrackId,
-    sourceAssetId: startImageAssetId,
-    model: input.model,
-    frameRange: input.frameRange,
-    fps: input.fps,
-    cloudAssetId,
-    cloudOutputLayerId: outputLayerId,
-    settings: renderSettings
-  });
+  const registered = await work.boundary(() =>
+    getLocalDesktopApi().cloud.renders.register({
+      outputTrackId: input.local.outputTrackId,
+      sourceAssetId: startImageAssetId,
+      model: input.model,
+      frameRange: input.frameRange,
+      fps: input.fps,
+      cloudAssetId,
+      cloudOutputLayerId: outputLayerId,
+      settings: renderSettings
+    })
+  );
 
   return { jobId: registered.jobId, cloudAssetId };
 };

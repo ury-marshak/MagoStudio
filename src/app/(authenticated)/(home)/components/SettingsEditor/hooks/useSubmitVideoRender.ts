@@ -20,6 +20,7 @@ import { useToast } from "@store/useToast";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 interface SubmitVideoRenderParams {
@@ -51,21 +52,25 @@ export const useSubmitVideoRender = () => {
     data: { videoTrack, tracks }
   } = useFilteredAndSortedTracks();
 
-  const submitVideoRender = async ({
-    layerId,
-    renderSettings,
-    range,
-    sources,
-    model,
-    inputTrackId,
-    inputVideoWidth,
-    inputVideoHeight,
-    fps,
-    isUnlimitedModeActive,
-    selectedProjectId,
-    target = "range",
-    crop
-  }: SubmitVideoRenderParams): Promise<boolean> => {
+  const submitVideoRender = async (
+    {
+      layerId,
+      renderSettings,
+      range,
+      sources,
+      model,
+      inputTrackId,
+      inputVideoWidth,
+      inputVideoHeight,
+      fps,
+      isUnlimitedModeActive,
+      selectedProjectId,
+      target = "range",
+      crop
+    }: SubmitVideoRenderParams,
+    work = rendererLibrary.capture()
+  ): Promise<boolean> => {
+    if (work.signal.aborted) return false;
     if (!layerId) {
       console.error("Layer ID is missing");
       return false;
@@ -107,20 +112,24 @@ export const useSubmitVideoRender = () => {
         ? RenderMode.UNLIMITED
         : RenderMode.CREDITS;
 
-      await addRenderMutation({
-        parentLayerId: layerId,
-        frameRange: range,
-        renderSettings,
-        sources,
-        inputTrackId,
-        renderEngine: "magov2",
-        renderMode,
-        model,
-        inputVideoWidth,
-        inputVideoHeight,
-        fps,
-        crop
-      });
+      await addRenderMutation(
+        {
+          parentLayerId: layerId,
+          frameRange: range,
+          renderSettings,
+          sources,
+          inputTrackId,
+          renderEngine: "magov2",
+          renderMode,
+          model,
+          inputVideoWidth,
+          inputVideoHeight,
+          fps,
+          crop
+        },
+        work
+      );
+      work.check();
 
       void queryClient.refetchQueries({ queryKey: queryKeys.queue.all });
 
@@ -148,6 +157,7 @@ export const useSubmitVideoRender = () => {
       triggerRefetch();
       return true;
     } catch (error) {
+      if (work.signal.aborted) return false;
       console.error("Render generation failed:", error);
       if (handleRenderSubmitError(error)) return false;
       const beDetail = extractRenderErrorMessage(error);

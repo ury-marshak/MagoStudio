@@ -1,6 +1,8 @@
 import { AxiosError, AxiosHeaders } from "axios";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 import {
   ensureCloudAsset,
   ensureCloudImageAsset,
@@ -21,6 +23,7 @@ const makeBridge = () => {
     calls,
     links,
     api: {
+      library: { onWillChange: async () => {}, onDidChange: () => {} },
       cloud: {
         links: {
           get: vi.fn(async (kind: string, localId: string) => {
@@ -152,7 +155,9 @@ const notFoundError = () =>
     data: {}
   });
 
-beforeEach(() => {
+beforeEach(async () => {
+  await rendererLibrary.suspend();
+  rendererLibrary.reset();
   bridge = makeBridge();
 });
 

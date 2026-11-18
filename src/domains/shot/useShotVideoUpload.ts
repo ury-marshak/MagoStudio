@@ -6,6 +6,8 @@ import { getUploadErrorMessage } from "@utils";
 import { useSetAtom } from "jotai";
 import { ChangeEvent, useRef, useState } from "react";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { useSelectedProjectId } from "../project/useSelectedProjectId";
 import { useIngestVideo } from "../videoUpload/useIngestVideo";
 
@@ -16,16 +18,18 @@ export const useShotVideoUpload = () => {
   const { data: selectedShot } = useSelectedShot();
   const setIsSettingsEditorOpen = useSetAtom(useIsSettingsEditorOpenAtom());
   const { ingestVideo } = useIngestVideo();
+  const { work } = useRendererLibraryWork();
 
-  const [isActiveUpload, setIsActiveUpload] = useState(false);
-  const [error, setError] = useState<string | undefined>(undefined);
-  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [displayOwner, setDisplayOwner] = useState<AbortSignal>();
+  const [error, setError] = useState<string>();
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const active = useRef<{
+    owner: AbortSignal;
+    controller: AbortController;
+  } | null>(null);
+  const ownsDisplay = displayOwner === work.signal && !work.signal.aborted;
 
-  const abortControllerRef = useRef<AbortController | null>(null);
-
-  useMountEffect(() => {
-    return () => abortControllerRef.current?.abort();
-  });
+  useMountEffect(() => () => active.current?.controller.abort());
 
   async function handleUpload({
     e,
@@ -36,62 +40,53 @@ export const useShotVideoUpload = () => {
     trimMetadata?: TrimMetadata;
     processedFile?: File;
   }) {
+    if (work.signal.aborted || active.current?.owner === work.signal) return;
+    const selectedFile = processedFile ?? e.target.files?.[0];
+    if (!selectedFile || !selectedShot?.id || !selectedProjectId) return;
+
+    const controller = new AbortController();
+    const attempt = { owner: work.signal, controller };
+    active.current = attempt;
+    setDisplayOwner(work.signal);
     setUploadProgress(0);
     setError(undefined);
 
-    const selectedFile = processedFile ?? e.target.files?.[0] ?? null;
-
-    if (!selectedFile) {
-      setIsActiveUpload(false);
-      return;
-    }
-
-    if (isActiveUpload) {
-      return;
-    }
-
-    if (!selectedShot?.id || !selectedProjectId) {
-      return;
-    }
-
-    setIsActiveUpload(true);
-
-    const abortController = new AbortController();
-    abortControllerRef.current = abortController;
-
     try {
-      const result = await ingestVideo({
-        shotId: selectedShot.id,
-        projectId: selectedProjectId,
-        file: selectedFile,
-        trimMetadata,
-        signal: abortController.signal,
-        onProgress: ({ progress }) => setUploadProgress(progress),
-        onUploaded: ({ trackId, trackName }) =>
-          trackingUtils.videoActions.upload(
-            trackId,
-            trackName,
-            selectedShot.id,
-            selectedShot.user_id || ""
-          )
-      });
+      const result = await ingestVideo(
+        {
+          shotId: selectedShot.id,
+          projectId: selectedProjectId,
+          file: selectedFile,
+          trimMetadata,
+          signal: controller.signal,
+          onProgress: ({ progress }) => setUploadProgress(progress),
+          onUploaded: ({ trackId, trackName }) =>
+            trackingUtils.videoActions.upload(
+              trackId,
+              trackName,
+              selectedShot.id,
+              selectedShot.user_id || ""
+            )
+        },
+        work
+      );
 
-      if (result.outcome === "cancelled") {
-        return;
+      work.check();
+      if (!controller.signal.aborted && result.outcome === "ingested") {
+        setIsSettingsEditorOpen(true);
       }
-
-      setIsSettingsEditorOpen(true);
     } catch (err) {
-      setError(getUploadErrorMessage(err));
+      if (!work.signal.aborted && !controller.signal.aborted) {
+        setError(getUploadErrorMessage(err));
+      }
     } finally {
-      abortControllerRef.current = null;
-      setIsActiveUpload(false);
+      if (active.current === attempt) active.current = null;
     }
   }
 
   return {
-    uploadProgress,
-    error,
+    uploadProgress: ownsDisplay ? uploadProgress : 0,
+    error: ownsDisplay ? error : undefined,
     handleUpload
   };
 };

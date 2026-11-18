@@ -2,6 +2,8 @@ import { useIsOnboardingActive } from "@domains/onboarding/useIsOnboardingActive
 import { Project } from "@schemas/project";
 import { useTranslation } from "react-i18next";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 import { useUpdateProject } from "./useUpdateProject";
 import { resolveAutoProjectName } from "./utils/resolveAutoProjectName";
 
@@ -12,8 +14,10 @@ export const useAutoNameProjectFromVideo = () => {
 
   const autoNameProjectFromVideo = async (
     project: Project,
-    filename: string
+    filename: string,
+    work = rendererLibrary.capture()
   ) => {
+    work.check();
     const newName = resolveAutoProjectName({
       currentName: project.name,
       defaultName: t("titles.untitled_project.label"),
@@ -26,14 +30,18 @@ export const useAutoNameProjectFromVideo = () => {
     if (!newName) return;
 
     try {
-      await updateProject({
-        projectId: project.id,
-        projectName: newName,
-        projectDescription: project.description,
-        settings: project.settings,
-        settingsPatch: {}
-      });
+      await updateProject(
+        {
+          projectId: project.id,
+          projectName: newName,
+          projectDescription: project.description,
+          settings: project.settings,
+          settingsPatch: {}
+        },
+        work
+      );
     } catch (error) {
+      work.check();
       console.error("Failed to auto-name project from video:", error);
     }
   };

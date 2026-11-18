@@ -1,8 +1,9 @@
 import { MirrorProgress } from "@domains/cloud/mirrorService";
 import { Layer } from "@schemas/layer";
 import { Project } from "@schemas/project";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { postRender, PostRenderParams } from "../api/postRender";
@@ -10,12 +11,10 @@ import { buildUpdatedProjectAfterRender } from "../utils/buildUpdatedProjectAfte
 
 export const usePostRender = ({
   selectedProjectId,
-  selectedShotId,
-  onProgress
+  selectedShotId
 }: {
   selectedProjectId?: string;
   selectedShotId?: string;
-  onProgress?: MirrorProgress;
 }) => {
   const queryClient = useQueryClient();
   const onSuccess = (updatedLayer: Layer) => {
@@ -25,8 +24,14 @@ export const usePostRender = ({
         buildUpdatedProjectAfterRender(project, selectedShotId, updatedLayer)
     );
   };
-  return useMutation({
-    mutationFn: (params: PostRenderParams) => postRender(params, onProgress),
+  return useRendererLibraryMutation({
+    mutationFn: (
+      {
+        params,
+        onProgress
+      }: { params: PostRenderParams; onProgress?: MirrorProgress },
+      work
+    ) => postRender(params, onProgress, work),
     onSuccess
   });
 };

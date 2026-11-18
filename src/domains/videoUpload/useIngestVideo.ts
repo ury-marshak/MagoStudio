@@ -3,6 +3,9 @@ import { usePublishVideoIngestionJob } from "@hooks/assets/usePublishVideoIngest
 import { useAuth } from "@platform/identity";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { isCloudAccountActive } from "@/platform/cloudAccount";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 import { getVideoAsset } from "../asset/getVideoAsset";
 import { useCreateVideoAsset } from "../asset/useCreateVideoAsset";
 import { useUploadAsset } from "../asset/useUploadAsset";
@@ -22,50 +25,62 @@ export const useIngestVideo = () => {
   const { mutateAsync: publishIngestionJob } = usePublishVideoIngestionJob();
 
   const runIngestVideo = (
-    params: IngestVideoParams
+    params: IngestVideoParams,
+    work = rendererLibrary.capture()
   ): Promise<IngestVideoResult> =>
-    ingestVideo(params, {
-      createVideoAsset: async ({ file, shotId }) => {
-        const creation = await handleVideoAssetCreation({
-          selectedFile: file,
-          selectedShotId: shotId,
-          createVideoAsset
-        });
+    ingestVideo(
+      params,
+      {
+        createVideoAsset: async ({ file, shotId, signal }) => {
+          const creation = await handleVideoAssetCreation({
+            selectedFile: file,
+            selectedShotId: shotId,
+            createVideoAsset,
+            signal
+          });
 
-        if (!creation) {
-          throw new Error("Error creating video asset");
-        }
-
-        return creation;
+          if (!creation) throw new Error("Error creating video asset");
+          return creation;
+        },
+        uploadAssetToS3,
+        publishIngestionJob: (assetId, signal) =>
+          publishIngestionJob({ assetId, signal }),
+        fetchVideoAssetStatus: async (assetId, signal) => {
+          if (!isCloudAccountActive()) return undefined;
+          let clerkToken: string | null;
+          try {
+            clerkToken = await getToken({ template: "basicToken" });
+          } catch {
+            return undefined;
+          }
+          signal.throwIfAborted();
+          if (!clerkToken) return undefined;
+          return getVideoAsset({ assetId, clerkToken, signal });
+        },
+        invalidateAfterIngest: async (projectId, signal) => {
+          // Invalidation may be detached. It still owns the same library, not
+          // whichever library is active when metadata mirroring completes.
+          try {
+            await syncCloudProjectMetadata(projectId, work);
+          } catch (error) {
+            work.check();
+            signal.throwIfAborted();
+            console.warn(`Failed to mirror cloud project ${projectId}`, error);
+          }
+          work.check();
+          signal.throwIfAborted();
+          await Promise.all(
+            getIngestInvalidationKeys(projectId).map((queryKey) =>
+              queryClient.invalidateQueries({ queryKey })
+            )
+          );
+        },
+        cacheVideoFile: (assetId, file) =>
+          cacheSet("video", assetId, file, work),
+        waitForPollTick
       },
-      uploadAssetToS3,
-      publishIngestionJob,
-      fetchVideoAssetStatus: async (assetId) => {
-        let clerkToken: string | null;
-        try {
-          clerkToken = await getToken({ template: "basicToken" });
-        } catch {
-          return undefined;
-        }
-        if (!clerkToken) return undefined;
-
-        return getVideoAsset({ assetId, clerkToken });
-      },
-      invalidateAfterIngest: async (projectId) => {
-        // The desktop app reads projects from its local mirror, which does not
-        // know about the new shot until it is pulled back from the cloud.
-        await syncCloudProjectMetadata(projectId).catch((error) => {
-          console.warn(`Failed to mirror cloud project ${projectId}`, error);
-        });
-        await Promise.all(
-          getIngestInvalidationKeys(projectId).map((queryKey) =>
-            queryClient.invalidateQueries({ queryKey })
-          )
-        );
-      },
-      cacheVideoFile: (assetId, file) => cacheSet("video", assetId, file),
-      waitForPollTick
-    });
+      work
+    );
 
   return { ingestVideo: runIngestVideo };
 };

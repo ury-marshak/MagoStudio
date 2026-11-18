@@ -12,6 +12,7 @@ const makeBridge = () => {
     links,
     registered,
     api: {
+      library: { onWillChange: async () => {}, onDidChange: () => {} },
       projects: {
         listAll: vi.fn(async () => [
           {

@@ -30,17 +30,26 @@ export interface IngestVideoDeps {
   createVideoAsset: (params: {
     file: File;
     shotId: string;
+    signal: AbortSignal;
   }) => Promise<VideoAssetCreationData>;
   uploadAssetToS3: (params: {
     s3_url: string;
     file: File;
     onUploadProgress?: (progress: number) => void;
+    signal: AbortSignal;
   }) => Promise<void>;
-  publishIngestionJob: (assetId: string) => Promise<unknown>;
+  publishIngestionJob: (
+    assetId: string,
+    signal: AbortSignal
+  ) => Promise<unknown>;
   fetchVideoAssetStatus: (
-    assetId: string
+    assetId: string,
+    signal: AbortSignal
   ) => Promise<VideoAssetResponse | undefined>;
-  invalidateAfterIngest: (projectId: string) => Promise<void>;
+  invalidateAfterIngest: (
+    projectId: string,
+    signal: AbortSignal
+  ) => Promise<void>;
   cacheVideoFile: (assetId: string, file: File) => Promise<void>;
   waitForPollTick: (ms: number, signal: AbortSignal) => Promise<void>;
 }

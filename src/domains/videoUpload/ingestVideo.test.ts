@@ -406,7 +406,10 @@ describe("ingestVideo", () => {
       await ingestVideo({ ...buildParams(), awaitInvalidation: false }, deps);
 
       expect(invalidationSettled).toBe(false);
-      expect(deps.invalidateAfterIngest).toHaveBeenCalledWith(PROJECT_ID);
+      expect(deps.invalidateAfterIngest).toHaveBeenCalledWith(
+        PROJECT_ID,
+        expect.any(AbortSignal)
+      );
     });
 
     it("does not reject when a non-awaited invalidation fails", async () => {

@@ -4,6 +4,9 @@ import { TrimMetadata } from "@schemas/video";
 import { getUploadErrorMessage } from "@utils";
 import { ChangeEvent, useRef, useState } from "react";
 
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { PROJECT_NAME_MAX_LENGTH } from "../project/constants";
 import { fetchProject } from "../project/fetchProject";
 import { useAutoNameProjectFromVideo } from "../project/useAutoNameProjectFromVideo";
@@ -21,6 +24,16 @@ interface UseCreateProjectAndUploadVideoParams {
   parentFolderId?: string;
 }
 
+interface UploadAttempt {
+  work: RendererLibraryWork;
+  controller: AbortController;
+  newProjectId?: string;
+  newTimelineId?: string;
+  existingProjectId?: string;
+  cancelRequested?: boolean;
+  cleanup?: Promise<unknown>;
+}
+
 const getTimelineNameFromFile = (file: File) =>
   file.name.replace(/\.[^/.]+$/, "").slice(0, PROJECT_NAME_MAX_LENGTH) ||
   "Untitled";
@@ -34,20 +47,41 @@ export const useCreateProjectAndUploadVideo = ({
   const { mutateAsync: deleteProject } = useDeleteProject();
   const { autoNameProjectFromVideo } = useAutoNameProjectFromVideo();
   const { ingestVideo } = useIngestVideo();
+  const { work } = useRendererLibraryWork();
 
-  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [displayOwner, setDisplayOwner] = useState<AbortSignal>();
+  const active = useRef<UploadAttempt | null>(null);
+  const ownsDisplay = displayOwner === work.signal && !work.signal.aborted;
 
-  const abortControllerRef = useRef<AbortController | null>(null);
-  const createdProjectIdRef = useRef<string | null>(null);
-  const createdShotIdRef = useRef<string | null>(null);
-  const isExistingProjectRef = useRef(false);
-  const isNewlyCreatedTimelineRef = useRef(false);
+  useMountEffect(() => () => active.current?.controller.abort());
 
-  useMountEffect(() => {
-    return () => abortControllerRef.current?.abort();
-  });
+  const cleanup = async (attempt: UploadAttempt) => {
+    if (attempt.work.signal.aborted) return;
+    if (!attempt.cleanup) {
+      if (attempt.newProjectId) {
+        attempt.cleanup = deleteProject(
+          { projectId: attempt.newProjectId },
+          attempt.work
+        );
+      } else if (attempt.cancelRequested && attempt.newTimelineId) {
+        attempt.cleanup = deleteTimeline(
+          attempt.newTimelineId,
+          attempt.existingProjectId,
+          attempt.work
+        );
+      }
+    }
+    try {
+      await attempt.cleanup;
+    } catch (error) {
+      if (!attempt.work.signal.aborted && !attempt.cancelRequested) {
+        console.error("Failed to delete project after upload error:", error);
+      }
+    }
+  };
 
   const handleUpload = async ({
     e,
@@ -58,159 +92,149 @@ export const useCreateProjectAndUploadVideo = ({
     trimMetadata?: TrimMetadata;
     processedFile?: File;
   }) => {
-    createdProjectIdRef.current = null;
-    createdShotIdRef.current = null;
-    isExistingProjectRef.current = false;
-    isNewlyCreatedTimelineRef.current = false;
+    if (work.signal.aborted || active.current?.work.signal === work.signal)
+      return;
+    const originalFile = e.target.files?.[0];
+    const selectedFile = processedFile ?? originalFile;
+    if (!selectedFile) return;
+
+    const controller = new AbortController();
+    const attempt: UploadAttempt = { work, controller, existingProjectId };
+    active.current = attempt;
+    setDisplayOwner(work.signal);
     setUploadProgress(0);
     setError(null);
     setIsUploading(true);
 
-    const selectedFile = processedFile ?? e.target.files?.[0] ?? null;
-
-    if (!selectedFile) {
-      setIsUploading(false);
-      return;
-    }
-
-    const abortController = new AbortController();
-    abortControllerRef.current = abortController;
+    const check = () => {
+      work.check();
+      controller.signal.throwIfAborted();
+    };
 
     try {
+      await work.ready();
+      check();
       let projectId: string;
       let shotId: string;
-
-      const originalFile = e.target.files?.[0];
       const namingFile = originalFile ?? selectedFile;
       const timelineName = getTimelineNameFromFile(namingFile);
 
       if (existingProjectId) {
         projectId = existingProjectId;
-        createdProjectIdRef.current = projectId;
-        isExistingProjectRef.current = true;
-
-        const existingProject = await fetchProject(existingProjectId);
+        const existingProject = await fetchProject(projectId, work);
+        check();
         const emptyTimeline = existingProject?.timelines?.find(
           (timeline) => timeline.layers.length === 0
         );
 
         if (emptyTimeline) {
-          await putTimeline(emptyTimeline.id, {
-            name: timelineName,
-            settings: {},
-            project_id: existingProjectId
-          });
+          await putTimeline(
+            emptyTimeline.id,
+            {
+              name: timelineName,
+              settings: {},
+              project_id: projectId
+            },
+            work
+          );
           shotId = emptyTimeline.id;
         } else {
-          const newTimeline = await postTimeline(
-            existingProjectId,
-            timelineName
-          );
+          const newTimeline = await postTimeline(projectId, timelineName, work);
           shotId = newTimeline.id;
-          isNewlyCreatedTimelineRef.current = true;
+          attempt.newTimelineId = shotId;
         }
-        createdShotIdRef.current = shotId;
-
+        check();
         if (existingProject) {
-          await autoNameProjectFromVideo(existingProject, namingFile.name);
+          await autoNameProjectFromVideo(
+            existingProject,
+            namingFile.name,
+            work
+          );
         }
       } else {
-        const newProject = await createNewProject({ parentFolderId });
-
-        if (!newProject) {
-          throw new Error("Failed to create project");
-        }
+        const newProject = await createNewProject({ parentFolderId }, work);
+        if (!newProject) throw new Error("Failed to create project");
 
         projectId = newProject.id;
+        attempt.newProjectId = projectId;
+        check();
         shotId = newProject.timelines?.[0]?.id ?? "";
-        createdProjectIdRef.current = projectId;
-        createdShotIdRef.current = shotId;
+        if (!shotId) throw new Error("No shot found in created project");
 
-        if (!shotId) {
-          throw new Error("No shot found in created project");
-        }
-
-        await putTimeline(shotId, {
-          name: timelineName,
-          settings: {},
-          project_id: newProject.id
-        });
-
-        await autoNameProjectFromVideo(newProject, namingFile.name);
+        await putTimeline(
+          shotId,
+          {
+            name: timelineName,
+            settings: {},
+            project_id: projectId
+          },
+          work
+        );
+        check();
+        await autoNameProjectFromVideo(newProject, namingFile.name, work);
       }
+      check();
 
-      const result = await ingestVideo({
-        shotId,
-        projectId,
-        file: selectedFile,
-        trimMetadata,
-        signal: abortController.signal,
-        onProgress: ({ progress }) => setUploadProgress(progress),
-        onUploaded: ({ trackId, trackName }) =>
-          trackingUtils.videoActions.upload(trackId, trackName, shotId, "")
-      });
+      const result = await ingestVideo(
+        {
+          shotId,
+          projectId,
+          file: selectedFile,
+          trimMetadata,
+          signal: controller.signal,
+          onProgress: ({ progress }) => setUploadProgress(progress),
+          onUploaded: ({ trackId, trackName }) =>
+            trackingUtils.videoActions.upload(trackId, trackName, shotId, "")
+        },
+        work
+      );
 
-      if (result.outcome === "cancelled") {
+      check();
+      if (result.outcome === "ingested") onSuccess?.(projectId, shotId);
+    } catch (error) {
+      if (work.signal.aborted) return;
+      if (controller.signal.aborted) {
+        if (attempt.cancelRequested) await cleanup(attempt);
         return;
       }
-
-      onSuccess?.(projectId, shotId);
-    } catch (err) {
-      console.error("Error in upload flow:", err);
-
-      if (createdProjectIdRef.current && !isExistingProjectRef.current) {
-        try {
-          await deleteProject({
-            projectId: createdProjectIdRef.current
-          });
-        } catch (deleteError) {
-          console.error(
-            "Failed to delete project after upload error:",
-            deleteError
-          );
-        }
+      console.error("Error in upload flow:", error);
+      await cleanup(attempt);
+      if (!work.signal.aborted && !controller.signal.aborted) {
+        setError(getUploadErrorMessage(error));
       }
-      setError(getUploadErrorMessage(err));
     } finally {
-      abortControllerRef.current = null;
-      setIsUploading(false);
+      if (active.current === attempt) {
+        active.current = null;
+        if (!work.signal.aborted) setIsUploading(false);
+      }
     }
   };
 
   const clearError = () => {
+    if (work.signal.aborted) return;
     setError(null);
     setUploadProgress(0);
   };
 
   const cancelUpload = async () => {
-    abortControllerRef.current?.abort();
-
-    if (createdProjectIdRef.current && !isExistingProjectRef.current) {
-      try {
-        await deleteProject({
-          projectId: createdProjectIdRef.current
-        });
-      } catch {}
-    } else if (createdShotIdRef.current && isNewlyCreatedTimelineRef.current) {
-      try {
-        await deleteTimeline(
-          createdShotIdRef.current,
-          createdProjectIdRef.current ?? undefined
-        );
-      } catch {}
-    }
+    const attempt = active.current;
+    if (work.signal.aborted) return false;
+    if (!attempt || attempt.work.signal !== work.signal) return true;
+    attempt.cancelRequested = true;
+    attempt.controller.abort();
+    await cleanup(attempt);
+    if (work.signal.aborted || (active.current && active.current !== attempt))
+      return false;
     setIsUploading(false);
-    setUploadProgress(0);
-    setError(null);
-    createdProjectIdRef.current = null;
-    createdShotIdRef.current = null;
+    clearError();
+    return true;
   };
 
   return {
     handleUpload,
-    uploadProgress,
-    error,
-    isUploading,
+    uploadProgress: ownsDisplay ? uploadProgress : 0,
+    error: ownsDisplay ? error : null,
+    isUploading: ownsDisplay && isUploading,
     clearError,
     cancelUpload
   };

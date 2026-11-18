@@ -18,7 +18,9 @@ describe("deleteCloudLayer", () => {
 
     await deleteCloudLayer("cloud-output-layer");
 
-    expect(deleteRequest).toHaveBeenCalledWith("/layers/cloud-output-layer");
+    expect(deleteRequest).toHaveBeenCalledWith("/layers/cloud-output-layer", {
+      signal: expect.any(AbortSignal)
+    });
   });
 
   it("propagates a failed delete", async () => {

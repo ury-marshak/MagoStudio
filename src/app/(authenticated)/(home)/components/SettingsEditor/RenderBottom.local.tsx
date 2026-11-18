@@ -61,6 +61,7 @@ import { useTranslation } from "react-i18next";
 import { useGetTrackById } from "@/domains/track/useGetTrackById";
 import { useSetSelectedTrackIds } from "@/domains/track/useSetSelectedTrackIds";
 import { resolveRenderProvider } from "@/platform/renderTarget";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { GenerateButtonCostLabel } from "./GenerateButtonCostLabel";
@@ -70,6 +71,7 @@ import { useSubmitVideoRender } from "./hooks/useSubmitVideoRender";
 
 export const RenderBottom: React.FC = () => {
   const { t } = useTranslation();
+  const { work } = useRendererLibraryWork();
   const {
     subscription,
     isModeToggleAvailable,
@@ -132,12 +134,17 @@ export const RenderBottom: React.FC = () => {
     useEnsureLocalVideoRenderPreconditions();
   const blockRenderWhileLocalSetupRuns = useBlockRenderWhileLocalSetupRuns();
   const queryClient = useQueryClient();
-  const { showToast, showHintToast } = useToast();
+  const { showToast, showHintToast, hideToast } = useToast();
   const setSelectedTrackIds = useSetSelectedTrackIds();
   const { data: rendersInProgressData } = useRendersInProgress();
 
   const [disabledMessage, setDisabledMessage] = useState<string | null>(null);
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [generatingOwner, setGeneratingOwner] = useState<AbortSignal>();
+  const isGenerating = generatingOwner === work.signal && !work.signal.aborted;
+  const setIsGenerating = (value: boolean) => {
+    if (!work.signal.aborted)
+      setGeneratingOwner(value ? work.signal : undefined);
+  };
   const buttonsContainerRef = useRef<HTMLDivElement | null>(null);
 
   const unlimitedCurrentGenerationCount =
@@ -268,21 +275,24 @@ export const RenderBottom: React.FC = () => {
     range: number[],
     target: RenderTarget
   ): Promise<boolean> =>
-    submitVideoRender({
-      layerId,
-      renderSettings,
-      range,
-      sources,
-      model: selectedModel,
-      inputTrackId: inputTrackId || videoTrack.id,
-      inputVideoWidth,
-      inputVideoHeight,
-      fps,
-      isUnlimitedModeActive,
-      selectedProjectId,
-      target,
-      crop
-    });
+    submitVideoRender(
+      {
+        layerId,
+        renderSettings,
+        range,
+        sources,
+        model: selectedModel,
+        inputTrackId: inputTrackId || videoTrack.id,
+        inputVideoWidth,
+        inputVideoHeight,
+        fps,
+        isUnlimitedModeActive,
+        selectedProjectId,
+        target,
+        crop
+      },
+      work
+    );
 
   const onGenerateRendersPress = async ({
     range,
@@ -295,18 +305,25 @@ export const RenderBottom: React.FC = () => {
     setSelectedTrackIds: (trackIds: string[]) => void;
     videoGenerationMode: "generate";
   }) => {
+    if (!selectedProjectId || work.signal.aborted) return;
     setIsPlaying(false);
-    if (!selectedProjectId) return;
 
     setIsGenerating(true);
 
     let areLocalRenderPreconditionsMet = false;
     try {
       areLocalRenderPreconditionsMet =
-        await ensureLocalVideoRenderPreconditions({
-          model: selectedModel.name,
-          renderSettingsValues
-        });
+        await ensureLocalVideoRenderPreconditions(
+          {
+            model: selectedModel.name,
+            renderSettingsValues
+          },
+          work
+        );
+      work.check();
+    } catch (error) {
+      if (work.signal.aborted) return;
+      throw error;
     } finally {
       if (!areLocalRenderPreconditionsMet) setIsGenerating(false);
     }
@@ -314,10 +331,15 @@ export const RenderBottom: React.FC = () => {
 
     let track: Awaited<ReturnType<typeof addTrack>>;
     try {
-      track = await addTrack({
-        parentTrackOrder: sourceTrack?.layer_order
-      });
+      track = await addTrack(
+        {
+          parentTrackOrder: sourceTrack?.layer_order
+        },
+        work
+      );
+      work.check();
     } catch (error) {
+      if (work.signal.aborted) return;
       console.error("Failed to create track:", error);
       showToast({
         message: t("notifications.failed_to_create_track.description")
@@ -342,16 +364,22 @@ export const RenderBottom: React.FC = () => {
       fps
     });
 
-    showToast({
+    // A confirmation click can happen long after the output track was prepared.
+    const hideConfirmation = () => hideToast(confirmationId);
+    const confirmationId = showToast({
       message: t("notifications.render_queue_confirmation.description"),
       onCancelText: t("notifications.render_queue_confirmation.cancel"),
       onCancel: () => {
+        work.signal.removeEventListener("abort", hideConfirmation);
+        if (work.signal.aborted) return;
         void queryClient.invalidateQueries({
           queryKey: queryKeys.project.byId(selectedProjectId)
         });
         setIsGenerating(false);
       },
       onSubmit: async () => {
+        work.signal.removeEventListener("abort", hideConfirmation);
+        if (work.signal.aborted) return;
         try {
           const didSubmit = await handleGenerateRender(
             track.id,
@@ -360,7 +388,7 @@ export const RenderBottom: React.FC = () => {
             target
           );
 
-          if (!didSubmit) return;
+          if (!didSubmit || work.signal.aborted) return;
 
           showHintToast(t("hints.privacy_notice"));
         } finally {
@@ -371,6 +399,11 @@ export const RenderBottom: React.FC = () => {
       invertedSubmitAndCancelColors: true
     });
 
+    if (work.signal.aborted) {
+      hideConfirmation();
+      return;
+    }
+    work.signal.addEventListener("abort", hideConfirmation, { once: true });
     void refreshRendersInProgressIfNeeded();
   };
 
@@ -384,6 +417,7 @@ export const RenderBottom: React.FC = () => {
   const isGenerateActionUnavailable = isGenerateButtonDisabled || isGenerating;
 
   const pressGenerate = () => {
+    if (work.signal.aborted) return;
     if (blockRenderWhileLocalSetupRuns(renderProvider === "local-comfy"))
       return;
     if (drivingSubmission.isBlockedByCreditPaywall) {

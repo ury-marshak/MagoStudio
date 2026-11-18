@@ -12,6 +12,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
 import { isComfyLocalVideoModel } from "@/platform/localVideoModels";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { deriveImageToVideoFrameRange } from "../utils/deriveImageToVideoFrameRange";
@@ -36,14 +37,18 @@ export const useSubmitImageToVideoRender = () => {
   const blockRenderWhileLocalSetupRuns = useBlockRenderWhileLocalSetupRuns();
   const { isUnlimitedModeActive } = useIsUnlimitedModeActive();
 
-  const submitImageToVideoRender = async ({
-    layerId,
-    renderSettings,
-    durationInSeconds,
-    fps,
-    model,
-    selectedProjectId
-  }: SubmitImageToVideoRenderParams): Promise<boolean> => {
+  const submitImageToVideoRender = async (
+    {
+      layerId,
+      renderSettings,
+      durationInSeconds,
+      fps,
+      model,
+      selectedProjectId
+    }: SubmitImageToVideoRenderParams,
+    work = rendererLibrary.capture()
+  ): Promise<boolean> => {
+    if (work.signal.aborted) return false;
     if (blockRenderWhileLocalSetupRuns(isComfyLocalVideoModel(model.name)))
       return false;
 
@@ -63,17 +68,21 @@ export const useSubmitImageToVideoRender = () => {
         ? RenderMode.UNLIMITED
         : RenderMode.CREDITS;
 
-      await addRenderMutation({
-        parentLayerId: layerId,
-        frameRange,
-        renderSettings,
-        sources: [],
-        inputTrackId: "",
-        renderEngine: "magov2",
-        renderMode,
-        model,
-        fps
-      });
+      await addRenderMutation(
+        {
+          parentLayerId: layerId,
+          frameRange,
+          renderSettings,
+          sources: [],
+          inputTrackId: "",
+          renderEngine: "magov2",
+          renderMode,
+          model,
+          fps
+        },
+        work
+      );
+      work.check();
 
       void queryClient.refetchQueries({ queryKey: queryKeys.queue.all });
 
@@ -97,6 +106,7 @@ export const useSubmitImageToVideoRender = () => {
       triggerRefetch();
       return true;
     } catch (error) {
+      if (work.signal.aborted) return false;
       const beDetail = extractRenderErrorMessage(error);
       console.error(
         "Image-to-video render generation failed:",

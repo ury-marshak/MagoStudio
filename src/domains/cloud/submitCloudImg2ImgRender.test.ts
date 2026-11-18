@@ -12,6 +12,7 @@ const makeBridge = () => {
     links,
     registered,
     api: {
+      library: { onWillChange: async () => {}, onDidChange: () => {} },
       cloud: {
         links: {
           get: vi.fn(async (kind: string, localId: string) => {

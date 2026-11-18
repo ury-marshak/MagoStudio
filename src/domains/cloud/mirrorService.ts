@@ -1,4 +1,11 @@
+import { waitForPollTick } from "@domains/videoUpload/utils/waitForPollTick";
+
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { toSourceVideoTrimKey } from "../../../desktop/shared/toSourceVideoTrimKey";
 
@@ -34,9 +41,21 @@ import { toCloudSourceVideoLinkLocalId } from "./toCloudSourceVideoLinkLocalId";
  */
 
 export interface CloudApi {
-  post: <T>(url: string, body?: unknown) => Promise<T>;
-  get: <T>(url: string) => Promise<T>;
+  post: <T>(url: string, body?: unknown, signal?: AbortSignal) => Promise<T>;
+  get: <T>(url: string, signal?: AbortSignal) => Promise<T>;
 }
+
+/** Guard transport dispatch, including credentials, and late responses from
+ * even a transport that ignores the signal. */
+export const bindCloudApiToLibrary = (
+  api: CloudApi,
+  work: RendererLibraryWork
+): CloudApi => ({
+  get: <T>(url: string) =>
+    runRendererLibraryRequest(work, (signal) => api.get<T>(url, signal)),
+  post: <T>(url: string, body?: unknown) =>
+    runRendererLibraryRequest(work, (signal) => api.post<T>(url, body, signal))
+});
 
 const INGESTION_POLL_INTERVAL_MS = 3000;
 const INGESTION_POLL_ATTEMPTS = 100;
@@ -54,13 +73,35 @@ export type MirrorProgress = (
 
 const bridge = () => getLocalDesktopApi();
 
+export const reportMirrorProgress = (
+  work: RendererLibraryWork,
+  onProgress: MirrorProgress | undefined,
+  step: Parameters<MirrorProgress>[0]
+): void => {
+  work.check();
+  onProgress?.(step);
+};
+
 interface CreatedProject {
   id: string;
   timelines?: { id?: unknown }[];
 }
 
-const cloudProjectResolutionsInFlight = new Map<string, Promise<string>>();
-const cloudRecordsConfirmedThisRun = new Set<string>();
+type MirrorState = {
+  projectResolutions: Map<string, Promise<string>>;
+  confirmedRecords: Set<string>;
+};
+const mirrorStates = new WeakMap<AbortSignal, MirrorState>();
+
+const mirrorState = (work: RendererLibraryWork): MirrorState => {
+  work.check();
+  let state = mirrorStates.get(work.signal);
+  if (!state) {
+    state = { projectResolutions: new Map(), confirmedRecords: new Set() };
+    mirrorStates.set(work.signal, state);
+  }
+  return state;
+};
 
 const isCloudOriginLink = (link: { data: Record<string, unknown> }): boolean =>
   link.data.origin === "cloud";
@@ -75,96 +116,113 @@ const toCloudTimelineConfirmationKey = (
 
 const isLinkedCloudProjectStillInCloud = async (
   api: CloudApi,
-  cloudProjectId: string
+  cloudProjectId: string,
+  work: RendererLibraryWork
 ): Promise<boolean> => {
+  const { confirmedRecords } = mirrorState(work);
   const confirmationKey = toCloudProjectConfirmationKey(cloudProjectId);
-  if (cloudRecordsConfirmedThisRun.has(confirmationKey)) return true;
+  if (confirmedRecords.has(confirmationKey)) return true;
   try {
-    await api.get(`/projects/${cloudProjectId}`);
+    await bindCloudApiToLibrary(api, work).get(`/projects/${cloudProjectId}`);
   } catch (err) {
+    work.check();
     if (isCloudResourceAlreadyGoneError(err)) return false;
     throw err;
   }
-  cloudRecordsConfirmedThisRun.add(confirmationKey);
+  work.check();
+  confirmedRecords.add(confirmationKey);
   return true;
 };
 
 const isLinkedCloudTimelineInCloudProject = async (
   api: CloudApi,
   cloudTimelineId: string,
-  cloudProjectId: string
+  cloudProjectId: string,
+  work: RendererLibraryWork
 ): Promise<boolean> => {
+  const { confirmedRecords } = mirrorState(work);
   const confirmationKey = toCloudTimelineConfirmationKey(
     cloudTimelineId,
     cloudProjectId
   );
-  if (cloudRecordsConfirmedThisRun.has(confirmationKey)) return true;
+  if (confirmedRecords.has(confirmationKey)) return true;
   let cloudTimeline: { project_id?: unknown } | undefined;
   try {
-    cloudTimeline = await api.get<{ project_id?: unknown }>(
-      `/timeline/${cloudTimelineId}`
-    );
+    cloudTimeline = await bindCloudApiToLibrary(api, work).get<{
+      project_id?: unknown;
+    }>(`/timeline/${cloudTimelineId}`);
   } catch (err) {
+    work.check();
     if (isCloudResourceAlreadyGoneError(err)) return false;
     throw err;
   }
   if (cloudTimeline?.project_id !== cloudProjectId) return false;
-  cloudRecordsConfirmedThisRun.add(confirmationKey);
+  work.check();
+  confirmedRecords.add(confirmationKey);
   return true;
 };
 
-export const ensureCloudProject = (
+export const ensureCloudProject = async (
   api: CloudApi,
-  input: { localProjectId: string; name: string; description?: string }
+  input: { localProjectId: string; name: string; description?: string },
+  work = rendererLibrary.capture()
 ): Promise<string> => {
-  const resolutionInFlight = cloudProjectResolutionsInFlight.get(
-    input.localProjectId
-  );
+  const { projectResolutions } = mirrorState(work);
+  const resolutionInFlight = projectResolutions.get(input.localProjectId);
   if (resolutionInFlight) return resolutionInFlight;
 
-  const resolution = linkOrCreateCloudProject(api, input).finally(() => {
-    cloudProjectResolutionsInFlight.delete(input.localProjectId);
+  const resolution = linkOrCreateCloudProject(api, input, work).finally(() => {
+    projectResolutions.delete(input.localProjectId);
   });
-  cloudProjectResolutionsInFlight.set(input.localProjectId, resolution);
+  projectResolutions.set(input.localProjectId, resolution);
   return resolution;
 };
 
 const linkOrCreateCloudProject = async (
   api: CloudApi,
-  input: { localProjectId: string; name: string; description?: string }
+  input: { localProjectId: string; name: string; description?: string },
+  work: RendererLibraryWork
 ): Promise<string> => {
-  const existing = await bridge().cloud.links.get(
-    "project",
-    input.localProjectId
+  const { confirmedRecords } = mirrorState(work);
+  const existing = await work.boundary(() =>
+    bridge().cloud.links.get("project", input.localProjectId)
   );
   if (
     existing &&
     (isCloudOriginLink(existing) ||
-      (await isLinkedCloudProjectStillInCloud(api, existing.cloudId)))
+      (await isLinkedCloudProjectStillInCloud(api, existing.cloudId, work)))
   )
     return existing.cloudId;
 
-  const created = await api.post<CreatedProject>("/projects", {
-    name: input.name,
-    description: input.description ?? "",
-    settings: toCloudMirrorProjectSettings(input.localProjectId)
-  });
+  const created = await bindCloudApiToLibrary(api, work).post<CreatedProject>(
+    "/projects",
+    {
+      name: input.name,
+      description: input.description ?? "",
+      settings: toCloudMirrorProjectSettings(input.localProjectId)
+    }
+  );
   if (!created?.id) throw new Error("Cloud Mago did not return a project id");
 
   // Creating a project also creates an empty timeline. Remembering it lets the
   // first shot adopt it instead of leaving an orphan empty shot that a user
   // would see if they opened this project in the cloud web app.
   const spare = created.timelines?.[0]?.id;
-  await bridge().cloud.links.put({
-    kind: "project",
-    localId: input.localProjectId,
-    cloudId: created.id,
-    data: {
-      isCloudProjectMarkedAsMirror: true,
-      ...(typeof spare === "string" && spare ? { spareTimelineId: spare } : {})
-    }
-  });
-  cloudRecordsConfirmedThisRun.add(toCloudProjectConfirmationKey(created.id));
+  await work.boundary(() =>
+    bridge().cloud.links.put({
+      kind: "project",
+      localId: input.localProjectId,
+      cloudId: created.id,
+      data: {
+        isCloudProjectMarkedAsMirror: true,
+        ...(typeof spare === "string" && spare
+          ? { spareTimelineId: spare }
+          : {})
+      }
+    })
+  );
+  work.check();
+  confirmedRecords.add(toCloudProjectConfirmationKey(created.id));
   return created.id;
 };
 
@@ -175,11 +233,12 @@ export const ensureCloudTimeline = async (
     localProjectId?: string;
     cloudProjectId: string;
     name: string;
-  }
+  },
+  work = rendererLibrary.capture()
 ): Promise<string> => {
-  const existing = await bridge().cloud.links.get(
-    "timeline",
-    input.localShotId
+  const { confirmedRecords } = mirrorState(work);
+  const existing = await work.boundary(() =>
+    bridge().cloud.links.get("timeline", input.localShotId)
   );
   if (
     existing &&
@@ -187,35 +246,44 @@ export const ensureCloudTimeline = async (
       (await isLinkedCloudTimelineInCloudProject(
         api,
         existing.cloudId,
-        input.cloudProjectId
+        input.cloudProjectId,
+        work
       )))
   )
     return existing.cloudId;
 
   // Adopt the timeline that came free with the project, once.
-  const projectLink = input.localProjectId
-    ? await bridge().cloud.links.get("project", input.localProjectId)
+  const { localProjectId } = input;
+  const projectLink = localProjectId
+    ? await work.boundary(() =>
+        bridge().cloud.links.get("project", localProjectId)
+      )
     : null;
   const spare = projectLink?.data.spareTimelineId;
   if (typeof spare === "string" && spare) {
-    await bridge().cloud.links.put({
-      kind: "project",
-      localId: projectLink!.localId,
-      cloudId: projectLink!.cloudId,
-      data: { ...projectLink!.data, spareTimelineId: undefined }
-    });
-    await bridge().cloud.links.put({
-      kind: "timeline",
-      localId: input.localShotId,
-      cloudId: spare
-    });
-    cloudRecordsConfirmedThisRun.add(
+    await work.boundary(() =>
+      bridge().cloud.links.put({
+        kind: "project",
+        localId: projectLink!.localId,
+        cloudId: projectLink!.cloudId,
+        data: { ...projectLink!.data, spareTimelineId: undefined }
+      })
+    );
+    await work.boundary(() =>
+      bridge().cloud.links.put({
+        kind: "timeline",
+        localId: input.localShotId,
+        cloudId: spare
+      })
+    );
+    work.check();
+    confirmedRecords.add(
       toCloudTimelineConfirmationKey(spare, projectLink!.cloudId)
     );
     return spare;
   }
 
-  return createCloudTimeline(api, input);
+  return createCloudTimeline(api, input, work);
 };
 
 const createCloudTimeline = async (
@@ -224,20 +292,25 @@ const createCloudTimeline = async (
     localShotId: string;
     cloudProjectId: string;
     name: string;
-  }
+  },
+  work: RendererLibraryWork
 ): Promise<string> => {
-  const created = await api.post<{ id: string }>(
+  const { confirmedRecords } = mirrorState(work);
+  const created = await bindCloudApiToLibrary(api, work).post<{ id: string }>(
     `/timelines/${input.cloudProjectId}`,
     { name: input.name }
   );
   if (!created?.id) throw new Error("Cloud Mago did not return a timeline id");
 
-  await bridge().cloud.links.put({
-    kind: "timeline",
-    localId: input.localShotId,
-    cloudId: created.id
-  });
-  cloudRecordsConfirmedThisRun.add(
+  await work.boundary(() =>
+    bridge().cloud.links.put({
+      kind: "timeline",
+      localId: input.localShotId,
+      cloudId: created.id
+    })
+  );
+  work.check();
+  confirmedRecords.add(
     toCloudTimelineConfirmationKey(created.id, input.cloudProjectId)
   );
   return created.id;
@@ -285,11 +358,14 @@ const adoptAssetScopedCloudSourceVideoLink = async (
     cloudTimelineId: string;
     sourceVideoTrimKey: string;
     sourceVideoLinkLocalId: string;
-  }
+  },
+  work: RendererLibraryWork
 ): Promise<CloudSourceVideo | null> => {
-  const assetScopedLink = await bridge().cloud.links.get(
-    "asset",
-    toAssetScopedCloudSourceVideoLinkLocalId(input)
+  const assetScopedLink = await work.boundary(() =>
+    bridge().cloud.links.get(
+      "asset",
+      toAssetScopedCloudSourceVideoLinkLocalId(input)
+    )
   );
   const isAssetScopedLinkAnUploadOfRequestedTrim =
     isIngestedCloudSourceVideoUploadOfTrim(
@@ -299,7 +375,7 @@ const adoptAssetScopedCloudSourceVideoLink = async (
   if (!assetScopedLink || !isAssetScopedLinkAnUploadOfRequestedTrim)
     return null;
 
-  const shotCloudTimeline = await api.get<unknown>(
+  const shotCloudTimeline = await bindCloudApiToLibrary(api, work).get<unknown>(
     `/timeline/${input.cloudTimelineId}`
   );
   const cloudLayerIdOnShotTimeline = findUploadedLayerId(
@@ -319,7 +395,7 @@ const adoptAssetScopedCloudSourceVideoLink = async (
       cloudLayerId: cloudLayerIdOnShotTimeline
     }
   };
-  await bridge().cloud.links.put(adoptedLink);
+  await work.boundary(() => bridge().cloud.links.put(adoptedLink));
   return toCloudSourceVideo(adoptedLink);
 };
 
@@ -339,9 +415,13 @@ interface CloudSourceVideoRequest {
 
 const ensureCloudSourceVideo = async (
   api: CloudApi,
-  input: CloudSourceVideoRequest
+  input: CloudSourceVideoRequest,
+  work: RendererLibraryWork
 ): Promise<CloudSourceVideo> => {
-  const assetLink = await bridge().cloud.links.get("asset", input.localAssetId);
+  const remote = bindCloudApiToLibrary(api, work);
+  const assetLink = await work.boundary(() =>
+    bridge().cloud.links.get("asset", input.localAssetId)
+  );
   const isSourceVideoOwnedByCloud = assetLink?.data.origin === "cloud";
   if (assetLink && isSourceVideoOwnedByCloud)
     return toCloudSourceVideo(assetLink);
@@ -352,9 +432,8 @@ const ensureCloudSourceVideo = async (
     localShotId: input.localShotId,
     sourceVideoTrimKey
   });
-  const shotSourceVideoLink = await bridge().cloud.links.get(
-    "asset",
-    sourceVideoLinkLocalId
+  const shotSourceVideoLink = await work.boundary(() =>
+    bridge().cloud.links.get("asset", sourceVideoLinkLocalId)
   );
   const isShotSourceVideoLinkReusable = isCloudSourceVideoLinkReusable(
     shotSourceVideoLink,
@@ -366,24 +445,32 @@ const ensureCloudSourceVideo = async (
   const hasShotEverLinkedThisSourceVideo = !!shotSourceVideoLink;
   const adoptedSourceVideo = hasShotEverLinkedThisSourceVideo
     ? null
-    : await adoptAssetScopedCloudSourceVideoLink(api, {
-        localAssetId: input.localAssetId,
-        cloudTimelineId: input.cloudTimelineId,
-        sourceVideoTrimKey,
-        sourceVideoLinkLocalId
-      });
+    : await adoptAssetScopedCloudSourceVideoLink(
+        api,
+        {
+          localAssetId: input.localAssetId,
+          cloudTimelineId: input.cloudTimelineId,
+          sourceVideoTrimKey,
+          sourceVideoLinkLocalId
+        },
+        work
+      );
   if (adoptedSourceVideo) return adoptedSourceVideo;
 
+  // Main owns and drains upload/preparation. The renderer acknowledgement
+  // must not wait for an abort that is only issued after it.
   // The trim is applied locally, so the metadata file that would tell ingestion
   // to trim is deliberately not written -- sending it would trim twice.
-  input.onProgress?.("encoding");
-  await bridge().cloud.prepareUpload({
-    assetId: input.localAssetId,
-    trimStartSeconds: input.trimStartSeconds,
-    trimEndSeconds: input.trimEndSeconds
-  });
+  reportMirrorProgress(work, input.onProgress, "encoding");
+  await runRendererLibraryRequest(work, () =>
+    bridge().cloud.prepareUpload({
+      assetId: input.localAssetId,
+      trimStartSeconds: input.trimStartSeconds,
+      trimEndSeconds: input.trimEndSeconds
+    })
+  );
 
-  const registration = await api.post<Record<string, unknown>>(
+  const registration = await remote.post<Record<string, unknown>>(
     "/assets/video/upload",
     { name: input.name, ext: "mp4", timeline_id: input.cloudTimelineId }
   );
@@ -409,41 +496,49 @@ const ensureCloudSourceVideo = async (
 
   // The layer id is only in this response, and a render needs it as its input.
   const cloudLayerId = findUploadedLayerId(registration, cloudAssetId);
-  await bridge().cloud.links.put({
-    kind: "asset",
-    localId: sourceVideoLinkLocalId,
-    cloudId: cloudAssetId,
-    data: {
-      status: "uploading",
-      sourceVideoTrimKey,
-      cloudTimelineId: input.cloudTimelineId,
-      ...(cloudLayerId ? { cloudLayerId } : {})
-    }
-  });
+  await work.boundary(() =>
+    bridge().cloud.links.put({
+      kind: "asset",
+      localId: sourceVideoLinkLocalId,
+      cloudId: cloudAssetId,
+      data: {
+        status: "uploading",
+        sourceVideoTrimKey,
+        cloudTimelineId: input.cloudTimelineId,
+        ...(cloudLayerId ? { cloudLayerId } : {})
+      }
+    })
+  );
 
-  input.onProgress?.("uploading");
-  await bridge().cloud.uploadPrepared({
-    assetId: input.localAssetId,
-    trimStartSeconds: input.trimStartSeconds,
-    trimEndSeconds: input.trimEndSeconds,
-    presignedUrl: videoUrl
-  });
+  reportMirrorProgress(work, input.onProgress, "uploading");
+  await runRendererLibraryRequest(work, () =>
+    bridge().cloud.uploadPrepared({
+      assetId: input.localAssetId,
+      trimStartSeconds: input.trimStartSeconds,
+      trimEndSeconds: input.trimEndSeconds,
+      presignedUrl: videoUrl
+    })
+  );
 
-  input.onProgress?.("ingesting");
-  await api.post(`/assets/${cloudAssetId}/ingestion`, {});
-  await bridge().cloud.links.patch({
-    kind: "asset",
-    localId: sourceVideoLinkLocalId,
-    patch: { status: "processing" }
-  });
+  reportMirrorProgress(work, input.onProgress, "ingesting");
+  await remote.post(`/assets/${cloudAssetId}/ingestion`, {});
+  await work.boundary(() =>
+    bridge().cloud.links.patch({
+      kind: "asset",
+      localId: sourceVideoLinkLocalId,
+      patch: { status: "processing" }
+    })
+  );
 
-  await waitForIngestion(api, cloudAssetId);
+  await waitForIngestion(api, cloudAssetId, {}, work);
 
-  await bridge().cloud.links.patch({
-    kind: "asset",
-    localId: sourceVideoLinkLocalId,
-    patch: { status: "ingested" }
-  });
+  await work.boundary(() =>
+    bridge().cloud.links.patch({
+      kind: "asset",
+      localId: sourceVideoLinkLocalId,
+      patch: { status: "ingested" }
+    })
+  );
   return {
     cloudAssetId,
     cloudLayerId,
@@ -453,8 +548,10 @@ const ensureCloudSourceVideo = async (
 
 export const ensureCloudAsset = async (
   api: CloudApi,
-  input: CloudSourceVideoRequest
-): Promise<string> => (await ensureCloudSourceVideo(api, input)).cloudAssetId;
+  input: CloudSourceVideoRequest,
+  work = rendererLibrary.capture()
+): Promise<string> =>
+  (await ensureCloudSourceVideo(api, input, work)).cloudAssetId;
 
 const fetchIngestionStatus = async (
   api: CloudApi,
@@ -472,13 +569,16 @@ const fetchIngestionStatus = async (
 export const waitForIngestion = async (
   api: CloudApi,
   cloudAssetId: string,
-  options: { attempts?: number; intervalMs?: number } = {}
+  options: { attempts?: number; intervalMs?: number } = {},
+  work = rendererLibrary.capture()
 ): Promise<void> => {
+  const remote = bindCloudApiToLibrary(api, work);
   const attempts = options.attempts ?? INGESTION_POLL_ATTEMPTS;
   const intervalMs = options.intervalMs ?? INGESTION_POLL_INTERVAL_MS;
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const response = await fetchIngestionStatus(api, cloudAssetId);
+    const response = await fetchIngestionStatus(remote, cloudAssetId);
+    work.check();
     const status = ingestionStatus(response);
     if (status === "ingested") return;
     if (status === "error" || status === "failed") {
@@ -486,7 +586,8 @@ export const waitForIngestion = async (
         describeIngestionErrorPayload(response.asset?.data?.error)
       );
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    await waitForPollTick(intervalMs, work.signal);
+    work.check();
   }
   throw new Error("Cloud ingestion did not finish in time");
 };
@@ -507,7 +608,8 @@ export const ensureMirroredShot = async (
     trimStartSeconds?: number;
     trimEndSeconds?: number;
     onProgress?: MirrorProgress;
-  }
+  },
+  work = rendererLibrary.capture()
 ): Promise<{
   cloudProjectId: string;
   cloudTimelineId: string;
@@ -516,49 +618,67 @@ export const ensureMirroredShot = async (
   cloudLayerId: string | null;
   cloudSourceVideoLinkLocalId: string;
 }> => {
-  input.onProgress?.("project");
-  const cloudProjectId = await ensureCloudProject(api, {
-    localProjectId: input.localProjectId,
-    name: input.projectName
-  });
+  await work.ready();
+  reportMirrorProgress(work, input.onProgress, "project");
+  const cloudProjectId = await ensureCloudProject(
+    api,
+    {
+      localProjectId: input.localProjectId,
+      name: input.projectName
+    },
+    work
+  );
 
-  input.onProgress?.("timeline");
-  let cloudTimelineId = await ensureCloudTimeline(api, {
-    localShotId: input.localShotId,
-    localProjectId: input.localProjectId,
-    cloudProjectId,
-    name: input.shotName
-  });
-
-  input.onProgress?.("asset");
-  const ensureSourceVideo = () =>
-    ensureCloudSourceVideo(api, {
-      localAssetId: input.localAssetId,
+  reportMirrorProgress(work, input.onProgress, "timeline");
+  let cloudTimelineId = await ensureCloudTimeline(
+    api,
+    {
       localShotId: input.localShotId,
-      cloudTimelineId,
-      name: input.assetName,
-      trimStartSeconds: input.trimStartSeconds,
-      trimEndSeconds: input.trimEndSeconds,
-      onProgress: input.onProgress
-    });
+      localProjectId: input.localProjectId,
+      cloudProjectId,
+      name: input.shotName
+    },
+    work
+  );
+
+  reportMirrorProgress(work, input.onProgress, "asset");
+  const ensureSourceVideo = () =>
+    ensureCloudSourceVideo(
+      api,
+      {
+        localAssetId: input.localAssetId,
+        localShotId: input.localShotId,
+        cloudTimelineId,
+        name: input.assetName,
+        trimStartSeconds: input.trimStartSeconds,
+        trimEndSeconds: input.trimEndSeconds,
+        onProgress: input.onProgress
+      },
+      work
+    );
 
   let sourceVideo: CloudSourceVideo;
   try {
     sourceVideo = await ensureSourceVideo();
   } catch (error) {
+    work.check();
     if (!(error instanceof CloudTimelineOccupiedError)) throw error;
 
-    input.onProgress?.("timeline");
-    cloudTimelineId = await createCloudTimeline(api, {
-      localShotId: input.localShotId,
-      cloudProjectId,
-      name: input.shotName
-    });
-    input.onProgress?.("asset");
+    reportMirrorProgress(work, input.onProgress, "timeline");
+    cloudTimelineId = await createCloudTimeline(
+      api,
+      {
+        localShotId: input.localShotId,
+        cloudProjectId,
+        name: input.shotName
+      },
+      work
+    );
+    reportMirrorProgress(work, input.onProgress, "asset");
     sourceVideo = await ensureSourceVideo();
   }
 
-  input.onProgress?.("done");
+  reportMirrorProgress(work, input.onProgress, "done");
   return { cloudProjectId, cloudTimelineId, ...sourceVideo };
 };
 
@@ -574,12 +694,17 @@ export const ensureCloudImageAsset = async (
   api: CloudApi,
   localAssetId: string,
   cloudProjectId?: string,
-  onProgress?: MirrorProgress
+  onProgress?: MirrorProgress,
+  work = rendererLibrary.capture()
 ): Promise<string> => {
-  const existing = await bridge().cloud.links.get("asset", localAssetId);
+  const existing = await work.boundary(() =>
+    bridge().cloud.links.get("asset", localAssetId)
+  );
   if (existing && isCloudAssetLinkReusable(existing)) return existing.cloudId;
 
-  const info = await bridge().cloud.assetInfo(localAssetId);
+  const info = await work.boundary(() =>
+    bridge().cloud.assetInfo(localAssetId)
+  );
   if (!info) throw new Error("The reference image could not be found locally");
   const cloudImageSize = toCloudImageSize(info);
   if (!cloudImageSize) {
@@ -588,8 +713,8 @@ export const ensureCloudImageAsset = async (
     );
   }
 
-  onProgress?.("asset");
-  const registered = await api.post<{
+  reportMirrorProgress(work, onProgress, "asset");
+  const registered = await bindCloudApiToLibrary(api, work).post<{
     asset?: { id?: unknown };
     s3_url?: unknown;
     thumbnail_s3_url?: unknown;
@@ -606,24 +731,30 @@ export const ensureCloudImageAsset = async (
     throw new Error("Cloud Mago did not return an uploadable image asset");
   }
 
-  onProgress?.("uploading");
-  await bridge().cloud.uploadAsset({
-    assetId: localAssetId,
-    presignedUrl: uploadUrl
-  });
-  if (typeof thumbnailUploadUrl === "string" && thumbnailUploadUrl) {
-    await bridge().cloud.uploadAsset({
+  reportMirrorProgress(work, onProgress, "uploading");
+  await runRendererLibraryRequest(work, () =>
+    bridge().cloud.uploadAsset({
       assetId: localAssetId,
-      presignedUrl: thumbnailUploadUrl
-    });
+      presignedUrl: uploadUrl
+    })
+  );
+  if (typeof thumbnailUploadUrl === "string" && thumbnailUploadUrl) {
+    await runRendererLibraryRequest(work, () =>
+      bridge().cloud.uploadAsset({
+        assetId: localAssetId,
+        presignedUrl: thumbnailUploadUrl
+      })
+    );
   }
-  await bridge().cloud.links.put({
-    kind: "asset",
-    localId: localAssetId,
-    cloudId: cloudAssetId,
-    // Images are usable as soon as they are uploaded: no ingestion step.
-    data: { status: "ingested", kind: "image" }
-  });
-  onProgress?.("done");
+  await work.boundary(() =>
+    bridge().cloud.links.put({
+      kind: "asset",
+      localId: localAssetId,
+      cloudId: cloudAssetId,
+      // Images are usable as soon as they are uploaded: no ingestion step.
+      data: { status: "ingested", kind: "image" }
+    })
+  );
+  reportMirrorProgress(work, onProgress, "done");
   return cloudAssetId;
 };

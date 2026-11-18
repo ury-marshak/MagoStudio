@@ -13,6 +13,11 @@ import {
   isLocalVideoModel
 } from "@/platform/localVideoModels";
 import {
+  rendererLibrary,
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+import {
   isVideoModelAvailable,
   videoRenderTarget
 } from "@/platform/renderTarget";
@@ -32,8 +37,13 @@ export type PostRenderParams = BuildRenderPayloadInput;
  * Reads the track back out of the local library after a submit, so callers get
  * the same shape the cloud endpoint would have returned.
  */
-const reloadLocalTrack = async (trackId: string): Promise<Layer> => {
-  const projects = await getLocalDesktopApi().projects.listAll();
+const reloadLocalTrack = async (
+  trackId: string,
+  work: RendererLibraryWork
+): Promise<Layer> => {
+  const projects = await work.boundary(() =>
+    getLocalDesktopApi().projects.listAll()
+  );
   for (const project of projects) {
     const timelines = (project.timelines ?? []) as Array<
       Record<string, unknown>
@@ -49,8 +59,10 @@ const reloadLocalTrack = async (trackId: string): Promise<Layer> => {
 
 export const postRender = async (
   params: PostRenderParams,
-  onProgress?: MirrorProgress
+  onProgress?: MirrorProgress,
+  work = rendererLibrary.capture()
 ): Promise<Layer> => {
+  work.check();
   const body = buildRenderPayload(params);
   const settings = body.render_settings.magov2;
   const requestedModel =
@@ -82,45 +94,54 @@ export const postRender = async (
     const doesLocalModelRenderFromSourceVideo =
       !isImageToVideoLocalVideoModel(localModel);
     const api = getLocalDesktopApi();
-    await api.videoRenders.submit({
-      outputTrackId: params.parentLayerId,
-      ...(doesLocalModelRenderFromSourceVideo
-        ? { inputTrackId: params.inputTrackId }
-        : {}),
-      frameRange,
-      fps: params.fps,
-      model: localModel,
-      referenceImageIds,
-      estimatedCostUsd: 0,
-      settings: localRenderSettings
-    });
-    return reloadLocalTrack(params.parentLayerId);
+    await runRendererLibraryRequest(work, () =>
+      api.videoRenders.submit({
+        outputTrackId: params.parentLayerId,
+        ...(doesLocalModelRenderFromSourceVideo
+          ? { inputTrackId: params.inputTrackId }
+          : {}),
+        frameRange,
+        fps: params.fps,
+        model: localModel,
+        referenceImageIds,
+        estimatedCostUsd: 0,
+        settings: localRenderSettings
+      })
+    );
+    return reloadLocalTrack(params.parentLayerId, work);
   }
 
   // A cloud model inside the desktop app: mirror the shot, submit, and record the
   // job locally so the editor shows it straight away.
   if (isLocalApp && isImageToVideoModel(requestedModel)) {
-    const projects = await getLocalDesktopApi().projects.listAll();
+    const projects = await work.boundary(() =>
+      getLocalDesktopApi().projects.listAll()
+    );
     const imageToVideoContext = resolveImageToVideoRenderContext(projects, {
       outputTrackId: params.parentLayerId
     });
     if (!imageToVideoContext) {
       throw new Error("This shot could not be prepared for a cloud render");
     }
-    await submitCloudImageToVideoRender(backendCloudApi(), {
-      payload: body,
-      local: imageToVideoContext,
-      model: requestedModel ?? "",
-      fps: params.fps,
-      frameRange: params.frameRange as [number, number],
-      onProgress
-    });
-    return reloadLocalTrack(params.parentLayerId);
+    await submitCloudImageToVideoRender(
+      backendCloudApi(),
+      {
+        payload: body,
+        local: imageToVideoContext,
+        model: requestedModel ?? "",
+        fps: params.fps,
+        frameRange: params.frameRange as [number, number],
+        onProgress
+      },
+      undefined,
+      work
+    );
+    return reloadLocalTrack(params.parentLayerId, work);
   }
 
   if (isLocalApp) {
     const api = getLocalDesktopApi();
-    const projects = await api.projects.listAll();
+    const projects = await work.boundary(() => api.projects.listAll());
     const context = resolveRenderContext(projects, {
       outputTrackId: params.parentLayerId,
       inputTrackId: params.inputTrackId
@@ -129,17 +150,24 @@ export const postRender = async (
       throw new Error("This shot could not be prepared for a cloud render");
     }
     const frameRange = params.frameRange as [number, number];
-    await submitCloudRender(backendCloudApi(), {
-      payload: body,
-      local: context,
-      model: requestedModel ?? "",
-      fps: params.fps,
-      frameRange,
-      onProgress
-    });
-    return reloadLocalTrack(params.parentLayerId);
+    await submitCloudRender(
+      backendCloudApi(),
+      {
+        payload: body,
+        local: context,
+        model: requestedModel ?? "",
+        fps: params.fps,
+        frameRange,
+        onProgress
+      },
+      undefined,
+      work
+    );
+    return reloadLocalTrack(params.parentLayerId, work);
   }
 
-  const response = await backendApiClient.post(`/assets/add_render`, body);
+  const response = await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.post(`/assets/add_render`, body, { signal })
+  );
   return response.data;
 };

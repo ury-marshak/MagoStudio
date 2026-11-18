@@ -16,6 +16,7 @@ vi.mock("@/lib/backend-api-client", () => ({
 vi.mock("@/platform/localDesktop", () => ({
   isLocalApp: true,
   getLocalDesktopApi: () => ({
+    library: { onWillChange: async () => {}, onDidChange: () => {} },
     videoRenders: { submit },
     projects: { listAll }
   })
@@ -113,7 +114,9 @@ describe("postRender — a local Image-to-Video render", () => {
                 })
               }
             })
-          })
+          }),
+          undefined,
+          expect.objectContaining({ signal: expect.any(AbortSignal) })
         );
       } else {
         await expect(submitImageToVideoRender(model)).rejects.toThrow(

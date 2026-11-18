@@ -1,9 +1,10 @@
 /* oxlint-disable local/no-cross-domain-internal-imports -- the composed fixture exercises the real renderer mutation APIs without mounting pages */
 
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable, Writable } from "node:stream";
 
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
@@ -20,7 +21,8 @@ const fixture = vi.hoisted(() => ({
   folder: "",
   calls: [] as string[],
   backend: vi.fn(),
-  mutation: vi.fn()
+  mutation: vi.fn(),
+  putObject: vi.fn()
 }));
 vi.mock("electron", () => ({
   app: { isPackaged: false, getAppPath: () => process.cwd() },
@@ -40,7 +42,11 @@ vi.mock("electron", () => ({
       );
     },
     on: (name: string, listener: (...args: any[]) => any) =>
-      fixture.listeners.set(name, listener)
+      fixture.listeners.set(name, listener),
+    removeListener: (name: string, listener: (...args: any[]) => any) => {
+      if (fixture.listeners.get(name) === listener)
+        fixture.listeners.delete(name);
+    }
   },
   contextBridge: {
     exposeInMainWorld: (_name: string, api: MagoDesktopApi) => {
@@ -57,6 +63,14 @@ vi.mock("electron", () => ({
   },
   shell: {}
 }));
+vi.mock("node:https", async (original) => {
+  const https = await original<typeof import("node:https")>();
+  return {
+    ...https,
+    request: fixture.putObject,
+    default: { ...https, request: fixture.putObject }
+  };
+});
 vi.mock("@/platform/localDesktop", () => ({
   isLocalApp: true,
   getLocalDesktopApi: () => fixture.api
@@ -74,6 +88,8 @@ import { CloudProjectMirrorRepository } from "../../../desktop/main/database/clo
 import { DatabaseManager } from "../../../desktop/main/database/databaseManager";
 import { ProjectRepository } from "../../../desktop/main/database/projectRepository";
 import {
+  assets,
+  cloudRenderJobs,
   projects,
   scriptProjectSnapshots,
   shots,
@@ -86,9 +102,9 @@ import type { LibrarySettings } from "../../../desktop/main/librarySettings";
 
 const directories: string[] = [];
 const managers: DatabaseManager[] = [];
-const deferred = () => {
-  let resolve!: () => void;
-  const promise = new Promise<void>((yes) => {
+const deferred = <T = void>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => {
     resolve = yes;
   });
   return { promise, resolve };
@@ -104,6 +120,9 @@ beforeEach(async () => {
   fixture.calls.length = 0;
   fixture.backend.mockReset();
   fixture.mutation.mockReset();
+  fixture.putObject.mockReset().mockImplementation(() => {
+    throw new Error("Unexpected PUT");
+  });
   fixture.sender = Object.assign(new EventEmitter(), {
     isDestroyed: () => false,
     send: vi.fn((channel: string, ...args: unknown[]) =>
@@ -128,7 +147,8 @@ afterEach(async () => {
 });
 
 const setupLibraries = async (
-  type: "timeline" | "script_to_shots" = "timeline"
+  type: "timeline" | "script_to_shots" = "timeline",
+  origin: "local" | "cloud" = "cloud"
 ) => {
   const root = await mkdtemp(
     path.join(tmpdir(), "mago-cloud-producer-libraries-")
@@ -145,7 +165,7 @@ const setupLibraries = async (
       .values({
         id: "reused",
         name: library,
-        settingsJson: JSON.stringify({ origin: "cloud", type }),
+        settingsJson: JSON.stringify({ origin, type }),
         createdAt: new Date(),
         updatedAt: new Date()
       });
@@ -155,6 +175,18 @@ const setupLibraries = async (
       name: library,
       createdAt: new Date(),
       updatedAt: new Date()
+    });
+    const sourcePath = path.join(library, "source.mp4");
+    await writeFile(sourcePath, library);
+    await manager.get().insert(assets).values({
+      id: "same-asset",
+      name: library,
+      type: "video",
+      sourcePath,
+      status: "available",
+      width: 640,
+      height: 480,
+      frameCount: 100
     });
     await manager.get().insert(tracks).values({
       id: "same-track",
@@ -218,11 +250,52 @@ const setupLibraries = async (
     databaseManager: manager,
     settings
   });
+  const cloudLinkModule = "../../../desktop/main/cloud/cloudLinkRepository.ts";
+  const jobModule = "../../../desktop/main/cloud/cloudRenderJobRepository.ts";
+  const uploadModule = "../../../desktop/main/cloud/uploadService.ts";
+  const submitModule =
+    "../../../desktop/main/cloud/cloudRenderSubmitService.ts";
+  const cloudHandlerModule =
+    "../../../desktop/main/ipc/registerCloudHandlers.ts";
+  const [
+    { CloudLinkRepository },
+    { CloudRenderJobRepository },
+    { UploadService },
+    { CloudRenderSubmitService },
+    { registerCloudHandlers }
+  ] = await Promise.all([
+    import(cloudLinkModule),
+    import(jobModule),
+    import(uploadModule),
+    import(submitModule),
+    import(cloudHandlerModule)
+  ]);
+  const links = new CloudLinkRepository(manager);
+  const renderJobs = new CloudRenderJobRepository(manager);
+  const uploads = new UploadService(getLibraryRoot);
+  const renderSubmits = new CloudRenderSubmitService(manager, getLibraryRoot);
+  registerCloudHandlers({
+    links,
+    renderJobs,
+    uploads,
+    renderSubmits,
+    repository: projectRepository,
+    databaseManager: manager,
+    getLibraryRoot,
+    settings
+  });
+  const cloudOwners = [
+    links.libraryWork,
+    renderJobs.libraryWork,
+    uploads.libraryWork,
+    renderSubmits.libraryWork
+  ];
   const beforeLibraryChange = vi.fn(async () => {
     await Promise.all([
       mirror.libraryWork.suspend(),
       snapshots.libraryWork.suspend(),
-      service.suspendPlans()
+      service.suspendPlans(),
+      ...cloudOwners.map((owner) => owner.suspend())
     ]);
   });
   registerLibraryHandlers({
@@ -234,6 +307,7 @@ const setupLibraries = async (
       mirror.libraryWork.reset();
       snapshots.libraryWork.reset();
       service.resetPlans();
+      for (const owner of cloudOwners) owner.reset();
     }
   });
   return {
@@ -566,9 +640,17 @@ it.each(["opening", "settings"] as const)(
     await expect(updateProject(rename)).rejects.toMatchObject({
       name: "AbortError"
     });
+    await expect(startRender("video")).rejects.toMatchObject({
+      name: "AbortError"
+    });
     held.resolve();
     expect(await choosing).toMatchObject({ message: `Failed ${stage}` });
-    for (const start of Object.values(actions)) {
+    for (const start of [
+      ...Object.values(actions),
+      () => startRender("video"),
+      () => startRender("image"),
+      () => startRender("i2v")
+    ]) {
       await expect(start()).rejects.toMatchObject({ name: "AbortError" });
     }
     expect(fixture.calls).toEqual(issued);
@@ -576,3 +658,452 @@ it.each(["opening", "settings"] as const)(
     expect(fixture.mutation).not.toHaveBeenCalled();
   }
 );
+
+const reusedLocal = {
+  projectId: "reused",
+  projectName: "Project",
+  shotId: "same-shot",
+  shotName: "Shot",
+  assetId: "same-asset",
+  assetName: "Source",
+  outputTrackId: "same-track"
+};
+
+const rememberRenderInputs = async () => {
+  for (const [kind, localId, cloudId] of [
+    ["project", "reused", "cloud-project"],
+    ["timeline", "same-shot", "cloud-shot"],
+    ["asset", "same-asset", "cloud-source"]
+  ] as const) {
+    await fixture.api.cloud.links.put({
+      kind,
+      localId,
+      cloudId,
+      data: { origin: "cloud", cloudLayerId: "cloud-layer" }
+    });
+  }
+};
+
+const startRender = async (
+  kind: "video" | "image" | "i2v",
+  onProgress = vi.fn()
+) => {
+  const { backendCloudApi } = await import("@domains/cloud/backendCloudApi");
+  const payload = {
+    parent_layer_id: "same-track",
+    frame_range: [0, 24],
+    render_mode: "credits",
+    render_settings: { magov2: { image_id: "same-asset" } },
+    sources: {},
+    render_engine: "magov2"
+  };
+  const input = {
+    payload,
+    local: reusedLocal,
+    model: "fixture-model",
+    fps: 24,
+    frameRange: [0, 24] as [number, number],
+    onProgress
+  };
+  if (kind === "i2v") {
+    const { submitCloudImageToVideoRender } =
+      await import("@domains/cloud/submitCloudImageToVideoRender");
+    return submitCloudImageToVideoRender(backendCloudApi(), input);
+  }
+  if (kind === "image") {
+    const { submitCloudImg2ImgRender } =
+      await import("@domains/cloud/submitCloudImg2ImgRender");
+    return submitCloudImg2ImgRender(backendCloudApi(), {
+      payload: {
+        settings: {},
+        frame: 0,
+        img_file_type: "jpg",
+        render_mode: "credits",
+        render_model: input.model
+      },
+      local: reusedLocal,
+      onProgress
+    });
+  }
+  const { submitCloudRender } =
+    await import("@domains/cloud/submitCloudRender");
+  return submitCloudRender(backendCloudApi(), input);
+};
+
+const accepted = (id: string) => ({
+  data: { clips: [{ id: `clip-${id}`, asset: { id } }] }
+});
+
+it.each(["video", "image", "i2v"] as const)(
+  "never registers, deletes or repeats a late accepted %s render after replacing its library",
+  async (kind) => {
+    const { manager, roots } = await setupLibraries("timeline", "local");
+    await rememberRenderInputs();
+    const entered = deferred<AbortSignal>();
+    const response = deferred<ReturnType<typeof accepted>>();
+    const endpoint =
+      kind === "image" ? "/assets/img2img/render" : "/assets/add_render";
+    fixture.backend.mockResolvedValue({ data: { layer_order: 1 } });
+    fixture.mutation.mockImplementation(async (url, _body, config) => {
+      if (url === "/layers") return { data: { id: "output-layer" } };
+      if (url !== endpoint) throw new Error(`Unexpected mutation ${url}`);
+      if (
+        fixture.mutation.mock.calls.filter(([path]) => path === endpoint)
+          .length === 1
+      ) {
+        entered.resolve(config.signal);
+        return response.promise;
+      }
+      return accepted("replacement-job");
+    });
+    const onProgress = vi.fn();
+    const old = startRender(kind, onProgress).catch((error: unknown) => error);
+    const oldSignal = await entered.promise;
+    await fixture.api.library.choose();
+    expect(oldSignal.aborted).toBe(true);
+    await rememberRenderInputs();
+    await expect(startRender(kind)).resolves.toMatchObject({
+      cloudAssetId: "replacement-job"
+    });
+    const ipcBefore = fixture.calls.slice();
+    const progressBefore = onProgress.mock.calls.slice();
+    response.resolve(accepted("old-job"));
+    expect(await old).toMatchObject({ name: "AbortError" });
+    expect(fixture.calls).toEqual(ipcBefore);
+    expect(onProgress.mock.calls).toEqual(progressBefore);
+    expect(fixture.mutation.mock.calls.map(([url]) => url)).toEqual(
+      kind === "image"
+        ? [endpoint, endpoint]
+        : ["/layers", endpoint, "/layers", endpoint]
+    );
+    expect(await manager.get().select().from(cloudRenderJobs)).toEqual([
+      expect.objectContaining({
+        cloudAssetId: "replacement-job",
+        projectId: "reused"
+      })
+    ]);
+    await manager.open(roots[0]);
+    expect(await manager.get().select().from(cloudRenderJobs)).toEqual([]);
+  }
+);
+
+it("drains an issued render registration into the original database before acknowledgement", async () => {
+  const { manager, roots, beforeLibraryChange } = await setupLibraries();
+  await rememberRenderInputs();
+  const entered = deferred();
+  const release = deferred();
+  const transaction = manager.transaction.bind(manager);
+  vi.spyOn(manager, "transaction").mockImplementationOnce(async (run) => {
+    entered.resolve();
+    await release.promise;
+    return transaction(run);
+  });
+  fixture.mutation.mockResolvedValue(accepted("issued-job"));
+  const old = startRender("image").catch((error: unknown) => error);
+  await entered.promise;
+  const changing = fixture.api.library.choose();
+  await flush();
+  expect(beforeLibraryChange).not.toHaveBeenCalled();
+  release.resolve();
+  await changing;
+  expect(await old).toMatchObject({ name: "AbortError" });
+  expect(await manager.get().select().from(cloudRenderJobs)).toEqual([]);
+  expect(fixture.mutation.mock.calls.map(([url]) => url)).toEqual([
+    "/assets/img2img/render"
+  ]);
+  await manager.open(roots[0]);
+  expect(await manager.get().select().from(cloudRenderJobs)).toEqual([
+    expect.objectContaining({ cloudAssetId: "issued-job", projectId: "reused" })
+  ]);
+});
+
+it("does not let an old project resolution or its finally retarget a reused ID", async () => {
+  await setupLibraries();
+  const { ensureCloudProject } = await import("@domains/cloud/mirrorService");
+  const { backendCloudApi } = await import("@domains/cloud/backendCloudApi");
+  const first = deferred<{ data: { id: string } }>();
+  const second = deferred<{ data: { id: string } }>();
+  fixture.mutation
+    .mockReturnValueOnce(first.promise)
+    .mockReturnValueOnce(second.promise);
+  const resolve = () =>
+    ensureCloudProject(backendCloudApi(), {
+      localProjectId: "reused",
+      name: "Same name"
+    });
+  const old = resolve().catch((error: unknown) => error);
+  await vi.waitFor(() => expect(fixture.mutation).toHaveBeenCalledTimes(1));
+  await fixture.api.library.choose();
+  const replacement = resolve();
+  await vi.waitFor(() => expect(fixture.mutation).toHaveBeenCalledTimes(2));
+  first.resolve({ data: { id: "old-cloud-id" } });
+  const calls = fixture.calls.slice();
+  expect(await old).toMatchObject({ name: "AbortError" });
+  expect(fixture.calls).toEqual(calls);
+  const coalesced = resolve();
+  second.resolve({ data: { id: "replacement-cloud-id" } });
+  expect(await Promise.all([replacement, coalesced])).toEqual([
+    "replacement-cloud-id",
+    "replacement-cloud-id"
+  ]);
+  expect(fixture.mutation).toHaveBeenCalledTimes(2);
+  expect(await fixture.api.cloud.links.get("project", "reused")).toMatchObject({
+    cloudId: "replacement-cloud-id"
+  });
+});
+
+it("reconfirms a project and timeline linked to the same cloud IDs in the next library", async () => {
+  await setupLibraries();
+  const { ensureCloudProject, ensureCloudTimeline } =
+    await import("@domains/cloud/mirrorService");
+  const { backendCloudApi } = await import("@domains/cloud/backendCloudApi");
+  const seedAndVerify = async () => {
+    await fixture.api.cloud.links.put({
+      kind: "project",
+      localId: "reused",
+      cloudId: "cloud-project"
+    });
+    await fixture.api.cloud.links.put({
+      kind: "timeline",
+      localId: "same-shot",
+      cloudId: "cloud-shot"
+    });
+    await expect(
+      ensureCloudProject(backendCloudApi(), {
+        localProjectId: "reused",
+        name: "Project"
+      })
+    ).resolves.toBe("cloud-project");
+    await expect(
+      ensureCloudTimeline(backendCloudApi(), {
+        localShotId: "same-shot",
+        cloudProjectId: "cloud-project",
+        name: "Shot"
+      })
+    ).resolves.toBe("cloud-shot");
+  };
+  fixture.backend.mockResolvedValue({ data: { project_id: "cloud-project" } });
+  await seedAndVerify();
+  await fixture.api.library.choose();
+  await seedAndVerify();
+  expect(fixture.backend.mock.calls.map(([url]) => url)).toEqual([
+    "/projects/cloud-project",
+    "/timeline/cloud-shot",
+    "/projects/cloud-project",
+    "/timeline/cloud-shot"
+  ]);
+  expect(fixture.mutation).not.toHaveBeenCalled();
+});
+
+it("acknowledges while an old preparation is still in its account wait, then refuses its continuation", async () => {
+  const { getAppMode } = await setupLibraries();
+  const { ensureCloudAsset } = await import("@domains/cloud/mirrorService");
+  const { backendCloudApi } = await import("@domains/cloud/backendCloudApi");
+  const waiting = deferred();
+  const late = deferred();
+  getAppMode.mockImplementationOnce(async () => {
+    waiting.resolve();
+    await late.promise;
+    return "cloud";
+  });
+  const progress = vi.fn();
+  const pending = ensureCloudAsset(backendCloudApi(), {
+    localAssetId: "same-asset",
+    localShotId: "same-shot",
+    cloudTimelineId: "cloud-shot",
+    name: "Source",
+    onProgress: progress
+  }).catch((error: unknown) => error);
+  await waiting.promise;
+  await fixture.api.library.choose();
+  const ipcBefore = fixture.calls.slice();
+  late.resolve();
+  expect(await pending).toMatchObject({ name: "AbortError" });
+  expect(fixture.calls).toEqual(ipcBefore);
+  expect(progress.mock.calls).toEqual([["encoding"]]);
+  expect(fixture.mutation).not.toHaveBeenCalled();
+  expect(fixture.putObject).not.toHaveBeenCalled();
+});
+
+const queuedPut = () => {
+  const sent = deferred<string>();
+  const closing = deferred();
+  const release = deferred();
+  const chunks: Buffer[] = [];
+  const body = Object.assign(
+    new Readable({
+      read() {},
+      destroy(error, callback) {
+        closing.resolve();
+        void release.promise.then(() => callback(error));
+      }
+    }),
+    { statusCode: 200 }
+  );
+  fixture.putObject.mockImplementationOnce(
+    (_url, _options, onResponse) =>
+      new Writable({
+        write(chunk, _encoding, callback) {
+          chunks.push(Buffer.from(chunk));
+          callback();
+        },
+        final(callback) {
+          onResponse(body);
+          sent.resolve(Buffer.concat(chunks).toString());
+          callback();
+        }
+      })
+  );
+  return {
+    sent: sent.promise,
+    closing: closing.promise,
+    release: release.resolve
+  };
+};
+
+it.each(["file read", "trim body", "video body"] as const)(
+  "does not advance video ingestion across the switch during %s",
+  async (stage) => {
+    const { manager, beforeLibraryChange } = await setupLibraries();
+    const { ingestVideo } = await import("@domains/videoUpload/ingestVideo");
+    const { uploadAssetToS3 } = await import("@domains/asset/api/putAssetOnS3");
+    const file = new File(["library-a-bytes"], "fixture.mp4", {
+      type: "video/mp4"
+    });
+    const read = deferred();
+    const bytes = deferred<ArrayBuffer>();
+    const put = stage === "file read" ? null : queuedPut();
+    if (!put) {
+      vi.spyOn(file, "arrayBuffer").mockImplementationOnce(() => {
+        read.resolve();
+        return bytes.promise;
+      });
+    }
+    const publish = vi.fn();
+    const cache = vi.fn();
+    const invalidate = vi.fn();
+    const progress = vi.fn();
+    const uploaded = vi.fn();
+    const pending = ingestVideo(
+      {
+        projectId: "reused",
+        shotId: "same-shot",
+        file,
+        onProgress: progress,
+        onUploaded: uploaded,
+        ...(stage === "trim body"
+          ? { trimMetadata: { trimStart: 1, trimEnd: 2 } }
+          : {})
+      },
+      {
+        createVideoAsset: async () =>
+          ({
+            video_url: "https://upload.invalid/video",
+            meta_url: "https://upload.invalid/trim",
+            timeline: {
+              layers: [
+                {
+                  id: "same-track",
+                  name: "Source",
+                  type: "IMAGE",
+                  created_at: "2026-01-01",
+                  clips: [{ asset: { id: "same-asset" } }]
+                }
+              ]
+            }
+          }) as never,
+        uploadAssetToS3,
+        publishIngestionJob: publish,
+        fetchVideoAssetStatus: vi.fn(),
+        cacheVideoFile: cache,
+        invalidateAfterIngest: invalidate,
+        waitForPollTick: vi.fn()
+      }
+    );
+    if (put) {
+      const sent = await put.sent;
+      if (stage === "video body") expect(sent).toBe("library-a-bytes");
+      else
+        expect(JSON.parse(sent)).toEqual({
+          "trim-start": 1000,
+          "trim-end": 2000
+        });
+    } else {
+      await read.promise;
+    }
+    const opened = vi.spyOn(manager, "open");
+    const choosing = fixture.api.library.choose();
+    if (put) {
+      await put.closing;
+      await vi.waitFor(() =>
+        expect(beforeLibraryChange).toHaveBeenCalledOnce()
+      );
+      expect(opened).not.toHaveBeenCalled();
+      expect(
+        fixture.calls.filter(
+          (call) => call === IPC_CHANNELS.cloudCancelUploadBytes
+        )
+      ).toHaveLength(1);
+      put.release();
+    }
+    await choosing;
+    const calls = fixture.calls.slice();
+    const progressBefore = progress.mock.calls.slice();
+    bytes.resolve(new ArrayBuffer(12));
+    await expect(pending).resolves.toEqual({ outcome: "cancelled" });
+    expect(fixture.calls).toEqual(calls);
+    expect(fixture.putObject).toHaveBeenCalledTimes(put ? 1 : 0);
+    for (const call of [publish, cache, invalidate, uploaded])
+      expect(call).not.toHaveBeenCalled();
+    expect(progress.mock.calls).toEqual(progressBefore);
+    expect(fixture.listeners.has(IPC_CHANNELS.cloudUploadProgress)).toBe(false);
+  }
+);
+
+it("acknowledges renderer teardown before main drains an issued mirror upload body", async () => {
+  const { manager, roots, beforeLibraryChange } = await setupLibraries();
+  const encodeModule = "../../../desktop/main/cloud/uploadEncode.ts";
+  const { uploadCachePath } = await import(encodeModule);
+  const encoded = path.join(
+    roots[0],
+    uploadCachePath({ assetId: "same-asset" })
+  );
+  await mkdir(path.dirname(encoded), { recursive: true });
+  await writeFile(encoded, "old encoded source");
+  const put = queuedPut();
+  fixture.mutation.mockResolvedValue({
+    data: {
+      video_url: "https://upload.invalid/video",
+      timeline: {
+        layers: [
+          { id: "source-layer", clips: [{ asset: { id: "old-cloud-source" } }] }
+        ]
+      }
+    }
+  });
+  const { backendCloudApi } = await import("@domains/cloud/backendCloudApi");
+  const { ensureCloudAsset } = await import("@domains/cloud/mirrorService");
+  const progress = vi.fn();
+  const pending = ensureCloudAsset(backendCloudApi(), {
+    localAssetId: "same-asset",
+    localShotId: "same-shot",
+    cloudTimelineId: "cloud-shot",
+    name: "Source",
+    onProgress: progress
+  }).catch((error: unknown) => error);
+  await expect(put.sent).resolves.toBe("old encoded source");
+  const opened = vi.spyOn(manager, "open");
+  const choosing = fixture.api.library.choose();
+  await put.closing;
+  expect(beforeLibraryChange).toHaveBeenCalledOnce();
+  expect(opened).not.toHaveBeenCalled();
+  put.release();
+  await choosing;
+  expect(await pending).toMatchObject({ name: "AbortError" });
+  expect(fixture.calls).not.toContain(IPC_CHANNELS.cloudCancelUploadBytes);
+  expect(fixture.calls).not.toContain(IPC_CHANNELS.cloudLinkPatch);
+  expect(fixture.mutation.mock.calls.map(([url]) => url)).toEqual([
+    "/assets/video/upload"
+  ]);
+  expect(progress.mock.calls).toEqual([["encoding"], ["uploading"]]);
+});

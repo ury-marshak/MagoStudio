@@ -10,11 +10,13 @@ const HTTP_STATUS_INTERNAL_SERVER_ERROR = 500;
 export const getVideoAsset = async ({
   assetId,
   selectedLayerId,
-  clerkToken
+  clerkToken,
+  signal
 }: {
   assetId?: string;
   selectedLayerId?: string;
   clerkToken?: string;
+  signal?: AbortSignal;
 }): Promise<VideoAssetResponse> => {
   if (!assetId) {
     return {
@@ -23,10 +25,15 @@ export const getVideoAsset = async ({
   }
 
   try {
-    const response = await backendApiClient.get(`/assets/${assetId}`);
+    signal?.throwIfAborted();
+    const url = `/assets/${assetId}`;
+    const response = signal
+      ? await backendApiClient.get(url, { signal })
+      : await backendApiClient.get(url);
 
     return response.data;
   } catch (error) {
+    signal?.throwIfAborted();
     if (
       error instanceof AxiosError &&
       error.status === HTTP_STATUS_UNPROCESSABLE_ENTITY

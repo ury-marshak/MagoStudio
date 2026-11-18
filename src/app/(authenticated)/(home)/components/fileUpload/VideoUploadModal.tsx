@@ -48,8 +48,7 @@ export const VideoUploadModal: React.FC<VideoUploadModalProps> = ({
       const confirmed = window.confirm(
         t("notifications.upload_cancel_confirm.description")
       );
-      if (!confirmed) return;
-      await cancelUpload();
+      if (!confirmed || !(await cancelUpload())) return;
     }
     onClose();
   };

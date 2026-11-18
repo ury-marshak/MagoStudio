@@ -1,7 +1,8 @@
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
 
 import { findLocalTrackName } from "./findLocalTrackName";
-import { CloudApi } from "./mirrorService";
+import { bindCloudApiToLibrary, CloudApi } from "./mirrorService";
 import { readCloudLayerOrder } from "./readCloudLayerOrder";
 
 const RENDER_LAYER_TYPE = "RENDER";
@@ -26,20 +27,24 @@ export const createCloudOutputLayer = async (
     shotName: string;
     cloudTimelineId: string;
     cloudSourceLayerId: string | null;
-  }
+  },
+  work: RendererLibraryWork
 ): Promise<string> => {
-  const localProjects = await getLocalDesktopApi()
-    .projects.listAll()
-    .catch(() => []);
+  const localProjects = await work.boundary(() =>
+    getLocalDesktopApi()
+      .projects.listAll()
+      .catch(() => [])
+  );
+  const remote = bindCloudApiToLibrary(api, work);
   const outputLayerName =
     findLocalTrackName(localProjects, input.localOutputTrackId) ??
     input.shotName;
   const outputLayerParentOrder = await readSourceLayerOrder(
-    api,
+    remote,
     input.cloudSourceLayerId
   );
 
-  const outputLayer = await api.post<{ id: string }>("/layers", {
+  const outputLayer = await remote.post<{ id: string }>("/layers", {
     timeline_id: input.cloudTimelineId,
     type: RENDER_LAYER_TYPE,
     name: outputLayerName,

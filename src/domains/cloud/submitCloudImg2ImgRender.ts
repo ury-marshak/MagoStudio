@@ -1,10 +1,12 @@
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 import {
   Img2ImgSettingsPayload,
   mirrorImg2ImgSettings
 } from "./mirrorImg2ImgSettings";
 import {
+  bindCloudApiToLibrary,
   CloudApi,
   ensureCloudImageAsset,
   ensureMirroredShot,
@@ -83,32 +85,46 @@ const findRenderClip = (
 
 export const submitCloudImg2ImgRender = async (
   api: CloudApi,
-  input: SubmitCloudImg2ImgRenderInput
+  input: SubmitCloudImg2ImgRenderInput,
+  work = rendererLibrary.capture()
 ): Promise<{ jobId: string; cloudAssetId: string }> => {
-  const mirrored = await ensureMirroredShot(api, {
-    localProjectId: input.local.projectId,
-    projectName: input.local.projectName,
-    localShotId: input.local.shotId,
-    shotName: input.local.shotName,
-    localAssetId: input.local.assetId,
-    assetName: input.local.assetName,
-    onProgress: input.onProgress
-  });
+  const mirrored = await ensureMirroredShot(
+    api,
+    {
+      localProjectId: input.local.projectId,
+      projectName: input.local.projectName,
+      localShotId: input.local.shotId,
+      shotName: input.local.shotName,
+      localAssetId: input.local.assetId,
+      assetName: input.local.assetName,
+      onProgress: input.onProgress
+    },
+    work
+  );
 
   // Reference images and an uploaded or iterated input image are local assets
   // the cloud has never seen, so each is mirrored and its id swapped.
   const settings = await mirrorImg2ImgSettings(
     input.payload.settings,
     (localAssetId) =>
-      ensureCloudImageAsset(api, localAssetId, mirrored.cloudProjectId)
+      ensureCloudImageAsset(
+        api,
+        localAssetId,
+        mirrored.cloudProjectId,
+        undefined,
+        work
+      )
   );
 
-  const submitted = await api.post<unknown>("/assets/img2img/render", {
-    ...input.payload,
-    settings,
-    source_asset: mirrored.cloudAssetId,
-    timeline_id: mirrored.cloudTimelineId
-  });
+  const submitted = await bindCloudApiToLibrary(api, work).post<unknown>(
+    "/assets/img2img/render",
+    {
+      ...input.payload,
+      settings,
+      source_asset: mirrored.cloudAssetId,
+      timeline_id: mirrored.cloudTimelineId
+    }
+  );
   const clip = findRenderClip(submitted);
   if (!clip) {
     throw new Error("Cloud Mago did not return a render output asset");
@@ -117,17 +133,19 @@ export const submitCloudImg2ImgRender = async (
   const { input_image: _inlineInputImage, ...localSettingsToRecord } =
     input.payload.settings;
 
-  const registered = await bridge().cloud.renders.registerImage({
-    projectId: input.local.projectId,
-    shotId: input.local.shotId,
-    sourceAssetId: input.local.assetId,
-    model: input.payload.render_model,
-    frame: input.payload.frame,
-    name: input.payload.name ?? input.local.shotName,
-    cloudAssetId: clip.assetId,
-    cloudClipId: clip.clipId,
-    settings: localSettingsToRecord
-  });
+  const registered = await work.boundary(() =>
+    bridge().cloud.renders.registerImage({
+      projectId: input.local.projectId,
+      shotId: input.local.shotId,
+      sourceAssetId: input.local.assetId,
+      model: input.payload.render_model,
+      frame: input.payload.frame,
+      name: input.payload.name ?? input.local.shotName,
+      cloudAssetId: clip.assetId,
+      cloudClipId: clip.clipId,
+      settings: localSettingsToRecord
+    })
+  );
 
   return { jobId: registered.jobId, cloudAssetId: clip.assetId };
 };

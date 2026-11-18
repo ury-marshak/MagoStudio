@@ -32,11 +32,13 @@ const getVideoFileExtension = (file: File): string => {
 export const handleVideoAssetCreation = async ({
   selectedFile,
   selectedShotId,
-  createVideoAsset
+  createVideoAsset,
+  signal
 }: {
   selectedFile: File | null;
   selectedShotId: Shot["id"] | undefined;
   createVideoAsset: ReturnType<typeof useCreateVideoAsset>["mutateAsync"];
+  signal?: AbortSignal;
 }) => {
   if (!selectedFile) {
     return;
@@ -52,11 +54,13 @@ export const handleVideoAssetCreation = async ({
     const createVideoAssetResponse = await createVideoAsset({
       originalFileName: selectedFile.name,
       extension,
-      timelineId: selectedShotId
+      timelineId: selectedShotId,
+      signal
     });
 
     return createVideoAssetResponse;
   } catch (error) {
+    signal?.throwIfAborted();
     console.error("Error uploading video", error);
   }
 };

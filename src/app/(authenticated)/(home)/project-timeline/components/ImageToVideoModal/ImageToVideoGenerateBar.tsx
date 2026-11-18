@@ -24,6 +24,7 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { resolveRenderProvider } from "@/platform/renderTarget";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 
 import { useMockImageToVideoTrackDuringGeneration } from "./hooks/useMockImageToVideoTrackDuringGeneration";
 import { useSubmitImageToVideoRender } from "./hooks/useSubmitImageToVideoRender";
@@ -45,6 +46,7 @@ export const ImageToVideoGenerateBar: React.FC<
   ImageToVideoGenerateBarProps
 > = ({ selectedProjectId }) => {
   const { t } = useTranslation();
+  const { work } = useRendererLibraryWork();
   const { renderSettingsValuesAtom, selectedModelAtom } =
     useRenderSettingsAtoms();
   const values = useAtomValue(renderSettingsValuesAtom);
@@ -65,7 +67,8 @@ export const ImageToVideoGenerateBar: React.FC<
     useEnsureLocalVideoRenderPreconditions();
   const { mockImageToVideoTrackDuringGeneration } =
     useMockImageToVideoTrackDuringGeneration({ selectedProjectId });
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [generatingOwner, setGeneratingOwner] = useState<AbortSignal>();
+  const isGenerating = generatingOwner === work.signal && !work.signal.aborted;
   const [disabledMessage, setDisabledMessage] = useState<string | null>(null);
   const buttonsContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -131,32 +134,42 @@ export const ImageToVideoGenerateBar: React.FC<
     isGenerating;
 
   const handleGenerate = async () => {
-    if (!selectedProjectId) return;
+    if (!selectedProjectId || work.signal.aborted) return;
     if (isRenderBlockedByCreditPaywall) {
       openNewUsersPaywall();
       return;
     }
 
-    setIsGenerating(true);
+    setGeneratingOwner(work.signal);
     try {
       const areLocalRenderPreconditionsMet =
-        await ensureLocalVideoRenderPreconditions({
-          model: selectedModel.name,
-          renderSettingsValues: values
-        });
+        await ensureLocalVideoRenderPreconditions(
+          {
+            model: selectedModel.name,
+            renderSettingsValues: values
+          },
+          work
+        );
+      work.check();
       if (!areLocalRenderPreconditionsMet) return;
 
       const resolvedContainerShotId =
-        containerShotId ?? (await ensureContainerShotId());
+        containerShotId ?? (await ensureContainerShotId(work));
+      work.check();
       if (!resolvedContainerShotId) return;
 
       let track: Awaited<ReturnType<typeof addTrack>>;
       try {
-        track = await addTrack({
-          shotIdOverride: resolvedContainerShotId,
-          shotNameWhenMissingFromCache: IMAGE_TO_VIDEO_CONTAINER_SHOT_NAME
-        });
+        track = await addTrack(
+          {
+            shotIdOverride: resolvedContainerShotId,
+            shotNameWhenMissingFromCache: IMAGE_TO_VIDEO_CONTAINER_SHOT_NAME
+          },
+          work
+        );
+        work.check();
       } catch (error) {
+        if (work.signal.aborted) return;
         console.error("Failed to create track:", error);
         showToast({
           message: t("notifications.failed_to_create_track.description")
@@ -178,16 +191,21 @@ export const ImageToVideoGenerateBar: React.FC<
         fps
       });
 
-      await submitImageToVideoRender({
-        layerId: track.id,
-        renderSettings: values,
-        durationInSeconds,
-        fps,
-        model: selectedModel,
-        selectedProjectId
-      });
+      await submitImageToVideoRender(
+        {
+          layerId: track.id,
+          renderSettings: values,
+          durationInSeconds,
+          fps,
+          model: selectedModel,
+          selectedProjectId
+        },
+        work
+      );
+    } catch (error) {
+      if (!work.signal.aborted) throw error;
     } finally {
-      setIsGenerating(false);
+      if (!work.signal.aborted) setGeneratingOwner(undefined);
     }
   };
 

@@ -18,6 +18,7 @@ vi.mock("@/lib/backend-api-client", () => ({
 vi.mock("@/platform/localDesktop", () => ({
   isLocalApp: true,
   getLocalDesktopApi: () => ({
+    library: { onWillChange: async () => {}, onDidChange: () => {} },
     videoRenders: { submit },
     projects: { listAll }
   })
@@ -128,4 +129,32 @@ describe("postRender — a signed-in Image-to-Video render", () => {
     expect(submit).not.toHaveBeenCalled();
     expect(submitCloudImageToVideoRender).not.toHaveBeenCalled();
   });
+});
+
+it("does not adopt a replacement library when the first project lookup returns late", async () => {
+  const { rendererLibrary } = await import("@/platform/rendererLibraryWork");
+  vi.stubGlobal("window", {
+    mago: { account: { mode: "cloud" } },
+    localStorage: { getItem: () => null }
+  });
+  const projects = Promise.withResolvers<unknown[]>();
+  listAll.mockReturnValueOnce(projects.promise);
+  try {
+    const pending = submitImageToVideoRender(seedance2I2vModel).catch(
+      (error: unknown) => error
+    );
+    await vi.waitFor(() => expect(listAll).toHaveBeenCalledOnce());
+    const switching = rendererLibrary.suspend();
+    projects.resolve([
+      { id: "reused", timelines: [{ id: "same-shot", layers: [outputTrack] }] }
+    ]);
+    await switching;
+    rendererLibrary.reset();
+    expect(await pending).toMatchObject({ name: "AbortError" });
+    expect(submitCloudImageToVideoRender).not.toHaveBeenCalled();
+    expect(submitCloudRender).not.toHaveBeenCalled();
+  } finally {
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+  }
 });
