@@ -50,7 +50,10 @@ describe("postBulkRendersRunResume (local run)", () => {
     await postBulkRendersRunResume("plan-1");
 
     expect(resumeLocal).toHaveBeenCalledWith("plan-1");
-    expect(executeCloudSheetPlan).toHaveBeenCalledWith("plan-1");
+    expect(executeCloudSheetPlan).toHaveBeenCalledWith(
+      "plan-1",
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(post).not.toHaveBeenCalled();
   });
 

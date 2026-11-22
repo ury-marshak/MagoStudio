@@ -8,7 +8,7 @@ export const usePinSheetGroupImage = (projectId: string | null | undefined) => {
   const { t } = useTranslation();
   const reportScriptProjectFailure = useReportScriptProjectFailure();
 
-  const { findRetryForRequest, withRetryRegistered } =
+  const { findRetryForRequest, withLibraryRetryRegistered } =
     useMutationRetryRegistry();
 
   const pinSheetGroupImageMutation = usePinSheetGroupImageMutation(projectId, {
@@ -20,5 +20,5 @@ export const usePinSheetGroupImage = (projectId: string | null | undefined) => {
       )
   });
 
-  return withRetryRegistered(pinSheetGroupImageMutation);
+  return withLibraryRetryRegistered(pinSheetGroupImageMutation);
 };

@@ -1,5 +1,9 @@
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest
+} from "@/platform/rendererLibraryWork";
 
 import { buildStoryboardSheetToken } from "../utils/buildStoryboardSheetToken";
 
@@ -13,36 +17,47 @@ export type RenderShotStoryboardRequest = {
   inputImageAssetIds: string[];
 };
 export const postShotStoryboardRender = async (
-  request: RenderShotStoryboardRequest
+  request: RenderShotStoryboardRequest,
+  work = rendererLibrary.capture()
 ): Promise<void> => {
-  const localProject = request.projectId
-    ? await getLocalDesktopApi().projects.get(request.projectId)
+  const { projectId } = request;
+  const localProject = projectId
+    ? await work.boundary(() => getLocalDesktopApi().projects.get(projectId))
     : null;
   if (localProject && localProject.origin !== "cloud") {
-    await postSceneStoryboardGenerate({
-      projectId: localProject.id,
-      sceneTimelineId: request.shotTimelineId
-    });
+    await postSceneStoryboardGenerate(
+      {
+        projectId: localProject.id,
+        sceneTimelineId: request.shotTimelineId
+      },
+      work
+    );
     return;
   }
   const [source, ...references] = request.inputImageAssetIds;
-  await backendApiClient.post("/assets/img2img/render", {
-    timeline_id: request.sheetsTimelineId,
-    sheet_token: buildStoryboardSheetToken(request.shotTimelineId),
-    sheet_name: "Storyboard",
-    img_file_type: "png",
-    render_model: source ? "gpt_image_2" : "gpt_image_2_t2i",
-    render_mode: "credits",
-    spec: {},
-    ...(source ? { source_asset: source, frame: 0 } : {}),
-    settings: {
-      prompt: request.prompt,
-      width: 1536,
-      height: 864,
-      quality: "medium",
-      ...(source
-        ? { input_image_id: source, reference_images: references }
-        : {})
-    }
-  });
+  await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.post(
+      "/assets/img2img/render",
+      {
+        timeline_id: request.sheetsTimelineId,
+        sheet_token: buildStoryboardSheetToken(request.shotTimelineId),
+        sheet_name: "Storyboard",
+        img_file_type: "png",
+        render_model: source ? "gpt_image_2" : "gpt_image_2_t2i",
+        render_mode: "credits",
+        spec: {},
+        ...(source ? { source_asset: source, frame: 0 } : {}),
+        settings: {
+          prompt: request.prompt,
+          width: 1536,
+          height: 864,
+          quality: "medium",
+          ...(source
+            ? { input_image_id: source, reference_images: references }
+            : {})
+        }
+      },
+      { signal }
+    )
+  );
 };

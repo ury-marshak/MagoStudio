@@ -4,11 +4,27 @@ import { ensureCloudImageAsset } from "@domains/cloud/mirrorService";
 import { CreatePlanRequest, Plan } from "@schemas/plan";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import {
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
-export const createPlan = async (data: CreatePlanRequest): Promise<Plan> => {
+export const createPlan = async (
+  data: CreatePlanRequest,
+  work: RendererLibraryWork
+): Promise<Plan> => {
+  work.check();
   const cloudApi = backendCloudApi();
-  const mirrorImageToCloud = (localAssetId: string) =>
-    ensureCloudImageAsset(cloudApi, localAssetId, data.project_id);
+  const mirrorImageToCloud = (localAssetId: string) => {
+    work.check();
+    return ensureCloudImageAsset(
+      cloudApi,
+      localAssetId,
+      data.project_id,
+      undefined,
+      work
+    );
+  };
 
   const cloudImg2ImgSettings = data.img2img_settings
     ? ((await mirrorImg2ImgSettings(
@@ -33,10 +49,19 @@ export const createPlan = async (data: CreatePlanRequest): Promise<Plan> => {
       : shotOverride;
   }
 
-  const response = await backendApiClient.post<Plan>("/agent/plans", {
-    ...data,
-    ...(cloudImg2ImgSettings ? { img2img_settings: cloudImg2ImgSettings } : {}),
-    ...(data.shot_overrides ? { shot_overrides: cloudShotOverrides } : {})
-  });
+  const response = await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.post<Plan>(
+      "/agent/plans",
+      {
+        ...data,
+        ...(cloudImg2ImgSettings
+          ? { img2img_settings: cloudImg2ImgSettings }
+          : {}),
+        ...(data.shot_overrides ? { shot_overrides: cloudShotOverrides } : {})
+      },
+      { signal }
+    )
+  );
+  work.check();
   return response.data;
 };

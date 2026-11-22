@@ -8,7 +8,7 @@ export const useEditProjectShot = () => {
   const { t } = useTranslation();
   const reportScriptProjectFailure = useReportScriptProjectFailure();
 
-  const { findRetryForRequest, withRetryRegistered } =
+  const { findRetryForRequest, withLibraryRetryRegistered } =
     useMutationRetryRegistry();
 
   const editProjectShotMutation = useEditProjectShotMutation({
@@ -20,5 +20,5 @@ export const useEditProjectShot = () => {
       )
   });
 
-  return withRetryRegistered(editProjectShotMutation);
+  return withLibraryRetryRegistered(editProjectShotMutation);
 };

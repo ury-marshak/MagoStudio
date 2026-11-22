@@ -9,6 +9,10 @@ import {
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest
+} from "@/platform/rendererLibraryWork";
 
 import { isLocalScriptProject } from "../projectOrigin";
 
@@ -50,30 +54,36 @@ const buildCloudShotEditBody = (request: EditProjectShotRequest) => ({
 });
 
 export const patchProjectShot = async (
-  request: EditProjectShotRequest
+  request: EditProjectShotRequest,
+  work = rendererLibrary.capture()
 ): Promise<EditedShot> => {
-  if (await isLocalScriptProject(request.projectId)) {
+  if (await work.boundary(() => isLocalScriptProject(request.projectId))) {
     return EditedShotSchema.parse(
-      await getLocalDesktopApi().scriptProjects.update({
-        projectId: request.projectId,
-        operation: "edit-shot",
-        // The cloud's PATCH body, so the desktop validates and tracks edits
-        // the same way; camera is the one local-only addition.
-        payload: {
-          timelineId: request.timelineId,
-          ...buildCloudShotEditBody(request),
-          ...(request.camera === undefined ? {} : { camera: request.camera })
-        }
-      })
+      await work.boundary(() =>
+        getLocalDesktopApi().scriptProjects.update({
+          projectId: request.projectId,
+          operation: "edit-shot",
+          // The cloud's PATCH body, so the desktop validates and tracks edits
+          // the same way; camera is the one local-only addition.
+          payload: {
+            timelineId: request.timelineId,
+            ...buildCloudShotEditBody(request),
+            ...(request.camera === undefined ? {} : { camera: request.camera })
+          }
+        })
+      )
     );
   }
   const cloudEditBody = buildCloudShotEditBody(request);
   if (Object.keys(cloudEditBody).length === 0) {
     throw new Error("This shot edit is not supported on Mago Cloud projects");
   }
-  const response = await backendApiClient.patch(
-    `/projects/${request.projectId}/shots/${request.timelineId}`,
-    cloudEditBody
+  const response = await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.patch(
+      `/projects/${request.projectId}/shots/${request.timelineId}`,
+      cloudEditBody,
+      { signal }
+    )
   );
   return EditedShotSchema.parse(response.data);
 };

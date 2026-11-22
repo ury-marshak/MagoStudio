@@ -89,6 +89,7 @@ import { DatabaseManager } from "../../../desktop/main/database/databaseManager"
 import { ProjectRepository } from "../../../desktop/main/database/projectRepository";
 import {
   assets,
+  clips,
   cloudRenderJobs,
   projects,
   scriptProjectSnapshots,
@@ -104,10 +105,12 @@ const directories: string[] = [];
 const managers: DatabaseManager[] = [];
 const deferred = <T = void>() => {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((yes) => {
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => {
     resolve = yes;
+    reject = no;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 };
 const flush = async () => {
   for (let i = 0; i < 40; i++) await Promise.resolve();
@@ -215,7 +218,7 @@ const setupLibraries = async (
   const projectRepository = new ProjectRepository(manager, getLibraryRoot);
   const storage = {
     allowedHosts: ["fixture.invalid"],
-    fetchFromCloudStorage: vi.fn(async () => {
+    fetchFromCloudStorage: vi.fn(async (): Promise<Response> => {
       throw new Error("Unexpected storage request");
     })
   };
@@ -318,7 +321,9 @@ const setupLibraries = async (
     projectRepository,
     beforeLibraryChange,
     setLibraryRoot,
-    getAppMode
+    getAppMode,
+    links,
+    storage
   };
 };
 
@@ -649,7 +654,25 @@ it.each(["opening", "settings"] as const)(
       ...Object.values(actions),
       () => startRender("video"),
       () => startRender("image"),
-      () => startRender("i2v")
+      () => startRender("i2v"),
+      async () => {
+        const { adaptCloudI2vPromptFromLocal } =
+          await import("@domains/prompt/api/adaptCloudI2vPromptFromLocal");
+        const { VideoEngine } = await import("@models/video/types");
+        return adaptCloudI2vPromptFromLocal(
+          {
+            prompt: "original",
+            referenceImageAssetIds: [],
+            cloudEngine: VideoEngine.minimax_reference
+          },
+          rendererLibrary.capture()
+        );
+      },
+      async () => {
+        const { resumePlan } =
+          await import("@domains/plan/api/resumePlan.local");
+        return resumePlan("same-plan", rendererLibrary.capture());
+      }
     ]) {
       await expect(start()).rejects.toMatchObject({ name: "AbortError" });
     }
@@ -1107,3 +1130,369 @@ it("acknowledges renderer teardown before main drains an issued mirror upload bo
   ]);
   expect(progress.mock.calls).toEqual([["encoding"], ["uploading"]]);
 });
+
+const installPromptReadiness = async (
+  hasExternalText: () => Promise<boolean>
+) => {
+  const handlersPath = "../../../desktop/main/ipc/registerVlmHandlers.ts";
+  const { registerVlmHandlers } = await import(handlersPath);
+  registerVlmHandlers({}, {}, hasExternalText);
+};
+
+const missingSourceCloudId = "11111111-1111-1111-1111-111111111111";
+const sourceLinkId = "same-asset#shot-same-shot#trim-full";
+const seedPromptSource = async (manager: DatabaseManager) => {
+  await manager.get().insert(clips).values({
+    id: "same-clip",
+    trackId: "same-track",
+    assetId: "same-asset",
+    name: "Camera footage"
+  });
+  await fixture.api.cloud.links.put({
+    kind: "project",
+    localId: "reused",
+    cloudId: "cloud-project"
+  });
+  await fixture.api.cloud.links.put({
+    kind: "timeline",
+    localId: "same-shot",
+    cloudId: "cloud-shot"
+  });
+  await fixture.api.cloud.links.put({
+    kind: "asset",
+    localId: sourceLinkId,
+    cloudId: missingSourceCloudId,
+    data: { cloudTimelineId: "cloud-shot", status: "ingested" }
+  });
+};
+
+it.each(["readiness", "missing reference", "issued stale write"] as const)(
+  "keeps prompt source context and stale-link retry in the old library during %s",
+  async (stage) => {
+    const { manager, roots, links, beforeLibraryChange } =
+      await setupLibraries();
+    await seedPromptSource(manager);
+    await manager.open(roots[1]);
+    await seedPromptSource(manager);
+    await manager.open(roots[0]);
+    const ready = deferred<boolean>();
+    const adaptation = deferred<never>();
+    const patchIssued = deferred();
+    const continuePatch = deferred();
+    const readiness = vi.fn(() =>
+      stage === "readiness" ? ready.promise : Promise.resolve(false)
+    );
+    await installPromptReadiness(readiness);
+    fixture.backend.mockResolvedValue({
+      data: { project_id: "cloud-project" }
+    });
+    const missing = new Error(
+      `reference asset ${missingSourceCloudId} not found`
+    );
+    fixture.mutation.mockImplementationOnce(() =>
+      stage === "issued stale write"
+        ? Promise.reject(missing)
+        : adaptation.promise
+    );
+    if (stage === "issued stale write") {
+      const patch = links.patchData.bind(links);
+      vi.spyOn(links, "patchData").mockImplementationOnce(
+        async (...args: unknown[]) => {
+          patchIssued.resolve();
+          await continuePatch.promise;
+          return patch(...args);
+        }
+      );
+    }
+    const { adaptCloudI2vPromptFromLocal } =
+      await import("@domains/prompt/api/adaptCloudI2vPromptFromLocal");
+    const { VideoEngine } = await import("@models/video/types");
+    const { rendererLibrary } = await import("@/platform/rendererLibraryWork");
+    const work = rendererLibrary.capture();
+    const pending = adaptCloudI2vPromptFromLocal(
+      {
+        prompt: "A camera move",
+        sourceVideoTrackId: "same-track",
+        referenceImageAssetIds: [],
+        cloudEngine: VideoEngine.minimax_reference
+      },
+      work
+    ).catch((error: unknown) => error);
+    await vi.waitFor(() => expect(readiness).toHaveBeenCalledOnce());
+    if (stage !== "readiness") {
+      await vi.waitFor(() =>
+        expect(fixture.mutation).toHaveBeenCalledExactlyOnceWith(
+          "/adapt_i2v_prompt",
+          expect.objectContaining({
+            reference_asset_ids: [missingSourceCloudId]
+          }),
+          { signal: work.signal }
+        )
+      );
+    }
+    if (stage === "issued stale write") await patchIssued.promise;
+    const choosing = fixture.api.library.choose();
+    if (stage === "issued stale write") {
+      await vi.waitFor(() => expect(work.signal.aborted).toBe(true));
+      expect(beforeLibraryChange).not.toHaveBeenCalled();
+      continuePatch.resolve();
+    }
+    await choosing;
+    const calls = fixture.calls.slice();
+    if (stage === "readiness") ready.resolve(false);
+    if (stage === "missing reference") adaptation.reject(missing);
+    expect(await pending).toMatchObject({ name: "AbortError" });
+    expect(fixture.calls).toEqual(calls);
+    expect(
+      fixture.calls.filter((call) => call === IPC_CHANNELS.projectsListAll)
+    ).toHaveLength(stage === "readiness" ? 0 : 1);
+    expect(
+      fixture.calls.filter((call) => call === IPC_CHANNELS.cloudLinkPatch)
+    ).toHaveLength(stage === "issued stale write" ? 1 : 0);
+    expect(
+      (await fixture.api.cloud.links.get("asset", sourceLinkId))?.data.status
+    ).toBe("ingested");
+    if (stage === "issued stale write") {
+      await manager.open(roots[0]);
+      expect(
+        (await fixture.api.cloud.links.get("asset", sourceLinkId))?.data.status
+      ).toBe("stale");
+    }
+    expect(fixture.putObject).not.toHaveBeenCalled();
+  }
+);
+
+const sheetPlan = {
+  id: "same-plan",
+  project_id: "reused",
+  local_operation: "sheets",
+  local_executor: "mago-cloud-renderer",
+  local_request: { settings: { render_model: "seedream_5_pro_t2i" } },
+  local_targets: [
+    { token: "same-key", name: "Mara", kind: "character", _local_prompt: "Ink" }
+  ],
+  status: "PAUSED",
+  steps: [
+    {
+      id: "submit",
+      status: "PENDING",
+      tool_name: "submit_img2img_batch",
+      tool_args: { token: "same-key" }
+    },
+    {
+      id: "poll",
+      status: "PENDING",
+      tool_name: "poll_img2img_batch",
+      tool_args: { token: "same-key" }
+    }
+  ]
+};
+
+it.each(["late acceptance", "accepted bookkeeping", "output body"] as const)(
+  "keeps renderer acknowledgement and main teardown in order for cloud sheet %s",
+  async (stage) => {
+    const { manager, roots, snapshots, storage, beforeLibraryChange } =
+      await setupLibraries("script_to_shots", "local");
+    const seed = async (name: string) => {
+      await snapshots.put({
+        projectId: "reused",
+        state: {
+          sheets_timeline_id: "same-shot",
+          keys: [{ token: "same-key", name, images: [] }]
+        }
+      });
+      await snapshots.putPlan("reused", sheetPlan.id, { ...sheetPlan, name });
+      await fixture.api.cloud.links.put({
+        kind: "project",
+        localId: "reused",
+        cloudId: "cloud-project"
+      });
+      await fixture.api.cloud.links.put({
+        kind: "timeline",
+        localId: "same-shot",
+        cloudId: "cloud-shot"
+      });
+    };
+    await seed("original");
+    await manager.open(roots[1]);
+    await seed("replacement");
+    await manager.open(roots[0]);
+    await fixture.api.scriptProjects.resumePlan(sheetPlan.id);
+    const issued = deferred();
+    const release = deferred();
+    const cancelled = deferred();
+    const acceptance = {
+      data: { clips: [{ id: "cloud-clip", asset: { id: "cloud-image" } }] }
+    };
+    if (stage === "late acceptance") {
+      fixture.mutation.mockImplementationOnce(async () => {
+        issued.resolve();
+        await release.promise;
+        return acceptance;
+      });
+    } else if (stage === "accepted bookkeeping") {
+      const savePlan = snapshots.putPlan.bind(snapshots);
+      vi.spyOn(snapshots, "putPlan").mockImplementation(async (...args) => {
+        const plan = args[2] as typeof sheetPlan;
+        if (
+          plan.steps.some(
+            (step) => step.id === "submit" && step.status === "COMPLETED"
+          )
+        ) {
+          issued.resolve();
+          await release.promise;
+        }
+        await savePlan(...args);
+      });
+    } else {
+      storage.fetchFromCloudStorage.mockImplementationOnce(
+        async () =>
+          new Response(
+            new ReadableStream({
+              pull: () => {
+                issued.resolve();
+              },
+              cancel: async () => {
+                cancelled.resolve();
+                await release.promise;
+              }
+            }),
+            { headers: { "content-type": "image/png" } }
+          )
+      );
+    }
+    fixture.mutation.mockResolvedValue(acceptance);
+    fixture.backend.mockImplementation(async (url: string) => ({
+      data:
+        url === "/assets/img2img/status/cloud-clip"
+          ? {
+              render_status: "SUCCESS",
+              output_url: "https://fixture.invalid/output.png"
+            }
+          : { project_id: "cloud-project" }
+    }));
+    const { rendererLibrary } = await import("@/platform/rendererLibraryWork");
+    const { executeCloudSheetPlan } = await import("./cloudSheetRender.local");
+    const work = rendererLibrary.capture();
+    const pending = executeCloudSheetPlan(sheetPlan.id, work);
+    await issued.promise;
+    const open = vi.spyOn(manager, "open");
+    const choosing = fixture.api.library.choose();
+    await vi.waitFor(() => expect(work.signal.aborted).toBe(true));
+    if (stage === "output body") {
+      await cancelled.promise;
+      expect(beforeLibraryChange).toHaveBeenCalledOnce();
+    } else if (stage === "accepted bookkeeping") {
+      expect(beforeLibraryChange).not.toHaveBeenCalled();
+    }
+    if (stage !== "late acceptance") {
+      expect(open).not.toHaveBeenCalled();
+      release.resolve();
+    }
+    await choosing;
+    release.resolve();
+    const calls = fixture.calls.slice();
+    await pending;
+    expect(fixture.calls).toEqual(calls);
+    expect(fixture.mutation.mock.calls.map(([url]) => url)).toEqual([
+      "/assets/img2img/render"
+    ]);
+    expect(await snapshots.getPlan(sheetPlan.id)).toEqual({
+      ...sheetPlan,
+      name: "replacement"
+    });
+    await manager.open(roots[0]);
+    const original = await snapshots.getPlan(sheetPlan.id);
+    if (stage === "late acceptance") {
+      expect(original).toMatchObject({
+        name: "original",
+        steps: expect.arrayContaining([
+          expect.objectContaining({
+            id: "submit",
+            result: { token: "same-key", cloud_submission_pending: true }
+          })
+        ])
+      });
+      // Model reopening the interrupted plan as paused; keep its durable step results.
+      await snapshots.putPlan("reused", sheetPlan.id, {
+        ...original,
+        status: "PAUSED"
+      });
+      await fixture.api.scriptProjects.resumePlan(sheetPlan.id);
+      await executeCloudSheetPlan(sheetPlan.id, rendererLibrary.capture());
+      expect(fixture.mutation).toHaveBeenCalledOnce();
+      expect(await snapshots.getPlan(sheetPlan.id)).toMatchObject({
+        status: "PAUSED",
+        steps: expect.arrayContaining([
+          expect.objectContaining({
+            id: "submit",
+            error: {
+              message: expect.stringContaining("will not submit it again")
+            }
+          })
+        ])
+      });
+    } else {
+      expect(original).toMatchObject({
+        name: "original",
+        steps: expect.arrayContaining([
+          expect.objectContaining({
+            id: "submit",
+            status: "COMPLETED",
+            result: expect.objectContaining({ cloud_clip_id: "cloud-clip" })
+          })
+        ])
+      });
+    }
+    expect((await snapshots.get("reused"))?.state?.keys).toEqual([
+      { token: "same-key", name: "original", images: [] }
+    ]);
+  }
+);
+
+it.each(["key", "token"] as const)(
+  "does not dispatch adaptation after an old library's delayed %s becomes available",
+  async (stage) => {
+    await setupLibraries();
+    await installPromptReadiness(async () => false);
+    const { backendApiClient, initializeBackendApiClient, setApiKey } =
+      await vi.importActual<typeof import("@/lib/backend-api-client")>(
+        "@/lib/backend-api-client"
+      );
+    const token = deferred<string>();
+    const getToken = vi.fn(() => token.promise);
+    const adapter = vi.fn(async () => {
+      throw new Error("Unexpected transport dispatch");
+    });
+    initializeBackendApiClient(getToken, { waitForApiKey: stage === "key" });
+    fixture.mutation.mockImplementation(
+      (url: string, data: unknown, config: { signal: AbortSignal }) =>
+        backendApiClient.post(url, data, { ...config, adapter })
+    );
+    const { adaptCloudI2vPromptFromLocal } =
+      await import("@domains/prompt/api/adaptCloudI2vPromptFromLocal");
+    const { rendererLibrary } = await import("@/platform/rendererLibraryWork");
+    const { VideoEngine } = await import("@models/video/types");
+    const pending = adaptCloudI2vPromptFromLocal(
+      {
+        prompt: "original",
+        referenceImageAssetIds: [],
+        cloudEngine: VideoEngine.minimax_reference
+      },
+      rendererLibrary.capture()
+    ).catch((error: unknown) => error);
+    await vi.waitFor(() =>
+      expect(
+        stage === "token" ? getToken : fixture.mutation
+      ).toHaveBeenCalledOnce()
+    );
+    await fixture.api.library.choose();
+    const calls = fixture.calls.slice();
+    if (stage === "key") setApiKey("fixture-key");
+    token.resolve("fixture-token");
+    expect(await pending).toMatchObject({ name: "AbortError" });
+    expect(adapter).not.toHaveBeenCalled();
+    if (stage === "key") expect(getToken).not.toHaveBeenCalled();
+    expect(fixture.calls).toEqual(calls);
+  }
+);

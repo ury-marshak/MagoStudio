@@ -8,7 +8,7 @@ export const useGenerateProjectSheets = () => {
   const { t } = useTranslation();
   const reportScriptProjectFailure = useReportScriptProjectFailure();
 
-  const { findRetryForRequest, withRetryRegistered } =
+  const { findRetryForRequest, withLibraryRetryRegistered } =
     useMutationRetryRegistry();
 
   const generateProjectSheetsMutation = useGenerateProjectSheetsMutation({
@@ -20,5 +20,5 @@ export const useGenerateProjectSheets = () => {
       )
   });
 
-  return withRetryRegistered(generateProjectSheetsMutation);
+  return withLibraryRetryRegistered(generateProjectSheetsMutation);
 };

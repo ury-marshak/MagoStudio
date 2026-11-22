@@ -2,6 +2,10 @@ import { SceneStoryboardSubmittedSchema } from "@schemas/scriptProject";
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest
+} from "@/platform/rendererLibraryWork";
 
 import {
   canUseCloudSheetModels,
@@ -26,17 +30,24 @@ export type GenerateSceneStoryboardRequest = {
   providerSettings?: Record<string, string | number | null>;
 };
 export const postSceneStoryboardGenerate = async (
-  request: GenerateSceneStoryboardRequest
+  request: GenerateSceneStoryboardRequest,
+  work = rendererLibrary.capture()
 ) => {
-  if (!(await isLocalScriptProject(request.projectId)))
+  if (!(await work.boundary(() => isLocalScriptProject(request.projectId))))
     return SceneStoryboardSubmittedSchema.parse(
       (
-        await backendApiClient.post(
-          `${buildSceneStoryboardPath(request)}/generate`
+        await runRendererLibraryRequest(work, (signal) =>
+          backendApiClient.post(
+            `${buildSceneStoryboardPath(request)}/generate`,
+            undefined,
+            { signal }
+          )
         )
       ).data
     );
-  const project = await getLocalDesktopApi().projects.get(request.projectId);
+  const project = await work.boundary(() =>
+    getLocalDesktopApi().projects.get(request.projectId)
+  );
   const selected =
     request.renderModel ??
     (project?.settings as Record<string, unknown> | undefined)
@@ -46,7 +57,9 @@ export const postSceneStoryboardGenerate = async (
     throw new Error("Sign in to Mago Cloud to use this image model");
   const fal =
     !isLocalSheetRenderModel(selected) && !isSheetRenderModel(selected)
-      ? await getLocalDesktopApi().externalProviders?.fal?.get()
+      ? await work.boundary(async () =>
+          getLocalDesktopApi().externalProviders?.fal?.get()
+        )
       : null;
   if (isFalSheetModel(selected) && !fal)
     throw new Error(
@@ -57,7 +70,9 @@ export const postSceneStoryboardGenerate = async (
     !fal &&
     !cloudAvailable &&
     getLocalDesktopApi().comfy?.scriptSetupStatus
-      ? await getLocalDesktopApi().comfy.scriptSetupStatus()
+      ? await runRendererLibraryRequest(work, () =>
+          getLocalDesktopApi().comfy.scriptSetupStatus()
+        )
       : undefined;
   const renderModel = resolveImageRenderModel({
     savedModel: selected,
@@ -68,18 +83,22 @@ export const postSceneStoryboardGenerate = async (
     falDefaultModel: fal?.storyboardImageModel ?? FAL_SHEET_MODEL_H3,
     installedLocalModels: installedLocalImageModels(setup)
   });
-  const result = await getLocalDesktopApi().scriptProjects.update({
-    projectId: request.projectId,
-    operation: "storyboard-generate",
-    payload: {
-      timelineId: request.sceneTimelineId,
-      renderModel,
-      ...(request.providerSettings
-        ? { providerSettings: request.providerSettings }
-        : {})
-    }
-  });
+  // Main owns storyboard media/template preparation. Do not drain that IPC here.
+  const result = await runRendererLibraryRequest(work, () =>
+    getLocalDesktopApi().scriptProjects.update({
+      projectId: request.projectId,
+      operation: "storyboard-generate",
+      payload: {
+        timelineId: request.sceneTimelineId,
+        renderModel,
+        ...(request.providerSettings
+          ? { providerSettings: request.providerSettings }
+          : {})
+      }
+    })
+  );
+  work.check();
   if (isSheetRenderModel(renderModel) && typeof result.plan_id === "string")
-    void executeCloudSheetPlan(result.plan_id);
+    void executeCloudSheetPlan(result.plan_id, work);
   return SceneStoryboardSubmittedSchema.parse(result);
 };

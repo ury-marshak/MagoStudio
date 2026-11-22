@@ -2,6 +2,10 @@ import { SceneStoryboardResponseSchema } from "@schemas/scriptProject";
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest
+} from "@/platform/rendererLibraryWork";
 
 import { isLocalScriptProject } from "../projectOrigin";
 
@@ -13,11 +17,14 @@ export type UpdateSceneStoryboardRequest = {
   selectedAssetId?: string | null;
   isUsedInVideoRenders?: boolean;
 };
-export const putSceneStoryboard = async ({
-  selectedAssetId,
-  isUsedInVideoRenders,
-  ...scene
-}: UpdateSceneStoryboardRequest) => {
+export const putSceneStoryboard = async (
+  {
+    selectedAssetId,
+    isUsedInVideoRenders,
+    ...scene
+  }: UpdateSceneStoryboardRequest,
+  work = rendererLibrary.capture()
+) => {
   const fields = {
     ...(selectedAssetId === undefined
       ? {}
@@ -26,13 +33,22 @@ export const putSceneStoryboard = async ({
       ? {}
       : { enabled: isUsedInVideoRenders })
   };
-  const data = (await isLocalScriptProject(scene.projectId))
-    ? await getLocalDesktopApi().scriptProjects.update({
-        projectId: scene.projectId,
-        operation: "storyboard-update",
-        payload: { timelineId: scene.sceneTimelineId, ...fields }
-      })
-    : (await backendApiClient.put(buildSceneStoryboardPath(scene), fields))
-        .data;
+  const data = (await work.boundary(() =>
+    isLocalScriptProject(scene.projectId)
+  ))
+    ? await work.boundary(() =>
+        getLocalDesktopApi().scriptProjects.update({
+          projectId: scene.projectId,
+          operation: "storyboard-update",
+          payload: { timelineId: scene.sceneTimelineId, ...fields }
+        })
+      )
+    : (
+        await runRendererLibraryRequest(work, (signal) =>
+          backendApiClient.put(buildSceneStoryboardPath(scene), fields, {
+            signal
+          })
+        )
+      ).data;
   return SceneStoryboardResponseSchema.parse(data).storyboard;
 };

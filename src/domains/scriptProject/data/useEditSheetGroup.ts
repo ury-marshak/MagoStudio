@@ -1,5 +1,6 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { EditSheetGroupRequest, patchSheetGroup } from "../api/patchSheetGroup";
@@ -12,9 +13,9 @@ export const useEditSheetGroup = (
 ) => {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: (request: EditSheetGroupRequest) =>
-      patchSheetGroup({ ...request, projectId: projectId ?? undefined }),
+  return useRendererLibraryMutation({
+    mutationFn: (request: EditSheetGroupRequest, work) =>
+      patchSheetGroup({ ...request, projectId: projectId ?? undefined }, work),
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.projectState.byProjectId(projectId)

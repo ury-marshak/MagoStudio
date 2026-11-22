@@ -13,5 +13,9 @@ export const postAdaptI2vPrompt = async (
     { signal }
   );
 
+  signal?.throwIfAborted();
   return response.data;
 };
+
+export const hasUnresolvedAdaptedReferences = (response: AdaptedI2vPrompt) =>
+  !response.adapted || (response.label_warnings?.length ?? 0) > 0;

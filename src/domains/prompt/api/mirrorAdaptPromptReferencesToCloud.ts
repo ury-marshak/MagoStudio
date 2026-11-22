@@ -8,12 +8,14 @@ import {
 import { resolveRenderContext } from "@domains/cloud/resolveRenderContext";
 
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
 
 import { MirroredAdaptPromptReference } from "../utils/adaptWithStaleCloudReferencesReplaced";
 
 const mirrorReferenceImages = (
   api: CloudApi,
   referenceImageAssetIds: string[],
+  work: RendererLibraryWork,
   cloudProjectId?: string,
   onProgress?: MirrorProgress
 ): Promise<MirroredAdaptPromptReference[]> =>
@@ -24,7 +26,8 @@ const mirrorReferenceImages = (
         api,
         localAssetId,
         cloudProjectId,
-        onProgress
+        onProgress,
+        work
       )
     }))
   );
@@ -42,15 +45,19 @@ export interface MirroredSourceVideoContext {
  * whole local library. See the stale-reference retry loop in
  * adaptWithStaleCloudReferencesReplaced.ts.
  */
-export const resolveMirroredSourceVideoContext = async ({
-  sourceVideoTrackId,
-  onProgress
-}: {
-  sourceVideoTrackId: string;
-  onProgress?: MirrorProgress;
-}): Promise<MirroredSourceVideoContext> => {
-  const api = backendCloudApi();
-  const projects = await getLocalDesktopApi().projects.listAll();
+export const resolveMirroredSourceVideoContext = async (
+  {
+    sourceVideoTrackId,
+    onProgress
+  }: {
+    sourceVideoTrackId: string;
+    onProgress?: MirrorProgress;
+  },
+  work: RendererLibraryWork
+): Promise<MirroredSourceVideoContext> => {
+  const projects = await work.boundary(() =>
+    getLocalDesktopApi().projects.listAll()
+  );
   const context = resolveRenderContext(projects, {
     outputTrackId: sourceVideoTrackId,
     inputTrackId: sourceVideoTrackId
@@ -58,15 +65,20 @@ export const resolveMirroredSourceVideoContext = async ({
   if (!context)
     throw new Error("The source video could not be prepared for the cloud");
 
-  const mirrored = await ensureMirroredShot(api, {
-    localProjectId: context.projectId,
-    projectName: context.projectName,
-    localShotId: context.shotId,
-    shotName: context.shotName,
-    localAssetId: context.assetId,
-    assetName: context.assetName,
-    onProgress
-  });
+  const mirrored = await ensureMirroredShot(
+    backendCloudApi(),
+    {
+      localProjectId: context.projectId,
+      projectName: context.projectName,
+      localShotId: context.shotId,
+      shotName: context.shotName,
+      localAssetId: context.assetId,
+      assetName: context.assetName,
+      onProgress
+    },
+    work
+  );
+  work.check();
   return {
     localAssetId: context.assetId,
     cloudSourceVideoLinkLocalId: mirrored.cloudSourceVideoLinkLocalId,
@@ -75,22 +87,28 @@ export const resolveMirroredSourceVideoContext = async ({
   };
 };
 
-export const mirrorAdaptPromptReferencesToCloud = async ({
-  sourceVideoContext,
-  referenceImageAssetIds,
-  onProgress
-}: {
-  sourceVideoContext: MirroredSourceVideoContext | undefined;
-  referenceImageAssetIds: string[];
-  onProgress?: MirrorProgress;
-}): Promise<MirroredAdaptPromptReference[]> => {
+export const mirrorAdaptPromptReferencesToCloud = async (
+  {
+    sourceVideoContext,
+    referenceImageAssetIds,
+    onProgress
+  }: {
+    sourceVideoContext: MirroredSourceVideoContext | undefined;
+    referenceImageAssetIds: string[];
+    onProgress?: MirrorProgress;
+  },
+  work: RendererLibraryWork
+): Promise<MirroredAdaptPromptReference[]> => {
+  work.check();
   const api = backendCloudApi();
   const referenceImages = await mirrorReferenceImages(
     api,
     referenceImageAssetIds,
+    work,
     sourceVideoContext?.cloudProjectId,
     onProgress
   );
+  work.check();
   if (!sourceVideoContext) return referenceImages;
   return [
     {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import { RendererLibrarySession } from "@/platform/rendererLibraryWork";
 
 import { executeCloudSheetPlan } from "../cloudSheetRender.local";
 
@@ -133,11 +134,15 @@ describe("local Storyboard routing", () => {
       })
     ).rejects.toThrow("Sign in");
     Reflect.set(window.mago.account, "mode", "cloud");
-    await postSceneStoryboardGenerate({
-      projectId: "p",
-      sceneTimelineId: "scene"
-    });
-    expect(executeCloudSheetPlan).toHaveBeenCalledWith("plan");
+    const work = new RendererLibrarySession().capture();
+    await postSceneStoryboardGenerate(
+      {
+        projectId: "p",
+        sceneTimelineId: "scene"
+      },
+      work
+    );
+    expect(executeCloudSheetPlan).toHaveBeenCalledWith("plan", work);
   });
   it("preserves the real cloud project endpoint and response", async () => {
     origin = "cloud";
@@ -150,8 +155,33 @@ describe("local Storyboard routing", () => {
       renderModel: "qwen_image_2512_local"
     });
     expect(backendApiClient.post).toHaveBeenCalledWith(
-      "/projects/p/shots/scene/storyboard/generate"
+      "/projects/p/shots/scene/storyboard/generate",
+      undefined,
+      { signal: expect.any(AbortSignal) }
     );
     expect(update).not.toHaveBeenCalled();
+  });
+  it("does not drain main storyboard preparation or launch its plan after replacement", async () => {
+    Reflect.set(window.mago.account, "mode", "cloud");
+    const library = new RendererLibrarySession();
+    const preparation = Promise.withResolvers<object>();
+    const issued = Promise.withResolvers<void>();
+    update.mockImplementationOnce(() => {
+      issued.resolve();
+      return preparation.promise;
+    });
+    const submitted = postSceneStoryboardGenerate(
+      { projectId: "p", sceneTimelineId: "scene" },
+      library.capture()
+    );
+    const stale = expect(submitted).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await issued.promise;
+    await library.suspend();
+    library.reset();
+    preparation.resolve({ timeline_id: "scene", plan_id: "plan" });
+    await stale;
+    expect(executeCloudSheetPlan).not.toHaveBeenCalled();
   });
 });

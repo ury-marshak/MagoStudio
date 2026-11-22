@@ -1,5 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { isLocalApp } from "@/platform/localDesktop";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { fetchBulkRendersRuns } from "../api/fetchBulkRendersRuns";
@@ -13,11 +15,15 @@ const useBulkRendersRunList = ({
   queryKey: readonly unknown[];
   projectId: string | undefined;
   enabled: boolean;
-}) =>
-  useQuery({
-    queryKey,
-    queryFn: () => fetchBulkRendersRuns(projectId),
-    enabled,
+}) => {
+  const { work, libraryVersion } = useRendererLibraryWork();
+  const query = useQuery({
+    queryKey: isLocalApp ? [...queryKey, libraryVersion] : queryKey,
+    queryFn: () =>
+      isLocalApp
+        ? fetchBulkRendersRuns(projectId, work)
+        : fetchBulkRendersRuns(projectId),
+    enabled: enabled && !work.signal.aborted,
     refetchInterval: (query) =>
       resolveBulkRendersRunListPollInterval({
         hasQueryErrored: query.state.status === "error",
@@ -25,6 +31,8 @@ const useBulkRendersRunList = ({
         runs: query.state.data
       })
   });
+  return { ...query, work };
+};
 
 export const useBulkRendersRunsForProject = (
   projectId: string | undefined,

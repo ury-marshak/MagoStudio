@@ -51,6 +51,7 @@ type Props = {
   onChange: (ids: string[], instruction: string) => void;
   onCommit: () => void;
   onUpload: (file: File) => Promise<string | undefined>;
+  librarySignal?: AbortSignal;
 };
 
 export const SheetGroupReferences: React.FC<Props> = ({
@@ -61,7 +62,8 @@ export const SheetGroupReferences: React.FC<Props> = ({
   isDisabled,
   onChange,
   onCommit,
-  onUpload
+  onUpload,
+  librarySignal
 }) => {
   const { t } = useTranslation();
   const [isUploading, setIsUploading] = useState(false);
@@ -89,15 +91,23 @@ export const SheetGroupReferences: React.FC<Props> = ({
           acceptedFileTypes={["image/png", "image/jpeg", "image/webp"]}
           onSelect={(files) => {
             const file = files?.[0];
-            if (!file || isDisabled || isUploading || assetIds.length >= limit)
+            if (
+              !file ||
+              librarySignal?.aborted ||
+              isDisabled ||
+              isUploading ||
+              assetIds.length >= limit
+            )
               return;
             setIsUploading(true);
             void onUpload(file)
               .then((id) => {
-                if (id && !assetIds.includes(id))
+                if (!librarySignal?.aborted && id && !assetIds.includes(id))
                   onChange([...assetIds, id], instruction);
               })
-              .finally(() => setIsUploading(false));
+              .finally(() => {
+                if (!librarySignal?.aborted) setIsUploading(false);
+              });
           }}
         >
           <MainButton

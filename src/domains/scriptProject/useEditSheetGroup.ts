@@ -8,7 +8,7 @@ export const useEditSheetGroup = (projectId: string | null | undefined) => {
   const { t } = useTranslation();
   const reportScriptProjectFailure = useReportScriptProjectFailure();
 
-  const { findRetryForRequest, withRetryRegistered } =
+  const { findRetryForRequest, withLibraryRetryRegistered } =
     useMutationRetryRegistry();
 
   const editSheetGroupMutation = useEditSheetGroupMutation(projectId, {
@@ -20,5 +20,5 @@ export const useEditSheetGroup = (projectId: string | null | undefined) => {
       )
   });
 
-  return withRetryRegistered(editSheetGroupMutation);
+  return withLibraryRetryRegistered(editSheetGroupMutation);
 };

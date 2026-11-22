@@ -1,18 +1,23 @@
+import { backendCloudApi } from "@domains/cloud/backendCloudApi";
 import {
   parseImg2ImgStatus,
   toImg2ImgJobStatus
 } from "@domains/cloud/img2imgStatus";
 import {
-  CloudApi,
+  bindCloudApiToLibrary,
   ensureCloudImageAsset,
   ensureCloudProject,
   ensureCloudTimeline
 } from "@domains/cloud/mirrorService";
+import { waitForPollTick } from "@domains/videoUpload/utils/waitForPollTick";
 import { isCloudRenderAvailable } from "@platform/renderTarget";
 
-import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
 import { readProviderPreferences } from "@/platform/providerPreferences";
+import {
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import {
   DEFAULT_SHEET_IMAGE_FILE_TYPE,
@@ -60,11 +65,11 @@ const records = (value: unknown): JsonRecord[] =>
       )
     : [];
 
-const cloudApi: CloudApi = {
-  post: async <T>(url: string, body?: unknown): Promise<T> =>
-    (await backendApiClient.post<T>(url, body)).data,
-  get: async <T>(url: string): Promise<T> =>
-    (await backendApiClient.get<T>(url)).data
+const cloudApi = backendCloudApi();
+const waitForNextPoll = async (work: RendererLibraryWork) => {
+  work.check();
+  await waitForPollTick(POLL_INTERVAL_MS, work.signal);
+  work.check();
 };
 
 export const canUseCloudSheetModels = (): boolean =>
@@ -91,9 +96,12 @@ const findRenderClip = (
 
 const isPlanCancelled = async (
   planId: string,
-  executionSession: string
+  executionSession: string,
+  work: RendererLibraryWork
 ): Promise<boolean> => {
-  const plan = await getLocalDesktopApi().scriptProjects.getPlan(planId);
+  const plan = await work.boundary(() =>
+    getLocalDesktopApi().scriptProjects.getPlan(planId)
+  );
   return (
     !plan ||
     plan.local_execution_session !== executionSession ||
@@ -104,20 +112,22 @@ const isPlanCancelled = async (
 const waitForOutput = async (
   clipId: string,
   planId: string,
-  executionSession: string
+  executionSession: string,
+  work: RendererLibraryWork
 ): Promise<string> => {
+  const remote = bindCloudApiToLibrary(cloudApi, work);
   for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt += 1) {
-    if (await isPlanCancelled(planId, executionSession))
+    if (await isPlanCancelled(planId, executionSession, work))
       throw new Error("Local plan cancelled or library changed");
     const parsed = parseImg2ImgStatus(
-      await cloudApi.get<unknown>(`/assets/img2img/status/${clipId}`)
+      await remote.get<unknown>(`/assets/img2img/status/${clipId}`)
     );
     const status = toImg2ImgJobStatus(parsed.status);
     if (status === "SUCCESS" && parsed.outputUrl) return parsed.outputUrl;
     if (status === "FAILED" || status === "CANCELLED") {
       throw new Error(`Mago Cloud image render ${status.toLowerCase()}`);
     }
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    await waitForNextPoll(work);
   }
   throw new Error("Mago Cloud image render did not finish in time");
 };
@@ -132,17 +142,21 @@ type CloudSheetTarget = {
   outputSize: [number, number];
   target: JsonRecord;
   existingCloudClip?: { assetId: string; clipId: string };
-  mutateLocalProject: <T>(mutation: () => Promise<T>) => Promise<T>;
+  work: RendererLibraryWork;
+  enqueueProjectUpdate: <T>(issue: () => Promise<T>) => Promise<T>;
 };
 
 /** A design variant edits its master's current image, read at render time so
  * a master re-rendered earlier in this run is the one it edits. */
 const resolveMasterAssetId = async (
   projectId: string,
-  masterToken: string | null
+  masterToken: string | null,
+  work: RendererLibraryWork
 ): Promise<string | null> => {
   if (!masterToken) return null;
-  const snapshot = await getLocalDesktopApi().scriptProjects.get(projectId);
+  const snapshot = await work.boundary(() =>
+    getLocalDesktopApi().scriptProjects.get(projectId)
+  );
   const master = records(
     (snapshot?.state as { keys?: unknown } | null)?.keys
   ).find((key) => key.token === masterToken);
@@ -156,13 +170,14 @@ const resolveMasterAssetId = async (
 
 const renderTarget = async (input: CloudSheetTarget): Promise<void> => {
   const desktop = getLocalDesktopApi();
-  const { target } = input;
+  const { target, work } = input;
   const token = textValue(target.token);
-  if (await isPlanCancelled(input.planId, input.executionSession))
+  if (await isPlanCancelled(input.planId, input.executionSession, work))
     throw new Error("Local plan cancelled or library changed");
   const masterAssetId = await resolveMasterAssetId(
     input.projectId,
-    typeof target.master_token === "string" ? target.master_token : null
+    typeof target.master_token === "string" ? target.master_token : null,
+    work
   );
   const localSourceIds = [
     ...(masterAssetId ? [masterAssetId] : []),
@@ -170,11 +185,17 @@ const renderTarget = async (input: CloudSheetTarget): Promise<void> => {
       ? target._local_reference_asset_ids.map(String)
       : [])
   ].filter((id, index, ids) => ids.indexOf(id) === index);
-  if (await isPlanCancelled(input.planId, input.executionSession))
+  if (await isPlanCancelled(input.planId, input.executionSession, work))
     throw new Error("Local plan cancelled or library changed");
   const cloudSourceIds = await Promise.all(
     localSourceIds.map((assetId) =>
-      ensureCloudImageAsset(cloudApi, assetId, input.cloudProjectId)
+      ensureCloudImageAsset(
+        cloudApi,
+        assetId,
+        input.cloudProjectId,
+        undefined,
+        work
+      )
     )
   );
   const plannedSize = Array.isArray(
@@ -195,12 +216,30 @@ const renderTarget = async (input: CloudSheetTarget): Promise<void> => {
       : target._local_render_prompt,
     textValue(target._local_prompt, textValue(target.prompt, token))
   );
-  if (await isPlanCancelled(input.planId, input.executionSession))
+  if (await isPlanCancelled(input.planId, input.executionSession, work))
     throw new Error("Local plan cancelled or library changed");
+  if (!input.existingCloudClip) {
+    // A switch can hide an accepted response before its IDs are saved. Do not
+    // dispatch a credit-bearing POST unless this plan records that ambiguity.
+    await input.enqueueProjectUpdate(() =>
+      work.boundary(() =>
+        desktop.scriptProjects.update({
+          projectId: input.projectId,
+          operation: "begin-cloud-sheet-submission",
+          payload: {
+            planId: input.planId,
+            executionSession: input.executionSession,
+            token
+          }
+        })
+      )
+    );
+  }
+  const remote = bindCloudApiToLibrary(cloudApi, work);
   const clip =
     input.existingCloudClip ??
     findRenderClip(
-      await cloudApi.post<unknown>("/assets/img2img/render", {
+      await remote.post<unknown>("/assets/img2img/render", {
         timeline_id: input.cloudTimelineId,
         sheet_token: token,
         sheet_name: textValue(target.name, token),
@@ -230,60 +269,67 @@ const renderTarget = async (input: CloudSheetTarget): Promise<void> => {
       })
     );
   if (!clip) throw new Error("Mago Cloud did not return an image render");
-  await input.mutateLocalProject(() =>
-    desktop.scriptProjects.update({
-      projectId: input.projectId,
-      operation: "start-cloud-sheet-render",
-      payload: {
-        planId: input.planId,
-        executionSession: input.executionSession,
-        token,
-        cloudClipId: clip.clipId,
-        cloudAssetId: clip.assetId
-      }
-    })
+  await input.enqueueProjectUpdate(() =>
+    work.boundary(() =>
+      desktop.scriptProjects.update({
+        projectId: input.projectId,
+        operation: "start-cloud-sheet-render",
+        payload: {
+          planId: input.planId,
+          executionSession: input.executionSession,
+          token,
+          cloudClipId: clip.clipId,
+          cloudAssetId: clip.assetId
+        }
+      })
+    )
   );
   const outputUrl = await waitForOutput(
     clip.clipId,
     input.planId,
-    input.executionSession
+    input.executionSession,
+    work
   );
   const plannedSpec =
     target._local_spec && typeof target._local_spec === "object"
       ? (target._local_spec as JsonRecord)
       : null;
-  await input.mutateLocalProject(() =>
-    desktop.scriptProjects.update({
-      projectId: input.projectId,
-      operation: "add-cloud-sheet-render",
-      payload: {
-        planId: input.planId,
-        executionSession: input.executionSession,
-        token,
-        prompt,
-        outputUrl,
-        cloudAssetId: clip.assetId,
-        renderSettings: {
-          render_model: renderModel,
-          width,
-          height,
-          ...(localSourceIds.length
-            ? { source_asset_id: localSourceIds[0] }
-            : {}),
-          ...(localSourceIds.length > 1
-            ? { reference_images: localSourceIds.slice(1) }
-            : {})
-        },
-        ...(plannedSpec
-          ? {
-              renderSpec: {
-                ...plannedSpec,
-                ...(masterAssetId ? { master_asset_id: masterAssetId } : {})
+  // Main owns the remote output download and body cleanup. Draining this IPC
+  // before acknowledgement would wait for the main abort that follows it.
+  await input.enqueueProjectUpdate(() =>
+    runRendererLibraryRequest(work, () =>
+      desktop.scriptProjects.update({
+        projectId: input.projectId,
+        operation: "add-cloud-sheet-render",
+        payload: {
+          planId: input.planId,
+          executionSession: input.executionSession,
+          token,
+          prompt,
+          outputUrl,
+          cloudAssetId: clip.assetId,
+          renderSettings: {
+            render_model: renderModel,
+            width,
+            height,
+            ...(localSourceIds.length
+              ? { source_asset_id: localSourceIds[0] }
+              : {}),
+            ...(localSourceIds.length > 1
+              ? { reference_images: localSourceIds.slice(1) }
+              : {})
+          },
+          ...(plannedSpec
+            ? {
+                renderSpec: {
+                  ...plannedSpec,
+                  ...(masterAssetId ? { master_asset_id: masterAssetId } : {})
+                }
               }
-            }
-          : {})
-      }
-    })
+            : {})
+        }
+      })
+    )
   );
 };
 
@@ -294,9 +340,28 @@ const FINISHED_STEP_STATUSES = ["COMPLETED", "SKIPPED"];
  * concurrently, design variants after the masters they edit. A key whose
  * cloud clip was already submitted is polled rather than paid for again.
  */
-export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
+export const executeCloudSheetPlan = async (
+  planId: string,
+  work: RendererLibraryWork
+): Promise<void> => {
+  try {
+    await runCloudSheetPlan(planId, work);
+  } catch (error) {
+    // Launchers intentionally detach; library teardown is not a plan failure.
+    if (!work.signal.aborted)
+      console.error("Cloud sheet executor failed", error);
+  }
+};
+
+const runCloudSheetPlan = async (
+  planId: string,
+  work: RendererLibraryWork
+): Promise<void> => {
+  work.check();
   const desktop = getLocalDesktopApi();
-  let plan = await desktop.scriptProjects.getPlan(planId);
+  const getPlan = () =>
+    work.boundary(() => desktop.scriptProjects.getPlan(planId));
+  let plan = await getPlan();
   if (!plan || plan.local_executor !== CLOUD_SHEET_EXECUTOR) return;
   const executionSession = textValue(plan.local_execution_session);
   if (!executionSession) return;
@@ -304,8 +369,8 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
     records(plan.local_targets).some((target) => target.role === "storyboard")
   ) {
     while (plan?.status === "PENDING") {
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-      plan = await desktop.scriptProjects.getPlan(planId);
+      await waitForNextPoll(work);
+      plan = await getPlan();
       if (plan?.local_execution_session !== executionSession) return;
     }
     if (!plan || plan.status !== "RUNNING") return;
@@ -317,11 +382,13 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
   const tokenOf = (step: JsonRecord) =>
     textValue((step.tool_args as JsonRecord | undefined)?.token);
   const fail = (token: string, message: string) =>
-    desktop.scriptProjects.update({
-      projectId,
-      operation: "fail-cloud-sheet-render",
-      payload: { planId, executionSession, token, message }
-    });
+    work.boundary(() =>
+      desktop.scriptProjects.update({
+        projectId,
+        operation: "fail-cloud-sheet-render",
+        payload: { planId, executionSession, token, message }
+      })
+    );
   const firstToken = textValue(records(plan.local_targets)[0]?.token);
 
   if (!isCloudSheetModel(settings.render_model)) {
@@ -365,30 +432,51 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
         : [];
     })
   );
+  const uncertain = new Set(
+    steps
+      .filter(
+        (step) =>
+          step.tool_name === "submit_img2img_batch" &&
+          (step.result as JsonRecord | undefined)?.cloud_submission_pending ===
+            true
+      )
+      .map(tokenOf)
+  );
 
   let cloudProjectId: string;
   let cloudTimelineId: string;
   try {
-    const project = await desktop.projects.get(projectId);
+    const project = await work.boundary(() => desktop.projects.get(projectId));
     if (!project) throw new Error("Local script project not found");
-    const snapshot = await desktop.scriptProjects.get(projectId);
+    const snapshot = await work.boundary(() =>
+      desktop.scriptProjects.get(projectId)
+    );
     const sheetsTimelineId = textValue(
       (snapshot?.state as { sheets_timeline_id?: unknown } | null)
         ?.sheets_timeline_id
     );
     if (!sheetsTimelineId)
       throw new Error("Local script project has no sheet timeline");
-    cloudProjectId = await ensureCloudProject(cloudApi, {
-      localProjectId: projectId,
-      name: project.name
-    });
-    cloudTimelineId = await ensureCloudTimeline(cloudApi, {
-      localShotId: sheetsTimelineId,
-      localProjectId: projectId,
-      cloudProjectId,
-      name: "Reference sheets"
-    });
+    cloudProjectId = await ensureCloudProject(
+      cloudApi,
+      {
+        localProjectId: projectId,
+        name: project.name
+      },
+      work
+    );
+    cloudTimelineId = await ensureCloudTimeline(
+      cloudApi,
+      {
+        localShotId: sheetsTimelineId,
+        localProjectId: projectId,
+        cloudProjectId,
+        name: "Reference sheets"
+      },
+      work
+    );
   } catch (error) {
+    work.check();
     await fail(
       firstToken,
       error instanceof Error ? error.message : "Mago Cloud is unavailable"
@@ -398,8 +486,11 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
 
   // Step writes go one at a time: each rewrites the whole plan record.
   let queue: Promise<unknown> = Promise.resolve();
-  const mutateLocalProject = <T>(mutation: () => Promise<T>): Promise<T> => {
-    const result = queue.then(mutation, mutation);
+  const enqueueProjectUpdate = <T>(issue: () => Promise<T>): Promise<T> => {
+    const result = queue.then(() => {
+      work.check();
+      return issue();
+    });
     queue = result.catch(() => undefined);
     return result;
   };
@@ -420,6 +511,10 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
       wave.map(async (target) => {
         const token = textValue(target.token);
         try {
+          if (uncertain.has(token) && !submitted.has(token))
+            throw new Error(
+              "Mago Cloud may have accepted this image render, but no clip ID was saved. Check Cloud render history; this plan will not submit it again."
+            );
           await renderTarget({
             projectId,
             planId,
@@ -430,20 +525,25 @@ export const executeCloudSheetPlan = async (planId: string): Promise<void> => {
             outputSize,
             target,
             existingCloudClip: submitted.get(token),
-            mutateLocalProject
+            work,
+            enqueueProjectUpdate
           });
         } catch (error) {
-          failures.push({ token, error });
+          if (!work.signal.aborted) failures.push({ token, error });
         }
       })
     );
   };
   await runWave(independents);
+  work.check();
   if (!failures.length) await runWave(dependents);
-  if (!failures.length || (await isPlanCancelled(planId, executionSession)))
+  if (
+    !failures.length ||
+    (await isPlanCancelled(planId, executionSession, work))
+  )
     return;
   const [failure] = failures;
-  await mutateLocalProject(() =>
+  await enqueueProjectUpdate(() =>
     fail(
       failure!.token,
       failure!.error instanceof Error

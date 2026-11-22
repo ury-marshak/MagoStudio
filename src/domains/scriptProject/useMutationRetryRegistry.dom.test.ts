@@ -7,6 +7,11 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 
+import {
+  RendererLibrarySession,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+
 import { useMutationRetryRegistry } from "./useMutationRetryRegistry";
 
 const renderWithQueryClient = <Result>(hook: () => Result) => {
@@ -107,5 +112,51 @@ describe("useMutationRetryRegistry", () => {
     shouldFail = false;
     act(() => reportedRetries[0]!());
     await waitFor(() => expect(result.current.data).toBe("shot-2"));
+  });
+  it("keeps the dispatch origin on retry and ignores old retry buttons after replacement", async () => {
+    const library = new RendererLibrarySession();
+    const work = library.capture();
+    const callbacks: (() => void)[] = [];
+    const request = { id: "same-sheet" };
+    const onSuccess = vi.fn();
+    const mutateAsync = vi
+      .fn<
+        (input: typeof request, origin: RendererLibraryWork) => Promise<string>
+      >()
+      .mockRejectedValueOnce(new Error("failed"))
+      .mockResolvedValueOnce("plan")
+      .mockRejectedValueOnce(new Error("failed again"));
+    const { result } = renderHook(() => {
+      const registry = useMutationRetryRegistry();
+      return registry.withLibraryRetryRegistered({
+        mutateAsync: async (
+          input: typeof request,
+          origin: RendererLibraryWork
+        ) => {
+          try {
+            return await mutateAsync(input, origin);
+          } catch (error) {
+            callbacks.push(registry.findRetryForRequest(input)!);
+            throw error;
+          }
+        }
+      });
+    });
+    await expect(
+      result.current.mutateAsync(request, work, onSuccess)
+    ).rejects.toThrow("failed");
+    callbacks[0]!();
+    await waitFor(() =>
+      expect(onSuccess).toHaveBeenCalledExactlyOnceWith("plan")
+    );
+    expect(mutateAsync).toHaveBeenLastCalledWith(request, work);
+    await expect(
+      result.current.mutateAsync(request, work, onSuccess)
+    ).rejects.toThrow("failed again");
+    await library.suspend();
+    library.reset();
+    callbacks[1]!();
+    expect(mutateAsync).toHaveBeenCalledTimes(3);
+    expect(onSuccess).toHaveBeenCalledTimes(1);
   });
 });

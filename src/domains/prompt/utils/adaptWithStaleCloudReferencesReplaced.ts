@@ -8,18 +8,27 @@ export interface MirroredAdaptPromptReference {
 export const adaptWithStaleCloudReferencesReplaced = async <TAdapted>({
   mirrorReferences,
   adapt,
-  markReferenceStale
+  markReferenceStale,
+  signal
 }: {
   mirrorReferences: () => Promise<MirroredAdaptPromptReference[]>;
   adapt: (cloudAssetIds: string[]) => Promise<TAdapted>;
   markReferenceStale: (localAssetId: string) => Promise<void>;
+  signal?: AbortSignal;
 }): Promise<TAdapted> => {
   const replacedLocalAssetIds = new Set<string>();
   for (;;) {
+    signal?.throwIfAborted();
     const references = await mirrorReferences();
     try {
-      return await adapt(references.map((reference) => reference.cloudAssetId));
+      signal?.throwIfAborted();
+      const adapted = await adapt(
+        references.map((reference) => reference.cloudAssetId)
+      );
+      signal?.throwIfAborted();
+      return adapted;
     } catch (error) {
+      signal?.throwIfAborted();
       const missingCloudAssetId = findMissingReferenceCloudAssetId(error);
       const staleReference = references.find(
         (reference) => reference.cloudAssetId === missingCloudAssetId

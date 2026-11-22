@@ -24,9 +24,9 @@ export const BulkRenderingPanel: React.FC<Props> = ({
 }) => {
   const { t } = useTranslation();
   const setBulkRenderingFlow = useSetAtom(bulkRenderingFlowAtom);
-  const { data: runs } = useBulkRendersRunsAcrossProjects();
+  const { data: runs, work } = useBulkRendersRunsAcrossProjects();
   const { inProgressRuns, historyRuns } = splitBulkRendersRunListBySection({
-    runs: runs ?? []
+    runs: work.signal.aborted ? [] : (runs ?? [])
   });
 
   const onActivateInProgressRow = (bulkRunId: string) => {
@@ -74,6 +74,7 @@ export const BulkRenderingPanel: React.FC<Props> = ({
                 <BulkRenderingInProgressRowContainer
                   key={run.id}
                   run={run}
+                  work={work}
                   onActivate={onActivateInProgressRow}
                 />
               ))}

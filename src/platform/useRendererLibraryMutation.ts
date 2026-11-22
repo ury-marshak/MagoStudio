@@ -1,4 +1,5 @@
 import { useMutation } from "@tanstack/react-query";
+import { useSyncExternalStore } from "react";
 
 import {
   rendererLibrary,
@@ -21,6 +22,13 @@ type LibraryMutationOptions<Data, Input, Optimistic> = {
 export function useRendererLibraryMutation<Data, Input, Optimistic = unknown>(
   options: LibraryMutationOptions<Data, Input, Optimistic>
 ) {
+  // An abort-ignoring request may outlive replacement; its observer must not
+  // keep the replacement form busy. Do not connect the bridge until dispatch.
+  useSyncExternalStore(
+    rendererLibrary.subscribe,
+    rendererLibrary.getSnapshot,
+    rendererLibrary.getSnapshot
+  );
   type Action = {
     input: Input;
     work: RendererLibraryWork;
@@ -51,6 +59,7 @@ export function useRendererLibraryMutation<Data, Input, Optimistic = unknown>(
 
   return {
     ...mutation,
+    isPending: mutation.isPending && !mutation.variables?.work.signal.aborted,
     variables: mutation.variables?.input,
     mutate: (input: Input, work = rendererLibrary.capture()) =>
       mutation.mutate({ input, work, options }),

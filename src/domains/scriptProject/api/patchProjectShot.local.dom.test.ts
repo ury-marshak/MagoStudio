@@ -86,12 +86,16 @@ describe("patchProjectShot capabilities", () => {
       sequential: { enabled: true, mode: "last_frame" }
     });
 
-    expect(patch).toHaveBeenCalledWith("/projects/project-1/shots/timeline-1", {
-      video_prompt: "Walk into frame",
-      dialogue: [{ speaker: "VO", line: "Keep walking." }],
-      sequential: { enabled: true, mode: "last_frame" },
-      locked: true
-    });
+    expect(patch).toHaveBeenCalledWith(
+      "/projects/project-1/shots/timeline-1",
+      {
+        video_prompt: "Walk into frame",
+        dialogue: [{ speaker: "VO", line: "Keep walking." }],
+        sequential: { enabled: true, mode: "last_frame" },
+        locked: true
+      },
+      { signal: expect.any(AbortSignal) }
+    );
     expect(editedShot).toMatchObject({
       timeline_id: "timeline-1",
       locked: true,
@@ -120,9 +124,13 @@ describe("patchProjectShot capabilities", () => {
       sequential: null
     });
 
-    expect(patch).toHaveBeenCalledWith("/projects/project-1/shots/timeline-1", {
-      sequential: null
-    });
+    expect(patch).toHaveBeenCalledWith(
+      "/projects/project-1/shots/timeline-1",
+      {
+        sequential: null
+      },
+      { signal: expect.any(AbortSignal) }
+    );
   });
 
   it("refuses a cloud edit that carries no field Mago Cloud accepts", async () => {

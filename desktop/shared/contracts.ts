@@ -1027,6 +1027,7 @@ export interface MagoDesktopApi {
         | "edit-shot"
         | "pin-shot"
         | "edit-image-description"
+        | "begin-cloud-sheet-submission"
         | "start-cloud-sheet-render"
         | "add-cloud-sheet-render"
         | "fail-cloud-sheet-render"

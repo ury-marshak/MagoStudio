@@ -12,6 +12,8 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useInterval, useIntersectionObserver } from "usehooks-ts";
 
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+
 import { BulkRenderingInProgressRow } from "./BulkRenderingInProgressRow";
 
 const NOW_TICK_INTERVAL_MS = 1000;
@@ -23,11 +25,13 @@ const CURRENT_STEP_NAME_TRANSLATION_KEY = {
 
 interface Props {
   run: BulkRendersRun;
+  work: RendererLibraryWork;
   onActivate: (runId: string) => void;
 }
 
 export const BulkRenderingInProgressRowContainer: React.FC<Props> = ({
   run,
+  work,
   onActivate
 }) => {
   const { t } = useTranslation();
@@ -75,33 +79,35 @@ export const BulkRenderingInProgressRowContainer: React.FC<Props> = ({
       shotOverridesById: detail?.input_data?.shot_overrides ?? undefined
     }
   );
-  const { mutate: resumeBulkRendersRun, isPending: isResuming } =
+  const { mutateAsync: resumeBulkRendersRun, isPending: isResuming } =
     useResumeBulkRendersRun();
 
-  const requestContinue = () => {
+  const requestContinue = async () => {
+    if (work.signal.aborted) return;
     if (!isLocalRun && !isBalanceSufficientForRemainder) {
       showToast({
         message: t(
           "bulk_rendering.panel_row_resume_insufficient_credits.description"
         ),
-        onSubmit: () => router.push(ROUTES.PAYMENT_CREDITS),
+        onSubmit: () => {
+          if (!work.signal.aborted) router.push(ROUTES.PAYMENT_CREDITS);
+        },
         onSubmitText: t("actions.buy_credits.label")
       });
       return;
     }
 
-    resumeBulkRendersRun(
-      { bulkRunId: run.id, projectId: run.project_id ?? undefined },
-      {
-        onError: () => {
-          showToast({
-            message: t(
-              "notifications.bulk_renders_run_resume_failed.description"
-            )
-          });
-        }
-      }
-    );
+    try {
+      await resumeBulkRendersRun(
+        { bulkRunId: run.id, projectId: run.project_id ?? undefined },
+        work
+      );
+    } catch {
+      if (work.signal.aborted) return;
+      showToast({
+        message: t("notifications.bulk_renders_run_resume_failed.description")
+      });
+    }
   };
 
   return (

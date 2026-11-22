@@ -1,5 +1,6 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import {
@@ -14,7 +15,7 @@ export const useSubmitSceneStoryboard = (
 ) => {
   const queryClient = useQueryClient();
 
-  return useMutation({
+  return useRendererLibraryMutation({
     mutationFn: postSceneStoryboardGenerate,
     onSuccess: (_submitted, request) => {
       void queryClient.invalidateQueries({

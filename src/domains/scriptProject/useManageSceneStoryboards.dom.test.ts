@@ -1,6 +1,8 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 import { useManageSceneStoryboards } from "./useManageSceneStoryboards";
 
 const submitSceneStoryboard = vi.hoisted(() => vi.fn());
@@ -11,8 +13,7 @@ vi.mock("./data/useSubmitSceneStoryboard", () => ({
 const updateSceneStoryboard = vi.hoisted(() => vi.fn());
 vi.mock("./data/useUpdateSceneStoryboard", () => ({
   useUpdateSceneStoryboard: () => ({
-    mutate: updateSceneStoryboard,
-    isPending: false
+    mutateAsync: updateSceneStoryboard
   })
 }));
 
@@ -37,10 +38,10 @@ describe("useManageSceneStoryboards", () => {
 
     await act(() => result.current.generateSceneStoryboard("scene"));
 
-    expect(submitSceneStoryboard).toHaveBeenCalledWith({
-      projectId: "project",
-      sceneTimelineId: "scene"
-    });
+    expect(submitSceneStoryboard).toHaveBeenCalledWith(
+      { projectId: "project", sceneTimelineId: "scene" },
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(result.current.isSubmittingSceneStoryboard("scene")).toBe(false);
   });
 
@@ -60,9 +61,11 @@ describe("useManageSceneStoryboards", () => {
     expect(submitSceneStoryboard).toHaveBeenCalledTimes(2);
   });
 
-  it("switches a scene's storyboard off for video renders", () => {
+  it("switches a scene's storyboard off for video renders", async () => {
     const { result } = renderHook(() => useManageSceneStoryboards("project"));
-    result.current.setSceneStoryboardUsedInVideoRenders("scene", false);
+    await act(async () => {
+      result.current.setSceneStoryboardUsedInVideoRenders("scene", false);
+    });
     expect(updateSceneStoryboard).toHaveBeenCalledWith(
       {
         projectId: "project",
@@ -73,17 +76,37 @@ describe("useManageSceneStoryboards", () => {
     );
   });
 
-  it("marks only the scene being updated as busy, until its update settles", () => {
+  it("marks only the scene being updated as busy, until its update settles", async () => {
+    const write = Promise.withResolvers<void>();
+    updateSceneStoryboard.mockReturnValueOnce(write.promise);
     const { result } = renderHook(() => useManageSceneStoryboards("project"));
 
     act(() => result.current.pinSceneStoryboardVersion("scene", "v1"));
     expect(result.current.isUpdatingSceneStoryboard("scene")).toBe(true);
     expect(result.current.isUpdatingSceneStoryboard("other-scene")).toBe(false);
 
-    const { onSettled } = updateSceneStoryboard.mock.calls[0]![1] as {
-      onSettled: () => void;
-    };
-    act(() => onSettled());
+    await act(async () => write.resolve());
+    expect(result.current.isUpdatingSceneStoryboard("scene")).toBe(false);
+  });
+
+  it("ignores an old update failure and finally after switching to the same scene ID", async () => {
+    const old = Promise.withResolvers<void>();
+    const replacement = Promise.withResolvers<void>();
+    updateSceneStoryboard
+      .mockReturnValueOnce(old.promise)
+      .mockReturnValueOnce(replacement.promise);
+    const { result } = renderHook(() => useManageSceneStoryboards("project"));
+    act(() => result.current.pinSceneStoryboardVersion("scene", "old"));
+    await act(async () => {
+      await rendererLibrary.suspend();
+      rendererLibrary.reset();
+    });
+    expect(result.current.isUpdatingSceneStoryboard("scene")).toBe(false);
+    act(() => result.current.pinSceneStoryboardVersion("scene", "new"));
+    await act(async () => old.reject(new Error("late failure")));
+    expect(reportScriptProjectFailure).not.toHaveBeenCalled();
+    expect(result.current.isUpdatingSceneStoryboard("scene")).toBe(true);
+    await act(async () => replacement.resolve());
     expect(result.current.isUpdatingSceneStoryboard("scene")).toBe(false);
   });
 });

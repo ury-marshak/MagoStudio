@@ -1329,6 +1329,7 @@ export class LocalScriptProjectService {
         | "edit-shot"
         | "pin-shot"
         | "edit-image-description"
+        | "begin-cloud-sheet-submission"
         | "start-cloud-sheet-render"
         | "add-cloud-sheet-render"
         | "fail-cloud-sheet-render"
@@ -1506,6 +1507,8 @@ export class LocalScriptProjectService {
       await this.snapshots.put({ projectId: input.projectId, state });
       return { asset_id: assetId, description };
     }
+    if (input.operation === "begin-cloud-sheet-submission")
+      return this.beginCloudSheetSubmission(input.projectId, input.payload);
     if (input.operation === "start-cloud-sheet-render")
       return this.startCloudSheetRender(input.projectId, input.payload);
     if (input.operation === "add-cloud-sheet-render")
@@ -4773,6 +4776,44 @@ export class LocalScriptProjectService {
     return plan;
   }
 
+  /** Persist uncertainty before allowing a credit-bearing POST. A lost response
+   * cannot safely be distinguished from acceptance. */
+  private async beginCloudSheetSubmission(
+    projectId: string,
+    payload: JsonRecord
+  ): Promise<JsonRecord> {
+    return this.withProjectStateWrite(projectId, async () => {
+      const planId = textValue(payload.planId, "");
+      const token = textValue(payload.token, "");
+      const plan = await this.requireCloudSheetPlan(
+        projectId,
+        planId,
+        payload.executionSession
+      );
+      const step = this.findStep(
+        plan,
+        "submit_img2img_batch",
+        undefined,
+        token
+      );
+      if (
+        plan.status === "CANCELLED" ||
+        completedStep(step) ||
+        record(step?.result)?.cloud_submission_pending === true
+      )
+        throw new Error(
+          "Mago Cloud sheet submission is already recorded or may have been accepted"
+        );
+      const recorded = await this.setStep(projectId, planId, step, "RUNNING", {
+        token,
+        cloud_submission_pending: true
+      });
+      if (recorded.status === "CANCELLED")
+        throw new Error("Local plan cancelled");
+      return recorded;
+    });
+  }
+
   /** The renderer submitted one key's cloud render: record the cloud clip so
    * a resumed plan polls it instead of paying for a second render. */
   private async startCloudSheetRender(
@@ -4793,19 +4834,16 @@ export class LocalScriptProjectService {
       token
     );
     if (!completedStep(submit)) {
-      plan = await this.setStep(projectId, planId, submit, "RUNNING");
-      plan = await this.setStep(
-        projectId,
-        planId,
-        this.findStep(plan, "submit_img2img_batch", undefined, token),
-        "COMPLETED",
-        {
-          token,
-          submitted: true,
-          cloud_clip_id: textValue(payload.cloudClipId, ""),
-          cloud_asset_id: textValue(payload.cloudAssetId, "")
-        }
-      );
+      const cloudClipId = textValue(payload.cloudClipId, "");
+      const cloudAssetId = textValue(payload.cloudAssetId, "");
+      if (!cloudClipId || !cloudAssetId)
+        throw new Error("Mago Cloud did not return a recoverable image render");
+      plan = await this.setStep(projectId, planId, submit, "COMPLETED", {
+        token,
+        submitted: true,
+        cloud_clip_id: cloudClipId,
+        cloud_asset_id: cloudAssetId
+      });
     }
     if (plan.status === "PENDING") {
       plan = planAt(plan, "RUNNING");

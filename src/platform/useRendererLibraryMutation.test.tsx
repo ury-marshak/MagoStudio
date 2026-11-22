@@ -18,10 +18,11 @@ const deferred = () => {
   return { result, release };
 };
 
-const switchLibrary = async () => {
-  await rendererLibrary.suspend();
-  rendererLibrary.reset();
-};
+const switchLibrary = () =>
+  act(async () => {
+    await rendererLibrary.suspend();
+    rendererLibrary.reset();
+  });
 
 afterEach(switchLibrary);
 
@@ -124,4 +125,29 @@ it("refuses a delayed success callback after reset without invalidating or rolli
   expect(client.getQueryData(["project", "reused"])).toBe("replacement");
   expect(invalidate).not.toHaveBeenCalled();
   expect(rollback).not.toHaveBeenCalled();
+});
+
+it("hides old pending state without waiting for the transport to settle", async () => {
+  const held = deferred();
+  const start = vi.fn(async () => held.result);
+  const { wrapper } = setup();
+  const { result } = renderHook(
+    () => useRendererLibraryMutation({ mutationFn: start }),
+    { wrapper }
+  );
+  let stale!: Promise<unknown>;
+  await act(async () => {
+    stale = result.current
+      .mutateAsync(undefined)
+      .catch((error: unknown) => error);
+  });
+  await vi.waitFor(() => expect(result.current.isPending).toBe(true));
+  await switchLibrary();
+  expect(result.current.isPending).toBe(false);
+  await act(async () => {
+    held.release();
+    await stale;
+  });
+  expect(await stale).toMatchObject({ name: "AbortError" });
+  expect(result.current.isPending).toBe(false);
 });

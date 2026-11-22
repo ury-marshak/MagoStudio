@@ -1,6 +1,10 @@
 import { BulkRendersRun, BulkRendersRunSchema } from "@schemas/bulkRendersRun";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import {
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 const isBulkRendersRunSummary = (value: unknown): boolean => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -16,11 +20,15 @@ const isBulkRendersRunSummary = (value: unknown): boolean => {
 };
 
 export const fetchBulkRendersRuns = async (
-  projectId?: string
+  projectId?: string,
+  work?: RendererLibraryWork
 ): Promise<BulkRendersRun[]> => {
-  const response = await backendApiClient.get("/agent/plans", {
-    params: projectId ? { project_id: projectId } : undefined
-  });
+  const params = projectId ? { project_id: projectId } : undefined;
+  const response = await (work
+    ? runRendererLibraryRequest(work, (signal) =>
+        backendApiClient.get("/agent/plans", { params, signal })
+      )
+    : backendApiClient.get("/agent/plans", { params }));
 
   if (!Array.isArray(response.data)) return [];
 

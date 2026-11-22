@@ -35,6 +35,13 @@ export const PromptWithAdaptI2vButton: React.FC<
     props.specificConfig?.adaptEngine ??
     (props.allValues?.mago_engine as VideoEngine | undefined) ??
     VideoEngine.minimax_reference;
+  const editorKey = JSON.stringify([
+    route,
+    isRoutePending,
+    props.name,
+    props.selectedLayer?.id,
+    engine
+  ]);
 
   const localReferenceAssetIds = buildAdaptPromptReferenceAssetIds({
     sourceVideoAssetId: isVideoReferenceEnabled
@@ -47,6 +54,8 @@ export const PromptWithAdaptI2vButton: React.FC<
     onChange: props.setValue,
     referenceAssetIds: localReferenceAssetIds,
     engine,
+    editorKey,
+    editorTarget: sourcesAtom,
     route: route === "external" ? "external" : "local"
   });
 
@@ -58,7 +67,9 @@ export const PromptWithAdaptI2vButton: React.FC<
     onChange: props.setValue,
     sourceVideoTrackId: cloudSourceVideoTrackId,
     referenceImageAssetIds,
-    cloudEngine: engine
+    cloudEngine: engine,
+    editorKey,
+    editorTarget: sourcesAtom
   });
 
   const active = route === "cloud" ? cloud : local;

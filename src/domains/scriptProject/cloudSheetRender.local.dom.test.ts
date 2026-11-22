@@ -19,7 +19,8 @@ const {
 vi.mock("@/lib/backend-api-client", () => ({
   backendApiClient: { post, get }
 }));
-vi.mock("@domains/cloud/mirrorService", () => ({
+vi.mock("@domains/cloud/mirrorService", async (original) => ({
+  ...(await original<typeof import("@domains/cloud/mirrorService")>()),
   ensureCloudImageAsset,
   ensureCloudProject,
   ensureCloudTimeline
@@ -30,6 +31,8 @@ vi.mock("@platform/renderTarget", () => ({
 vi.mock("@/platform/providerPreferences", () => ({
   readProviderPreferences: () => ({ "mago-cloud": true })
 }));
+
+import { RendererLibrarySession } from "@/platform/rendererLibraryWork";
 
 import { executeCloudSheetPlan } from "./cloudSheetRender.local";
 
@@ -105,27 +108,35 @@ describe("executeCloudSheetPlan", () => {
     succeed();
     const update = installBridge(cloudPlan([target()]));
 
-    await executeCloudSheetPlan("plan-1");
+    await executeCloudSheetPlan(
+      "plan-1",
+      new RendererLibrarySession().capture()
+    );
 
-    expect(post).toHaveBeenCalledWith("/assets/img2img/render", {
-      timeline_id: "cloud-sheets-1",
-      sheet_token: "mara",
-      sheet_name: "Mara",
-      sheet_kind: "character",
-      img_file_type: "png",
-      render_model: "seedream_5_pro_t2i",
-      render_mode: "credits",
-      settings: {
-        prompt: "Mara, turnaround\n\nPainterly",
-        width: 1024,
-        height: 1024
-      }
-    });
+    expect(post).toHaveBeenCalledWith(
+      "/assets/img2img/render",
+      {
+        timeline_id: "cloud-sheets-1",
+        sheet_token: "mara",
+        sheet_name: "Mara",
+        sheet_kind: "character",
+        img_file_type: "png",
+        render_model: "seedream_5_pro_t2i",
+        render_mode: "credits",
+        settings: {
+          prompt: "Mara, turnaround\n\nPainterly",
+          width: 1024,
+          height: 1024
+        }
+      },
+      { signal: expect.any(AbortSignal) }
+    );
     expect(update.mock.calls.map(([call]) => call.operation)).toEqual([
+      "begin-cloud-sheet-submission",
       "start-cloud-sheet-render",
       "add-cloud-sheet-render"
     ]);
-    expect(update.mock.calls[1]![0].payload).toEqual(
+    expect(update.mock.calls[2]![0].payload).toEqual(
       expect.objectContaining({
         planId: "plan-1",
         executionSession: "library-session",
@@ -151,7 +162,10 @@ describe("executeCloudSheetPlan", () => {
       ])
     );
 
-    await executeCloudSheetPlan("plan-1");
+    await executeCloudSheetPlan(
+      "plan-1",
+      new RendererLibrarySession().capture()
+    );
 
     expect(post.mock.calls[0]![1]).toEqual(
       expect.objectContaining({
@@ -163,7 +177,7 @@ describe("executeCloudSheetPlan", () => {
         })
       })
     );
-    expect(update.mock.calls[1]![0].payload.renderSpec).toEqual(
+    expect(update.mock.calls[2]![0].payload.renderSpec).toEqual(
       expect.objectContaining({ master_asset_id: "master-1" })
     );
   });
@@ -184,10 +198,15 @@ describe("executeCloudSheetPlan", () => {
       )
     );
 
-    await executeCloudSheetPlan("plan-1");
+    await executeCloudSheetPlan(
+      "plan-1",
+      new RendererLibrarySession().capture()
+    );
 
     expect(post).not.toHaveBeenCalled();
-    expect(get).toHaveBeenCalledWith("/assets/img2img/status/clip-0");
+    expect(get).toHaveBeenCalledWith("/assets/img2img/status/clip-0", {
+      signal: expect.any(AbortSignal)
+    });
   });
 
   it("does not render a key a newer run took over from this plan", async () => {
@@ -212,7 +231,10 @@ describe("executeCloudSheetPlan", () => {
       )
     );
 
-    await executeCloudSheetPlan("plan-1");
+    await executeCloudSheetPlan(
+      "plan-1",
+      new RendererLibrarySession().capture()
+    );
 
     expect(post).not.toHaveBeenCalled();
     expect(get).not.toHaveBeenCalled();
@@ -222,7 +244,10 @@ describe("executeCloudSheetPlan", () => {
     canRender.value = false;
     const update = installBridge(cloudPlan([target()]));
 
-    await executeCloudSheetPlan("plan-1");
+    await executeCloudSheetPlan(
+      "plan-1",
+      new RendererLibrarySession().capture()
+    );
 
     expect(update).toHaveBeenCalledWith({
       projectId: "local-1",
@@ -249,7 +274,10 @@ describe("executeCloudSheetPlan", () => {
           release = resolve;
         })
     );
-    const running = executeCloudSheetPlan("plan-1");
+    const running = executeCloudSheetPlan(
+      "plan-1",
+      new RendererLibrarySession().capture()
+    );
     await vi.waitFor(() => expect(ensureCloudImageAsset).toHaveBeenCalled());
     plan.local_execution_session = "replacement-session";
     release("cloud-reference");
@@ -262,9 +290,106 @@ describe("executeCloudSheetPlan", () => {
     const plan: Record<string, unknown> = cloudPlan([target()]);
     delete plan.local_execution_session;
     const update = installBridge(plan);
-    await executeCloudSheetPlan("plan-1");
+    await executeCloudSheetPlan(
+      "plan-1",
+      new RendererLibrarySession().capture()
+    );
     expect(ensureCloudProject).not.toHaveBeenCalled();
     expect(post).not.toHaveBeenCalled();
     expect(update).not.toHaveBeenCalled();
+  });
+
+  it("does not read a replacement plan when an old detached launcher starts late", async () => {
+    const session = new RendererLibrarySession();
+    const work = session.capture();
+    await session.suspend();
+    session.reset();
+    const plan = cloudPlan([target()]);
+    installBridge(plan);
+    await executeCloudSheetPlan(plan.id, work);
+    expect(window.mago?.scriptProjects.getPlan).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("stops polling without cancelling or rewriting an accepted clip", async () => {
+    vi.useFakeTimers();
+    try {
+      succeed();
+      get.mockResolvedValue({ data: { render_status: "RUNNING" } });
+      const update = installBridge(cloudPlan([target()]));
+      const session = new RendererLibrarySession();
+      const work = session.capture();
+      const running = executeCloudSheetPlan("plan-1", work);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(get).toHaveBeenCalledExactlyOnceWith(
+        "/assets/img2img/status/clip-1",
+        { signal: work.signal }
+      );
+      expect(vi.getTimerCount()).toBe(1);
+      await session.suspend();
+      await running;
+      expect(vi.getTimerCount()).toBe(0);
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(update.mock.calls.map(([call]) => call.operation)).toEqual([
+        "begin-cloud-sheet-submission",
+        "start-cloud-sheet-render"
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not register a second target after acceptance while an earlier output IPC holds the queue", async () => {
+    succeed();
+    const plan = cloudPlan([target(), target({ token: "coast" })]);
+    const update = installBridge(plan);
+    let acceptSecond!: () => void;
+    const secondResponse = new Promise<void>((resolve) => {
+      acceptSecond = resolve;
+    });
+    post.mockImplementation(async (_path, body: { sheet_token: string }) => {
+      if (body.sheet_token === "coast") await secondResponse;
+      return {
+        data: {
+          clips: [{ id: `${body.sheet_token}-clip`, asset: { id: "image" } }]
+        }
+      };
+    });
+    let finishOutput!: () => void;
+    const output = new Promise<void>((resolve) => {
+      finishOutput = resolve;
+    });
+    update.mockImplementation(async (call) => {
+      if (call.operation === "add-cloud-sheet-render") await output;
+      return {};
+    });
+    const session = new RendererLibrarySession();
+    const pending = executeCloudSheetPlan(plan.id, session.capture());
+    await vi.waitFor(() =>
+      expect(update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          operation: "add-cloud-sheet-render",
+          payload: expect.objectContaining({ token: "mara" })
+        })
+      )
+    );
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operation: "begin-cloud-sheet-submission",
+        payload: expect.objectContaining({ token: "coast" })
+      })
+    );
+    acceptSecond();
+    await Promise.resolve();
+    await session.suspend();
+    finishOutput();
+    await pending;
+    expect(update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        operation: "start-cloud-sheet-render",
+        payload: expect.objectContaining({ token: "coast" })
+      })
+    );
   });
 });

@@ -1,7 +1,10 @@
 import { resumePlan } from "@domains/plan/resumePlan";
 
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+
 export const postBulkRendersRunResume = async (
-  bulkRunId: string
+  bulkRunId: string,
+  work?: RendererLibraryWork
 ): Promise<void> => {
-  await resumePlan(bulkRunId);
+  await resumePlan(bulkRunId, work);
 };

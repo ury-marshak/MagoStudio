@@ -3,6 +3,8 @@ import { SheetKind } from "@schemas/scriptProject";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { useAddSheetGroupImage } from "./data/useAddSheetGroupImage";
 import { useReportScriptProjectFailure } from "./useReportScriptProjectFailure";
 import { readUploadRejectionMessage } from "./utils/readUploadRejectionMessage";
@@ -14,65 +16,94 @@ export const useUploadSheetGroupImage = (projectId: string) => {
   const { mutateAsync: uploadReferenceImage } = useUploadReferenceImage();
   const { mutateAsync: addSheetGroupImage, isPending: isFilingImage } =
     useAddSheetGroupImage(projectId);
-  const [pendingFileUploadCount, setPendingFileUploadCount] = useState(0);
+  const { work: origin } = useRendererLibraryWork();
+  const [pending, setPending] = useState<{
+    signal: AbortSignal;
+    count: number;
+  }>();
 
-  const uploadSheetGroupImage = async ({
-    timelineId,
-    token,
-    file,
-    nameForNewSheetGroup,
-    kindForNewSheetGroup
-  }: {
-    timelineId: string;
-    token: string;
-    file: File;
-    nameForNewSheetGroup?: string;
-    kindForNewSheetGroup?: SheetKind;
-  }) => {
-    setPendingFileUploadCount((count) => count + 1);
+  const uploadSheetGroupImage = async (
+    {
+      timelineId,
+      token,
+      file,
+      nameForNewSheetGroup,
+      kindForNewSheetGroup
+    }: {
+      timelineId: string;
+      token: string;
+      file: File;
+      nameForNewSheetGroup?: string;
+      kindForNewSheetGroup?: SheetKind;
+    },
+    work = origin
+  ) => {
+    if (work.signal.aborted) return;
+    setPending((current) => ({
+      signal: work.signal,
+      count: (current?.signal === work.signal ? current.count : 0) + 1
+    }));
     let fileUploadFailure: unknown;
     try {
       const assetId = await uploadReferenceImage({
         file,
         projectId,
+        work,
         onError: (error) => {
           fileUploadFailure = error;
         }
       });
+      work.check();
       if (!assetId) {
         throw fileUploadFailure instanceof Error
           ? fileUploadFailure
           : new Error("Image upload failed");
       }
 
-      await addSheetGroupImage({
-        timelineId,
-        token,
-        assetId,
-        name: nameForNewSheetGroup,
-        kind: kindForNewSheetGroup
-      });
+      await addSheetGroupImage(
+        {
+          timelineId,
+          token,
+          assetId,
+          name: nameForNewSheetGroup,
+          kind: kindForNewSheetGroup
+        },
+        work
+      );
     } catch (error) {
+      if (work.signal.aborted) return;
       reportScriptProjectFailure(
         error,
         readUploadRejectionMessage(error) ??
           t("script_project.upload_entity_image_failed.description"),
         () =>
-          void uploadSheetGroupImage({
-            timelineId,
-            token,
-            file,
-            nameForNewSheetGroup,
-            kindForNewSheetGroup
-          })
+          void uploadSheetGroupImage(
+            {
+              timelineId,
+              token,
+              file,
+              nameForNewSheetGroup,
+              kindForNewSheetGroup
+            },
+            work
+          )
       );
     } finally {
-      setPendingFileUploadCount((count) => count - 1);
+      if (!work.signal.aborted)
+        setPending((current) =>
+          current?.signal === work.signal
+            ? { ...current, count: current.count - 1 }
+            : current
+        );
     }
   };
 
   return {
     uploadSheetGroupImage,
-    isUploadingSheetGroupImage: pendingFileUploadCount > 0 || isFilingImage
+    isUploadingSheetGroupImage:
+      (!origin.signal.aborted &&
+        pending?.signal === origin.signal &&
+        pending.count > 0) ||
+      isFilingImage
   };
 };

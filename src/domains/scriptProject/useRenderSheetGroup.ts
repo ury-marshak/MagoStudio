@@ -8,7 +8,7 @@ export const useRenderSheetGroup = (projectId: string | null | undefined) => {
   const { t } = useTranslation();
   const reportScriptProjectFailure = useReportScriptProjectFailure();
 
-  const { findRetryForRequest, withRetryRegistered } =
+  const { findRetryForRequest, withLibraryRetryRegistered } =
     useMutationRetryRegistry();
 
   const renderSheetGroupMutation = useRenderSheetGroupMutation(projectId, {
@@ -20,5 +20,5 @@ export const useRenderSheetGroup = (projectId: string | null | undefined) => {
       )
   });
 
-  return withRetryRegistered(renderSheetGroupMutation);
+  return withLibraryRetryRegistered(renderSheetGroupMutation);
 };

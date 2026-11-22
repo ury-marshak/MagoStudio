@@ -1,6 +1,8 @@
 import { ProjectState } from "@schemas/scriptProject";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import {
@@ -14,6 +16,12 @@ import { ScriptProjectMutationOptions } from "./scriptProjectMutationOptions";
 
 export const EDIT_PROJECT_SHOT_MUTATION_KEY = ["editProjectShot"] as const;
 
+export type EditProjectShotAction = {
+  request: EditProjectShotRequest;
+  work: RendererLibraryWork;
+  options?: ScriptProjectMutationOptions<EditProjectShotRequest>;
+};
+
 const isLockOnlyEdit = (request: EditProjectShotRequest) =>
   request.isShotLocked !== undefined &&
   Object.entries(request).every(
@@ -26,6 +34,7 @@ export const useEditProjectShot = (
   options?: ScriptProjectMutationOptions<EditProjectShotRequest>
 ) => {
   const queryClient = useQueryClient();
+  const { work: origin } = useRendererLibraryWork();
 
   const refetchShotsAndCut = async (request: EditProjectShotRequest) => {
     const doesEditChangeCut =
@@ -43,10 +52,18 @@ export const useEditProjectShot = (
     ]);
   };
 
-  return useMutation({
+  const mutation = useMutation({
     mutationKey: EDIT_PROJECT_SHOT_MUTATION_KEY,
-    mutationFn: (request: EditProjectShotRequest) => patchProjectShot(request),
-    onMutate: async (request) => {
+    mutationFn: async ({ request, work }: EditProjectShotAction) => {
+      await work.ready();
+      work.check();
+      const result = await patchProjectShot(request, work);
+      work.check();
+      return result;
+    },
+    onMutate: async ({ request, work }) => {
+      await work.ready();
+      work.check();
       const { shotIndex, heading, isShotLocked, timelineId } = request;
       const isEditShownBeforeServerConfirms =
         shotIndex !== undefined ||
@@ -79,6 +96,7 @@ export const useEditProjectShot = (
         queryKey: projectStateQueryKey,
         exact: true
       });
+      work.check();
       const previousProjectState =
         queryClient.getQueryData<ProjectState>(projectStateQueryKey);
       queryClient.setQueryData<ProjectState>(
@@ -91,7 +109,8 @@ export const useEditProjectShot = (
       );
       return { previousProjectState };
     },
-    onSuccess: async (editedShot, request) => {
+    onSuccess: async (editedShot, { request, work }) => {
+      work.check();
       if (!isLockOnlyEdit(request)) return refetchShotsAndCut(request);
 
       const projectStateQueryKey = queryKeys.projectState.byProjectId(
@@ -114,7 +133,8 @@ export const useEditProjectShot = (
         refetchType: "none"
       });
     },
-    onError: (error, request, context) => {
+    onError: (error, { request, work, options }, context) => {
+      if (work.signal.aborted) return;
       if (context?.previousProjectState) {
         queryClient.setQueryData(
           queryKeys.projectState.byProjectId(request.projectId),
@@ -125,4 +145,22 @@ export const useEditProjectShot = (
       options?.onError?.(error, request);
     }
   });
+
+  return {
+    ...mutation,
+    variables: mutation.variables?.request,
+    isPending: mutation.isPending && !mutation.variables?.work.signal.aborted,
+    mutate: (request: EditProjectShotRequest, work = origin) =>
+      mutation.mutate({ request, work, options }),
+    mutateAsync: async (request: EditProjectShotRequest, work = origin) => {
+      try {
+        const result = await mutation.mutateAsync({ request, work, options });
+        work.check();
+        return result;
+      } catch (error) {
+        work.check();
+        throw error;
+      }
+    }
+  };
 };

@@ -49,6 +49,8 @@ import { ProjectState, SheetKind } from "@schemas/scriptProject";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { ConfirmPinDialog } from "./ConfirmPinDialog";
 import { ConfirmRemoveEntityDialog } from "./ConfirmRemoveEntityDialog";
 import { DraftSheetGroupCard } from "./DraftSheetGroupCard";
@@ -194,16 +196,19 @@ export const AssetsTab: React.FC<Props> = ({
   >([]);
   const [areEarlierVersionEntitiesShown, setAreEarlierVersionEntitiesShown] =
     useState(false);
-  const [pendingRemoval, setPendingRemoval] = useState<{
-    token: string;
+  const [removal, setPendingRemoval] = useState<{
     entityName: string;
     taggedShotCount: number;
+    confirm: () => void;
+    signal: AbortSignal;
+    projectId: string;
   } | null>(null);
-  const [pendingPin, setPendingPin] = useState<{
-    token: string;
+  const [pin, setPendingPin] = useState<{
     entityName: string;
-    assetId: string | null;
     staleShotCount: number;
+    confirm: () => void;
+    signal: AbortSignal;
+    projectId: string;
   } | null>(null);
 
   const { data: dryRun, isFetching: isDryRunFetching } = useProjectSheetsDryRun(
@@ -215,6 +220,19 @@ export const AssetsTab: React.FC<Props> = ({
     },
     canRender
   );
+  const { work, libraryVersion } = useRendererLibraryWork();
+  const pendingRemoval =
+    !removal?.signal.aborted && removal?.projectId === projectId
+      ? removal
+      : null;
+  const pendingPin =
+    !pin?.signal.aborted && pin?.projectId === projectId ? pin : null;
+  const handleSheetRunStarted = (
+    result: { plan_id?: string | null; would_run: string[] } | null
+  ) => {
+    if (!work.signal.aborted && result?.plan_id)
+      onRunStarted(result.plan_id, result.would_run);
+  };
   const { mutate: generateSheets, isPending: isGeneratingSheets } =
     useGenerateProjectSheets();
   const { mutate: pinSheetImage, isPending: isPinningSheetImage } =
@@ -320,11 +338,8 @@ export const AssetsTab: React.FC<Props> = ({
         },
         shouldScoreImages: isLocalProject ? false : shouldScoreImages
       },
-      {
-        onSuccess: (result) => {
-          if (result.plan_id) onRunStarted(result.plan_id, result.would_run);
-        }
-      }
+      work,
+      handleSheetRunStarted
     );
 
   if (!sheetsTimelineId) {
@@ -388,7 +403,7 @@ export const AssetsTab: React.FC<Props> = ({
     renderModel: AnySheetRenderModel,
     actionId: string
   ) => {
-    if (!sheetsTimelineId) return;
+    if (!sheetsTimelineId || work.signal.aborted) return;
 
     renderSheetGroup(
       {
@@ -402,11 +417,8 @@ export const AssetsTab: React.FC<Props> = ({
         renderMode: RenderMode.CREDITS,
         outputSize: sheetOutputSize
       },
-      {
-        onSuccess: (result) => {
-          if (result?.plan_id) onRunStarted(result.plan_id, result.would_run);
-        }
-      }
+      work,
+      handleSheetRunStarted
     );
   };
 
@@ -424,17 +436,26 @@ export const AssetsTab: React.FC<Props> = ({
     },
     renderModel: AnySheetRenderModel
   ) => {
-    if (!sheetsTimelineId) return;
+    if (!sheetsTimelineId || work.signal.aborted) return;
 
     if (draft.hasUnsavedEdits) {
-      await editSheetGroupAsync({
-        timelineId: sheetsTimelineId,
-        token: group.token,
-        description: draft.description,
-        prompt: draft.prompt
-      });
+      try {
+        await editSheetGroupAsync(
+          {
+            timelineId: sheetsTimelineId,
+            token: group.token,
+            description: draft.description,
+            prompt: draft.prompt
+          },
+          work
+        );
+      } catch {
+        // The mutation reports active failures; nothing is submitted on failure.
+        return;
+      }
     }
 
+    if (work.signal.aborted) return;
     renderSheetGroup(
       {
         timelineId: sheetsTimelineId,
@@ -457,11 +478,8 @@ export const AssetsTab: React.FC<Props> = ({
         referenceAssetIds: draft.referenceAssetIds,
         referenceInstruction: draft.referenceInstruction
       },
-      {
-        onSuccess: (result) => {
-          if (result?.plan_id) onRunStarted(result.plan_id, result.would_run);
-        }
-      }
+      work,
+      handleSheetRunStarted
     );
   };
 
@@ -470,7 +488,7 @@ export const AssetsTab: React.FC<Props> = ({
     const model = actionModel(modelId);
     return (
       <SheetGroupRow
-        key={`${group.token}:${(group.reference_asset_ids ?? []).join(",")}:${group.reference_instruction ?? ""}`}
+        key={`${libraryVersion}:${projectId}:${group.token}:${(group.reference_asset_ids ?? []).join(",")}:${group.reference_instruction ?? ""}`}
         group={group}
         imageUrlsByAssetId={imageUrlsByAssetId}
         changedPaths={
@@ -482,13 +500,17 @@ export const AssetsTab: React.FC<Props> = ({
         }
         isRendering={isSheetGroupRendering(group, renderingSheetTokens)}
         onUploadImage={(file) =>
-          void uploadSheetGroupImage({
-            timelineId: sheetsTimelineId,
-            token: group.token,
-            file
-          })
+          void uploadSheetGroupImage(
+            {
+              timelineId: sheetsTimelineId,
+              token: group.token,
+              file
+            },
+            work
+          )
         }
         onUploadReference={uploadSheetGroupReference}
+        librarySignal={work.signal}
         isBusy={isBusy}
         isRunActive={isRunActive}
         isRenderDisabled={!canRenderAction(model)}
@@ -511,48 +533,78 @@ export const AssetsTab: React.FC<Props> = ({
         supportsImageReferences={isLocalProject || canRender}
         shouldFetchImageInputs={!isLocalProject}
         onPin={(assetId) => {
+          if (work.signal.aborted) return;
           const staleShotCount = countShotsTaggingEntity(
             shotsInActiveScript,
             group.token
           );
           if (staleShotCount === 0) {
-            pinSheetImage({
-              timelineId: sheetsTimelineId,
-              token: group.token,
-              selectedAssetId: assetId
-            });
+            pinSheetImage(
+              {
+                timelineId: sheetsTimelineId,
+                token: group.token,
+                selectedAssetId: assetId
+              },
+              work
+            );
             return;
           }
           setPendingPin({
-            token: group.token,
             entityName: group.name,
-            assetId,
-            staleShotCount
+            staleShotCount,
+            projectId,
+            signal: work.signal,
+            confirm: () =>
+              pinSheetImage(
+                {
+                  timelineId: sheetsTimelineId,
+                  token: group.token,
+                  selectedAssetId: assetId
+                },
+                work
+              )
           });
         }}
         onSaveFields={(fields) =>
-          editSheetGroup({
-            timelineId: sheetsTimelineId,
-            token: group.token,
-            ...fields
-          })
-        }
-        onToggleEnabled={() => {
-          if (!group.enabled) {
-            editSheetGroup({
+          editSheetGroup(
+            {
               timelineId: sheetsTimelineId,
               token: group.token,
-              enabled: true
-            });
+              ...fields
+            },
+            work
+          )
+        }
+        onToggleEnabled={() => {
+          if (work.signal.aborted) return;
+          if (!group.enabled) {
+            editSheetGroup(
+              {
+                timelineId: sheetsTimelineId,
+                token: group.token,
+                enabled: true
+              },
+              work
+            );
             return;
           }
           setPendingRemoval({
-            token: group.token,
             entityName: group.name,
             taggedShotCount: countShotsTaggingEntity(
               shotsInActiveScript,
               group.token
-            )
+            ),
+            projectId,
+            signal: work.signal,
+            confirm: () =>
+              editSheetGroup(
+                {
+                  timelineId: sheetsTimelineId,
+                  token: group.token,
+                  enabled: false
+                },
+                work
+              )
           });
         }}
         onDescribeFromImage={(assetId) =>
@@ -618,13 +670,8 @@ export const AssetsTab: React.FC<Props> = ({
         taggedShotCount={pendingRemoval?.taggedShotCount ?? 0}
         onCancel={() => setPendingRemoval(null)}
         onConfirm={() => {
-          if (pendingRemoval) {
-            editSheetGroup({
-              timelineId: sheetsTimelineId,
-              token: pendingRemoval.token,
-              enabled: false
-            });
-          }
+          if (pendingRemoval?.signal.aborted) return;
+          pendingRemoval?.confirm();
           setPendingRemoval(null);
         }}
       />
@@ -634,13 +681,8 @@ export const AssetsTab: React.FC<Props> = ({
         staleShotCount={pendingPin?.staleShotCount ?? 0}
         onCancel={() => setPendingPin(null)}
         onConfirm={() => {
-          if (pendingPin) {
-            pinSheetImage({
-              timelineId: sheetsTimelineId,
-              token: pendingPin.token,
-              selectedAssetId: pendingPin.assetId
-            });
-          }
+          if (pendingPin?.signal.aborted) return;
+          pendingPin?.confirm();
           setPendingPin(null);
         }}
       />
@@ -810,7 +852,7 @@ export const AssetsTab: React.FC<Props> = ({
                 )}
                 onRender={(newSheetGroup) => {
                   const model = actionModel(`draft:${draft.draftId}`);
-                  if (!canRenderAction(model)) return;
+                  if (work.signal.aborted || !canRenderAction(model)) return;
                   createSheetGroupWithFirstRender(
                     newSheetGroup,
                     model,
@@ -819,13 +861,17 @@ export const AssetsTab: React.FC<Props> = ({
                   discardSheetGroupDraft(draft.draftId);
                 }}
                 onUploadImage={(newSheetGroup, file) => {
-                  void uploadSheetGroupImage({
-                    timelineId: sheetsTimelineId,
-                    token: newSheetGroup.token,
-                    file,
-                    nameForNewSheetGroup: newSheetGroup.name,
-                    kindForNewSheetGroup: newSheetGroup.kind
-                  });
+                  if (work.signal.aborted) return;
+                  void uploadSheetGroupImage(
+                    {
+                      timelineId: sheetsTimelineId,
+                      token: newSheetGroup.token,
+                      file,
+                      nameForNewSheetGroup: newSheetGroup.name,
+                      kindForNewSheetGroup: newSheetGroup.kind
+                    },
+                    work
+                  );
                   discardSheetGroupDraft(draft.draftId);
                 }}
                 onDiscard={() => discardSheetGroupDraft(draft.draftId)}

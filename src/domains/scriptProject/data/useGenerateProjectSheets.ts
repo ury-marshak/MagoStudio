@@ -1,5 +1,6 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import {
@@ -14,9 +15,9 @@ export const useGenerateProjectSheets = (
 ) => {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: (request: GenerateProjectSheetsRequest) =>
-      postGenerateProjectSheets(request),
+  return useRendererLibraryMutation({
+    mutationFn: (request: GenerateProjectSheetsRequest, work) =>
+      postGenerateProjectSheets(request, work),
     onSuccess: (_result, request) => {
       if (request.isDryRun) return;
 

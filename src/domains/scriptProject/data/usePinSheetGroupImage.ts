@@ -1,5 +1,6 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import {
@@ -15,9 +16,9 @@ export const usePinSheetGroupImage = (
 ) => {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: (request: PinSheetGroupImageRequest) =>
-      putSheetGroupPin({ ...request, projectId: projectId ?? undefined }),
+  return useRendererLibraryMutation({
+    mutationFn: (request: PinSheetGroupImageRequest, work) =>
+      putSheetGroupPin({ ...request, projectId: projectId ?? undefined }, work),
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.projectState.byProjectId(projectId)

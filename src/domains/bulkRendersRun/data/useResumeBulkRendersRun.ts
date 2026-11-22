@@ -1,5 +1,6 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { postBulkRendersRunResume } from "../api/postBulkRendersRunResume";
@@ -12,9 +13,9 @@ export interface ResumeBulkRendersRunInput {
 export const useResumeBulkRendersRun = () => {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: ({ bulkRunId }: ResumeBulkRendersRunInput) =>
-      postBulkRendersRunResume(bulkRunId),
+  return useRendererLibraryMutation({
+    mutationFn: ({ bulkRunId }: ResumeBulkRendersRunInput, work) =>
+      postBulkRendersRunResume(bulkRunId, work),
     onSuccess: (_resumedRun, { bulkRunId, projectId }) => {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.bulkRendersRunProgress.byRunId(bulkRunId)

@@ -1,9 +1,16 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook } from "@testing-library/react";
+import {
+  MutationCache,
+  QueryClient,
+  QueryClientProvider
+} from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
+
+import { postBulkRendersRun } from "../api/postBulkRendersRun";
 
 import { useCreateBulkRendersRun } from "./useCreateBulkRendersRun";
 
@@ -16,8 +23,8 @@ vi.mock("../api/postBulkRendersRun", () => ({
 
 const PROJECT_ID = "project-1";
 
-const renderWithClient = () => {
-  const queryClient = new QueryClient();
+const renderWithClient = (mutationCache = new MutationCache()) => {
+  const queryClient = new QueryClient({ mutationCache });
   const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
@@ -40,6 +47,9 @@ describe("useCreateBulkRendersRun", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: queryKeys.bulkRendersRuns.byProjectId(PROJECT_ID)
     });
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: queryKeys.bulkRendersRuns.everyProject()
+    });
   });
 
   it("never keys the invalidation off the response, which carries no Project id at all", async () => {
@@ -59,5 +69,37 @@ describe("useCreateBulkRendersRun", () => {
     for (const invalidatedKey of invalidatedKeys) {
       expect(invalidatedKey).not.toContain(undefined);
     }
+  });
+
+  it("does not dispatch an old run queued before a library switch", async () => {
+    const held = Promise.withResolvers<void>();
+    const onMutate = vi.fn(() => held.promise);
+    const { result, invalidateSpy } = renderWithClient(
+      new MutationCache({ onMutate })
+    );
+    vi.mocked(postBulkRendersRun).mockClear();
+    const input = { project_id: PROJECT_ID, timeline_ids: ["shot-1"] };
+    let oldRun!: Promise<unknown>;
+    await act(async () => {
+      oldRun = result.current
+        .mutateAsync(input)
+        .catch((error: unknown) => error);
+    });
+    await waitFor(() => expect(onMutate).toHaveBeenCalledOnce());
+    expect(result.current.isPending).toBe(true);
+    await act(async () => {
+      await rendererLibrary.suspend();
+      rendererLibrary.reset();
+    });
+    expect(result.current.isPending).toBe(false);
+    await act(async () => {
+      held.resolve();
+      expect(await oldRun).toMatchObject({ name: "AbortError" });
+    });
+    expect(postBulkRendersRun).not.toHaveBeenCalled();
+    expect(invalidateSpy).not.toHaveBeenCalled();
+
+    await act(() => result.current.mutateAsync(input));
+    expect(postBulkRendersRun).toHaveBeenCalledOnce();
   });
 });

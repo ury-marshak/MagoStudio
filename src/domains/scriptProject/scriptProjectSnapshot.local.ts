@@ -19,9 +19,10 @@ const pendingReads = new WeakMap<
 >();
 
 export const readScriptProjectSnapshot = (
-  projectId: string
+  projectId: string,
+  work = rendererLibrary.capture()
 ): Promise<LocalScriptProjectSnapshot | null> => {
-  const work = rendererLibrary.capture();
+  work.check();
   const snapshots = getLocalDesktopApi().scriptProjects;
   if (!snapshots) return Promise.resolve(null);
   let reads = pendingReads.get(snapshots);

@@ -85,9 +85,13 @@ describe("patchSheetGroup reference fields", () => {
       referenceInstruction: "Use the coat"
     });
 
-    expect(patch).toHaveBeenCalledWith("/timelines/sheets-1/sheets/hero/edit", {
-      reference_asset_ids: ["reference-1"],
-      reference_instruction: "Use the coat"
-    });
+    expect(patch).toHaveBeenCalledWith(
+      "/timelines/sheets-1/sheets/hero/edit",
+      {
+        reference_asset_ids: ["reference-1"],
+        reference_instruction: "Use the coat"
+      },
+      { signal: expect.any(AbortSignal) }
+    );
   });
 });

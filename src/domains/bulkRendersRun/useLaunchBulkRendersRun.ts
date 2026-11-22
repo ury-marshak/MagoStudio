@@ -9,6 +9,8 @@ import { useToast } from "@store/useToast";
 import { useSetAtom } from "jotai";
 import { useTranslation } from "react-i18next";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 import { useCreateBulkRendersRun } from "./data/useCreateBulkRendersRun";
 import {
   BulkRendersRunShotSettingsOverride,
@@ -45,6 +47,7 @@ export const useLaunchBulkRendersRun = ({
       BulkRendersRunShotSettingsOverride
     > = {}
   ) => {
+    const work = rendererLibrary.capture();
     if (!selectedProjectId || selectedShotIds.length === 0) {
       return;
     }
@@ -53,6 +56,7 @@ export const useLaunchBulkRendersRun = ({
       resolveBulkRenderingMasterPrompts(masterSettings);
 
     try {
+      work.check();
       const request = buildCreateBulkRendersRunRequest({
         projectId: selectedProjectId,
         selectedShotIds,
@@ -79,9 +83,11 @@ export const useLaunchBulkRendersRun = ({
 
       if (blockRenderWhileLocalSetupRuns(bulkRunRequiresComfy(request))) return;
 
-      const createdRun = await createBulkRendersRun(request);
+      const createdRun = await createBulkRendersRun(request, work);
+      work.check();
       setBulkRenderingFlow({ view: "run", bulkRunId: createdRun.id });
     } catch {
+      if (work.signal.aborted) return;
       showToast({
         message: t("notifications.bulk_renders_run_launch_failed.description")
       });

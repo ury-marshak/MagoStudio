@@ -4,7 +4,10 @@ import {
 } from "@schemas/scriptProject";
 
 import { backendApiClient } from "@/lib/backend-api-client";
-import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest
+} from "@/platform/rendererLibraryWork";
 
 import {
   canUseCloudSheetModels,
@@ -18,6 +21,8 @@ import {
 import { isLocalScriptProject } from "../projectOrigin";
 import { isSheetRenderModel } from "../utils/isSheetRenderModel";
 
+import { generateLocalSheets } from "./generateLocalSheets";
+
 export type GenerateProjectSheetsRequest = {
   projectId: string;
   isDryRun: boolean;
@@ -28,9 +33,10 @@ export type GenerateProjectSheetsRequest = {
 };
 
 export const postGenerateProjectSheets = async (
-  request: GenerateProjectSheetsRequest
+  request: GenerateProjectSheetsRequest,
+  work = rendererLibrary.capture()
 ): Promise<SheetGenerateResult> => {
-  if (await isLocalScriptProject(request.projectId)) {
+  if (await work.boundary(() => isLocalScriptProject(request.projectId))) {
     // The desktop owns fal and ComfyUI jobs. Mago Cloud plans are executed
     // by the renderer while signed in.
     const isCloudModel =
@@ -50,24 +56,28 @@ export const postGenerateProjectSheets = async (
       ...(request.tokens ? { tokens: request.tokens } : {})
     };
     const result = SheetGenerateResultSchema.parse(
-      await getLocalDesktopApi().scriptProjects.generateSheets(localRequest)
+      await generateLocalSheets(localRequest, work)
     );
+    work.check();
     if (isCloudModel && !request.isDryRun && result.plan_id)
-      void executeCloudSheetPlan(result.plan_id);
+      void executeCloudSheetPlan(result.plan_id, work);
     return result;
   }
-  const response = await backendApiClient.post(
-    `/projects/${request.projectId}/sheets/generate`,
-    {
-      ...(request.outputSize ? { output_size: request.outputSize } : {}),
-      settings: {
-        ...request.settings,
-        render_mode: SCRIPT_PROJECT_RENDER_MODE
+  const response = await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.post(
+      `/projects/${request.projectId}/sheets/generate`,
+      {
+        ...(request.outputSize ? { output_size: request.outputSize } : {}),
+        settings: {
+          ...request.settings,
+          render_mode: SCRIPT_PROJECT_RENDER_MODE
+        },
+        ...(request.tokens ? { tokens: request.tokens } : {}),
+        ...(request.shouldScoreImages ? { metrics: true } : {}),
+        dry_run: request.isDryRun
       },
-      ...(request.tokens ? { tokens: request.tokens } : {}),
-      ...(request.shouldScoreImages ? { metrics: true } : {}),
-      dry_run: request.isDryRun
-    }
+      { signal }
+    )
   );
   return SheetGenerateResultSchema.parse(response.data);
 };

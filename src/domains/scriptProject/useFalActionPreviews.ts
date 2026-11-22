@@ -1,5 +1,6 @@
 import { useQueries } from "@tanstack/react-query";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import {
@@ -13,8 +14,9 @@ import {
 
 export const useSheetActionPreviews = (
   requests: (GenerateProjectSheetsRequest & { enabled: boolean })[]
-) =>
-  useQueries({
+) => {
+  const { work, libraryVersion } = useRendererLibraryWork();
+  return useQueries({
     queries: requests.map(({ enabled, ...request }) => ({
       queryKey: [
         ...queryKeys.projectState.sheetsDryRun(
@@ -22,12 +24,14 @@ export const useSheetActionPreviews = (
           request.outputSize,
           request.settings
         ),
-        request.tokens
+        request.tokens,
+        libraryVersion
       ],
-      queryFn: () => postGenerateProjectSheets(request),
-      enabled
+      queryFn: () => postGenerateProjectSheets(request, work),
+      enabled: enabled && !work.signal.aborted
     }))
   });
+};
 export const useShotActionPreviews = (
   requests: (GenerateProjectShotsRequest & { enabled: boolean })[]
 ) =>

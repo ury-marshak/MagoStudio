@@ -6,7 +6,8 @@ import type {
 } from "../../../desktop/shared/contracts";
 
 export const readScriptProjectSnapshot = async (
-  _projectId: string
+  _projectId: string,
+  _work?: RendererLibraryWork
 ): Promise<LocalScriptProjectSnapshot | null> => null;
 
 export const writeScriptProjectSnapshot = async (

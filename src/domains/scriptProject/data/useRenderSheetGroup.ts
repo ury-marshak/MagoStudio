@@ -1,5 +1,6 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import {
@@ -15,9 +16,12 @@ export const useRenderSheetGroup = (
 ) => {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: (request: RenderSheetGroupRequest) =>
-      postSheetGroupRender({ ...request, projectId: projectId ?? undefined }),
+  return useRendererLibraryMutation({
+    mutationFn: (request: RenderSheetGroupRequest, work) =>
+      postSheetGroupRender(
+        { ...request, projectId: projectId ?? undefined },
+        work
+      ),
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.projectState.byProjectId(projectId)

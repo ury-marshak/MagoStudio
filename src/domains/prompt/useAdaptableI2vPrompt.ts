@@ -9,13 +9,17 @@ export const useAdaptableI2vPrompt = ({
   onChange,
   referenceAssetIds,
   engine,
-  route
+  route,
+  editorKey,
+  editorTarget
 }: {
   value: string | undefined;
   onChange: (value: string | undefined) => void;
   referenceAssetIds: string[];
   engine: VideoEngine;
   route?: TextModelRoute;
+  editorKey?: string;
+  editorTarget?: object;
 }) => {
   const { mutateAsync: adaptI2vPrompt, isPending: isAdaptingPrompt } =
     usePostAdaptI2vPrompt(route);
@@ -23,15 +27,17 @@ export const useAdaptableI2vPrompt = ({
   const {
     rewritePrompt: adaptPrompt,
     undoRewritePrompt: undoAdaptPrompt,
-    canUndoRewritePrompt: canUndoAdaptPrompt
+    canUndoRewritePrompt: canUndoAdaptPrompt,
+    isRewritingPrompt
   } = useUndoablePromptRewrite({
     value,
     onChange,
-    rewritePrompt: (prompt) =>
+    editorKey,
+    editorTarget,
+    rewritePrompt: (prompt, signal) =>
       adaptI2vPrompt({
-        prompt,
-        reference_asset_ids: referenceAssetIds,
-        engine
+        requestBody: { prompt, reference_asset_ids: referenceAssetIds, engine },
+        callerSignal: signal
       }),
     rewriteFailedMessageKey: "notifications.adapt_prompt_failed.description"
   });
@@ -39,7 +45,8 @@ export const useAdaptableI2vPrompt = ({
   return {
     adaptPrompt,
     undoAdaptPrompt,
-    isAdaptingPrompt,
+    isAdaptingPrompt:
+      editorKey === undefined ? isAdaptingPrompt : isRewritingPrompt,
     canUndoAdaptPrompt
   };
 };

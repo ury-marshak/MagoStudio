@@ -80,7 +80,7 @@ describe("useKeepStoryboardTagsNonBlocking", () => {
     );
     expect(editShot).toHaveBeenCalledTimes(1);
     expect(editShot.mock.calls[0]![0].tags.props).toEqual([]);
-    editShot.mock.calls[0]![1].onSettled();
+    editShot.mock.calls[0]![3]();
 
     hook.rerender({
       scene: sceneWithStoryboardTagged(false),

@@ -36,7 +36,9 @@ describe("scene storyboard API contracts", () => {
       })
     ).resolves.toMatchObject({ clip_id: "clip" });
     expect(backendApiClient.post).toHaveBeenCalledWith(
-      "/projects/project/shots/scene/storyboard/generate"
+      "/projects/project/shots/scene/storyboard/generate",
+      undefined,
+      { signal: expect.any(AbortSignal) }
     );
   });
 
@@ -64,7 +66,8 @@ describe("scene storyboard API contracts", () => {
     });
     expect(backendApiClient.put).toHaveBeenCalledWith(
       "/projects/project/shots/scene/storyboard",
-      { enabled: false }
+      { enabled: false },
+      { signal: expect.any(AbortSignal) }
     );
 
     await putSceneStoryboard({
@@ -74,7 +77,8 @@ describe("scene storyboard API contracts", () => {
     });
     expect(backendApiClient.put).toHaveBeenLastCalledWith(
       "/projects/project/shots/scene/storyboard",
-      { selected_asset_id: null }
+      { selected_asset_id: null },
+      { signal: expect.any(AbortSignal) }
     );
   });
 });

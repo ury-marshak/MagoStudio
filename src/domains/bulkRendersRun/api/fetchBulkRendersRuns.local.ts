@@ -1,6 +1,10 @@
 import { BulkRendersRun, BulkRendersRunSchema } from "@schemas/bulkRendersRun";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import {
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { listLocalBulkRendersRuns } from "./localBulkRendersRun";
 
@@ -17,13 +21,19 @@ const parseCloudRuns = (value: unknown): BulkRendersRun[] =>
       });
 
 export const fetchBulkRendersRuns = async (
-  projectId?: string
+  projectId?: string,
+  work?: RendererLibraryWork
 ): Promise<BulkRendersRun[]> => {
   const desktop = typeof window === "undefined" ? undefined : window.mago;
+  const params = projectId ? { project_id: projectId } : undefined;
+  const fetchCloud = () =>
+    work
+      ? runRendererLibraryRequest(work, (signal) =>
+          backendApiClient.get("/agent/plans", { params, signal })
+        )
+      : backendApiClient.get("/agent/plans", { params });
   if (!desktop) {
-    const response = await backendApiClient.get("/agent/plans", {
-      params: projectId ? { project_id: projectId } : undefined
-    });
+    const response = await fetchCloud();
     return parseCloudRuns(response.data);
   }
   // Local project plans are authoritative on disk, even while signed in.
@@ -31,24 +41,27 @@ export const fetchBulkRendersRuns = async (
   if (
     desktop.account.mode === "cloud" &&
     projectId &&
-    (await desktop.projects.get(projectId))?.origin === "local"
+    (
+      await (work
+        ? work.boundary(() => desktop.projects.get(projectId))
+        : desktop.projects.get(projectId))
+    )?.origin === "local"
   )
-    return listLocalBulkRendersRuns(projectId);
-  const localRunsPromise = listLocalBulkRendersRuns(projectId);
+    return listLocalBulkRendersRuns(projectId, work);
+  const localRunsPromise = listLocalBulkRendersRuns(projectId, work);
   if (desktop.account.mode !== "cloud") return localRunsPromise;
 
   const [localRuns, cloudResult] = await Promise.all([
     localRunsPromise,
-    backendApiClient
-      .get("/agent/plans", {
-        params: projectId ? { project_id: projectId } : undefined
-      })
+    fetchCloud()
       .then((response) => parseCloudRuns(response.data))
       .catch((error: unknown) => {
+        work?.check();
         console.warn("Could not load cloud bulk-render history", error);
         return [];
       })
   ]);
+  work?.check();
   const runsById = new Map(
     [...cloudResult, ...localRuns].map((run) => [run.id, run])
   );

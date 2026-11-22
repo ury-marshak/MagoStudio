@@ -1,111 +1,87 @@
 import { useCloudSyncProgressToast } from "@domains/cloud/useCloudSyncProgressToast";
 import { VideoEngine } from "@models/video/types";
+import { useToast } from "@store/useToast";
+import { useTranslation } from "react-i18next";
 
-import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 
-import { markCloudAssetLinkStale } from "./api/markCloudAssetLinkStale";
-import { useMirrorAdaptPromptReferencesToCloud } from "./data/useMirrorAdaptPromptReferencesToCloud";
-import { usePostAdaptI2vPrompt } from "./data/usePostAdaptI2vPrompt";
-import { useResolveMirroredSourceVideoContext } from "./data/useResolveMirroredSourceVideoContext";
+import { adaptCloudI2vPromptFromLocal } from "./api/adaptCloudI2vPromptFromLocal";
+import { hasUnresolvedAdaptedReferences } from "./api/postAdaptI2vPrompt";
+import { useInferenceCancellation } from "./useInferenceCancellation";
 import { useUndoablePromptRewrite } from "./useUndoablePromptRewrite";
-import { adaptWithStaleCloudReferencesReplaced } from "./utils/adaptWithStaleCloudReferencesReplaced";
 
 export const useCloudAdaptableI2vPromptFromLocal = ({
   value,
   onChange,
   sourceVideoTrackId,
   referenceImageAssetIds,
-  cloudEngine
+  cloudEngine,
+  editorKey = "cloud",
+  editorTarget
 }: {
   value: string | undefined;
   onChange: (value: string | undefined) => void;
   sourceVideoTrackId: string | undefined;
   referenceImageAssetIds: string[];
   cloudEngine: VideoEngine;
+  editorKey?: string;
+  editorTarget?: object;
 }) => {
-  const {
-    mutateAsync: mirrorReferencesToCloud,
-    isPending: isMirroringReferences
-  } = useMirrorAdaptPromptReferencesToCloud();
-  const {
-    mutateAsync: resolveSourceVideoContext,
-    isPending: isResolvingSourceVideoContext
-  } = useResolveMirroredSourceVideoContext();
-  const { mutateAsync: adaptI2vPrompt, isPending: isAdaptingOnCloud } =
-    usePostAdaptI2vPrompt();
-  const { onProgress: onCloudSyncProgress, dismiss: dismissCloudSyncToast } =
-    useCloudSyncProgressToast();
+  const { work } = useRendererLibraryWork();
+  const { begin } = useCloudSyncProgressToast();
+  const { run } = useInferenceCancellation();
+  const { t } = useTranslation();
+  const { showToast } = useToast();
 
   const {
     rewritePrompt: adaptPrompt,
     undoRewritePrompt: undoAdaptPrompt,
-    canUndoRewritePrompt: canUndoAdaptPrompt
+    canUndoRewritePrompt: canUndoAdaptPrompt,
+    isRewritingPrompt: isAdaptingPrompt
   } = useUndoablePromptRewrite({
     value,
     onChange,
-    rewritePrompt: async (prompt) => {
-      // A single Optimize action can mirror both a source video and several
-      // reference images. Individual mirror helpers report "done" separately;
-      // keep one sync toast open until the complete action finishes instead.
-      const reportCloudSyncProgress: typeof onCloudSyncProgress = (step) => {
-        if (step !== "done") onCloudSyncProgress(step);
-      };
-
-      try {
-        if (await getLocalDesktopApi().vlm.hasExternalText())
-          throw new Error("External text configuration changed");
-        let sourceVideoContext = sourceVideoTrackId
-          ? await resolveSourceVideoContext({
-              sourceVideoTrackId,
-              onProgress: reportCloudSyncProgress
-            })
-          : undefined;
-        return await adaptWithStaleCloudReferencesReplaced({
-          mirrorReferences: () =>
-            mirrorReferencesToCloud({
-              sourceVideoContext,
-              referenceImageAssetIds,
-              onProgress: reportCloudSyncProgress
-            }),
-          adapt: (cloudAssetIds) =>
-            adaptI2vPrompt({
+    work,
+    editorKey,
+    editorTarget,
+    rewritePrompt: (prompt, editorSignal) =>
+      run(async (lifetimeSignal) => {
+        const signal = editorSignal
+          ? AbortSignal.any([lifetimeSignal, editorSignal])
+          : lifetimeSignal;
+        const progress = begin(work);
+        signal.addEventListener("abort", progress.dismiss, { once: true });
+        try {
+          const response = await adaptCloudI2vPromptFromLocal(
+            {
               prompt,
-              reference_asset_ids: cloudAssetIds,
-              engine: cloudEngine
-            }),
-          markReferenceStale: async (localAssetId) => {
-            const isStaleSourceVideo =
-              sourceVideoTrackId &&
-              localAssetId === sourceVideoContext?.localAssetId;
-            await markCloudAssetLinkStale(
-              isStaleSourceVideo && sourceVideoContext
-                ? sourceVideoContext.cloudSourceVideoLinkLocalId
-                : localAssetId
-            );
-            if (isStaleSourceVideo)
-              sourceVideoContext = await resolveSourceVideoContext({
-                sourceVideoTrackId,
-                onProgress: reportCloudSyncProgress
-              });
+              sourceVideoTrackId,
+              referenceImageAssetIds,
+              cloudEngine,
+              // Keep this attempt’s toast open across both mirrors and any retry.
+              onProgress: (step) => {
+                if (step !== "done" && !signal.aborted)
+                  progress.onProgress(step);
+              }
+            },
+            work,
+            signal
+          );
+          work.check();
+          signal.throwIfAborted();
+          if (hasUnresolvedAdaptedReferences(response)) {
+            showToast({
+              message: t("notifications.adapt_prompt_partial.description")
+            });
           }
-        });
-      } finally {
-        dismissCloudSyncToast();
-      }
-    },
+          return response.adapted_prompt;
+        } finally {
+          signal.removeEventListener("abort", progress.dismiss);
+          progress.dismiss();
+        }
+      }),
     rewriteFailedMessageKey: "notifications.adapt_prompt_failed.description"
   });
 
-  return {
-    adaptPrompt,
-    undoAdaptPrompt,
-    // Resolving the source context can encode, upload and ingest the source
-    // video before the adaptation request is sent. Keep the button visibly
-    // busy for that whole operation, not only for the final two mutations.
-    isAdaptingPrompt:
-      isResolvingSourceVideoContext ||
-      isMirroringReferences ||
-      isAdaptingOnCloud,
-    canUndoAdaptPrompt
-  };
+  return { adaptPrompt, undoAdaptPrompt, isAdaptingPrompt, canUndoAdaptPrompt };
 };

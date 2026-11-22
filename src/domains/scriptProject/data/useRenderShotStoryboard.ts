@@ -1,5 +1,6 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import {
@@ -15,12 +16,15 @@ export const useRenderShotStoryboard = (
 ) => {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: (request: RenderShotStoryboardRequest) =>
-      postShotStoryboardRender({
-        ...request,
-        projectId: projectId ?? undefined
-      }),
+  return useRendererLibraryMutation({
+    mutationFn: (request: RenderShotStoryboardRequest, work) =>
+      postShotStoryboardRender(
+        {
+          ...request,
+          projectId: projectId ?? undefined
+        },
+        work
+      ),
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.projectState.byProjectId(projectId)

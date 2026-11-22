@@ -9,6 +9,7 @@ import {
 } from "@schemas/bulkRendersRun";
 
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 const record = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === "object" && !Array.isArray(value)
@@ -39,18 +40,22 @@ export const parseLocalBulkRendersRun = (
 };
 
 export const listLocalBulkRendersRuns = async (
-  projectId?: string
+  projectId?: string,
+  work = rendererLibrary.capture()
 ): Promise<BulkRendersRun[]> => {
   const desktop = getLocalDesktopApi();
   const relevantProjects = projectId
-    ? [await desktop.projects.get(projectId)].filter(
+    ? [await work.boundary(() => desktop.projects.get(projectId))].filter(
         (project) => project !== null
       )
-    : await desktop.projects.list();
+    : await work.boundary(() => desktop.projects.list());
   const snapshots = await Promise.all(
-    relevantProjects.map((project) => readScriptProjectSnapshot(project.id))
+    relevantProjects.map((project) =>
+      readScriptProjectSnapshot(project.id, work)
+    )
   );
 
+  work.check();
   return snapshots.flatMap((snapshot) =>
     Object.values(snapshot?.planDetails ?? {}).flatMap((plan) => {
       const parsed = parseLocalBulkRendersRun(plan);

@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { UpdateSceneStoryboardRequest } from "./api/putSceneStoryboard";
 import { useSubmitSceneStoryboard } from "./data/useSubmitSceneStoryboard";
 import { useUpdateSceneStoryboard } from "./data/useUpdateSceneStoryboard";
@@ -12,75 +15,109 @@ export const useManageSceneStoryboards = (
   renderModel?: string
 ) => {
   const { t } = useTranslation();
+  const { work: origin } = useRendererLibraryWork();
   const reportScriptProjectFailure = useReportScriptProjectFailure();
   const { mutateAsync: submitSceneStoryboard } = useSubmitSceneStoryboard();
-  const { mutate: updateSceneStoryboard } = useUpdateSceneStoryboard({
-    onError: (error) =>
-      reportScriptProjectFailure(
-        error,
-        t("script_project.update_storyboard_failed.description")
-      )
-  });
-  const [submittingSceneTimelineIds, setSubmittingSceneTimelineIds] = useState<
-    ReadonlySet<string>
-  >(() => new Set());
-  const [updatingSceneTimelineIds, setUpdatingSceneTimelineIds] = useState<
-    ReadonlySet<string>
-  >(() => new Set());
+  const { mutateAsync: updateSceneStoryboard } = useUpdateSceneStoryboard();
+  const [busy, setBusy] = useState<{
+    signal: AbortSignal;
+    keys: ReadonlySet<string>;
+  }>();
+  const markBusy = (key: string, isBusy: boolean, work: RendererLibraryWork) =>
+    setBusy((previous) => {
+      if (work.signal.aborted) return previous;
+      return {
+        signal: work.signal,
+        keys: withTimelineId(
+          key,
+          isBusy
+        )(previous?.signal === work.signal ? previous.keys : new Set())
+      };
+    });
+  const submitKey = (timelineId: string) => `${projectId}:submit:${timelineId}`;
+  const updateKey = (timelineId: string) => `${projectId}:update:${timelineId}`;
+  const isBusy = (key: string) =>
+    !origin.signal.aborted &&
+    busy?.signal === origin.signal &&
+    busy.keys.has(key);
 
   const generateSceneStoryboard = async (
     sceneTimelineId: string,
     model = renderModel,
-    providerSettings?: Record<string, string | number | null>
+    providerSettings?: Record<string, string | number | null>,
+    work = origin
   ): Promise<void> => {
-    setSubmittingSceneTimelineIds(withTimelineId(sceneTimelineId, true));
+    if (work.signal.aborted) return;
+    const key = submitKey(sceneTimelineId);
+    markBusy(key, true, work);
     try {
-      await submitSceneStoryboard({
-        projectId,
-        sceneTimelineId,
-        ...(model ? { renderModel: model } : {}),
-        ...(providerSettings ? { providerSettings } : {})
-      });
-    } catch (error) {
-      reportScriptProjectFailure(
-        error,
-        t("script_project.generate_storyboard_failed.description"),
-        () =>
-          void generateSceneStoryboard(sceneTimelineId, model, providerSettings)
+      await submitSceneStoryboard(
+        {
+          projectId,
+          sceneTimelineId,
+          ...(model ? { renderModel: model } : {}),
+          ...(providerSettings ? { providerSettings } : {})
+        },
+        work
       );
+    } catch (error) {
+      if (!work.signal.aborted)
+        reportScriptProjectFailure(
+          error,
+          t("script_project.generate_storyboard_failed.description"),
+          () =>
+            void generateSceneStoryboard(
+              sceneTimelineId,
+              model,
+              providerSettings,
+              work
+            )
+        );
     } finally {
-      setSubmittingSceneTimelineIds(withTimelineId(sceneTimelineId, false));
+      if (!work.signal.aborted) markBusy(key, false, work);
     }
   };
 
-  const updateOneSceneStoryboard = (
-    request: Omit<UpdateSceneStoryboardRequest, "projectId">
-  ) => {
-    setUpdatingSceneTimelineIds(withTimelineId(request.sceneTimelineId, true));
-    updateSceneStoryboard(
-      { projectId, ...request },
-      {
-        onSettled: () =>
-          setUpdatingSceneTimelineIds(
-            withTimelineId(request.sceneTimelineId, false)
-          )
-      }
-    );
+  const updateOneSceneStoryboard = async (
+    request: Omit<UpdateSceneStoryboardRequest, "projectId">,
+    work: RendererLibraryWork
+  ): Promise<void> => {
+    if (work.signal.aborted) return;
+    const key = updateKey(request.sceneTimelineId);
+    markBusy(key, true, work);
+    try {
+      await updateSceneStoryboard({ projectId, ...request }, work);
+    } catch (error) {
+      if (!work.signal.aborted)
+        reportScriptProjectFailure(
+          error,
+          t("script_project.update_storyboard_failed.description")
+        );
+    } finally {
+      if (!work.signal.aborted) markBusy(key, false, work);
+    }
   };
 
   return {
     generateSceneStoryboard,
     isSubmittingSceneStoryboard: (sceneTimelineId: string) =>
-      submittingSceneTimelineIds.has(sceneTimelineId),
+      isBusy(submitKey(sceneTimelineId)),
     pinSceneStoryboardVersion: (
       sceneTimelineId: string,
-      selectedAssetId: string | null
-    ) => updateOneSceneStoryboard({ sceneTimelineId, selectedAssetId }),
+      selectedAssetId: string | null,
+      work = origin
+    ) =>
+      void updateOneSceneStoryboard({ sceneTimelineId, selectedAssetId }, work),
     setSceneStoryboardUsedInVideoRenders: (
       sceneTimelineId: string,
-      isUsedInVideoRenders: boolean
-    ) => updateOneSceneStoryboard({ sceneTimelineId, isUsedInVideoRenders }),
+      isUsedInVideoRenders: boolean,
+      work = origin
+    ) =>
+      void updateOneSceneStoryboard(
+        { sceneTimelineId, isUsedInVideoRenders },
+        work
+      ),
     isUpdatingSceneStoryboard: (sceneTimelineId: string) =>
-      updatingSceneTimelineIds.has(sceneTimelineId)
+      isBusy(updateKey(sceneTimelineId))
   };
 };

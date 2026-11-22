@@ -8,6 +8,10 @@ import {
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest
+} from "@/platform/rendererLibraryWork";
 
 import { isLocalScriptProject } from "../projectOrigin";
 
@@ -21,33 +25,46 @@ export type AddSheetGroupImageRequest = {
 };
 
 export const postSheetGroupImage = async (
-  request: AddSheetGroupImageRequest
+  request: AddSheetGroupImageRequest,
+  work = rendererLibrary.capture()
 ): Promise<SheetGroup> => {
-  if (request.projectId && (await isLocalScriptProject(request.projectId))) {
+  const { projectId } = request;
+  if (
+    projectId &&
+    (await work.boundary(() => isLocalScriptProject(projectId)))
+  ) {
     return SheetGroupSchema.parse(
-      await getLocalDesktopApi().scriptProjects.update({
-        projectId: request.projectId,
-        operation: "add-sheet-image",
-        payload: {
-          token: request.token,
-          assetId: request.assetId,
-          ...(request.name ? { name: request.name } : {})
-        }
-      })
+      // Filing can wait for main-owned image description after the local write.
+      await runRendererLibraryRequest(work, () =>
+        getLocalDesktopApi().scriptProjects.update({
+          projectId,
+          operation: "add-sheet-image",
+          payload: {
+            token: request.token,
+            assetId: request.assetId,
+            ...(request.name ? { name: request.name } : {})
+          }
+        })
+      )
     );
   }
   const cloudAssetId = await ensureCloudImageAsset(
     backendCloudApi(),
     request.assetId,
-    request.projectId
+    projectId,
+    undefined,
+    work
   );
-  const response = await backendApiClient.post(
-    `/timelines/${request.timelineId}/sheets/${encodeURIComponent(request.token)}/images`,
-    {
-      asset_id: cloudAssetId,
-      ...(request.name ? { name: request.name } : {}),
-      ...(request.kind ? { kind: request.kind } : {})
-    }
+  const response = await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.post(
+      `/timelines/${request.timelineId}/sheets/${encodeURIComponent(request.token)}/images`,
+      {
+        asset_id: cloudAssetId,
+        ...(request.name ? { name: request.name } : {}),
+        ...(request.kind ? { kind: request.kind } : {})
+      },
+      { signal }
+    )
   );
   return SheetGroupSchema.parse(response.data);
 };

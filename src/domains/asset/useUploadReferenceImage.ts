@@ -5,12 +5,21 @@ import { getImageDimensions, resizeImageToFitWidth } from "@utils";
 import { useRef, useState } from "react";
 
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 const THUMBNAIL_WIDTH = 158;
 const INITIAL_PROGRESS = 5;
 const COMPLETE_PROGRESS = 100;
 const PROGRESS_RESET_DELAY_MS = 300;
+
+// All hooks sharing a provider contribute to the same pending count.
+type SetUploading = (uploading: boolean) => void;
+const sharedUploads = new WeakMap<
+  SetUploading,
+  { signal: AbortSignal; count: number }
+>();
 
 const createAbortError = () => new DOMException("Upload aborted", "AbortError");
 
@@ -21,23 +30,32 @@ const createAbortError = () => new DOMException("Upload aborted", "AbortError");
  */
 export const useUploadReferenceImage = () => {
   const queryClient = useQueryClient();
-  const [error, setError] = useState<Error | null>(null);
-  const [uploadProgress, setUploadProgress] = useState(0);
+  const { work: origin } = useRendererLibraryWork();
+  const [progress, setProgress] = useState<{
+    signal: AbortSignal;
+    value: number;
+  }>();
+  const [failure, setFailure] = useState<{
+    signal: AbortSignal;
+    error: Error;
+  }>();
   const { isReferenceImageUploading, setIsReferenceImageUploading } =
     useIsReferenceImageUploading();
-  const inFlightUploadCountRef = useRef(0);
+  const latestAttempt = useRef<object>(null);
 
   const uploadReferenceImage = async ({
     file,
     projectId,
     signal,
     onProgress,
-    onError
+    onError,
+    work = origin
   }: {
     file: File;
     selectedLayerId?: string;
     projectId?: string;
     signal?: AbortSignal;
+    work?: RendererLibraryWork;
     onProgress?: (progress: number) => void;
     onError?: (error: unknown) => void;
   }): Promise<string | undefined> => {
@@ -45,15 +63,40 @@ export const useUploadReferenceImage = () => {
       throw new Error("Project ID is required");
     }
 
-    const reportProgress = (progress: number) => {
-      setUploadProgress(progress);
-      onProgress?.(progress);
+    work.check();
+    const attempt = {};
+    latestAttempt.current = attempt;
+    const reportProgress = (value: number) => {
+      work.check();
+      if (latestAttempt.current === attempt)
+        setProgress({ signal: work.signal, value });
+      onProgress?.(value);
     };
 
-    inFlightUploadCountRef.current += 1;
+    const previous = sharedUploads.get(setIsReferenceImageUploading);
+    const uploads =
+      previous?.signal === work.signal
+        ? previous
+        : { signal: work.signal, count: 0 };
+    sharedUploads.set(setIsReferenceImageUploading, uploads);
+    uploads.count += 1;
     setIsReferenceImageUploading(true);
-    reportProgress(0);
+    let tracking = true;
+    const finish = () => {
+      if (!tracking) return;
+      tracking = false;
+      if (
+        --uploads.count === 0 &&
+        sharedUploads.get(setIsReferenceImageUploading) === uploads
+      ) {
+        sharedUploads.delete(setIsReferenceImageUploading);
+        setIsReferenceImageUploading(false);
+      }
+    };
+    work.signal.addEventListener("abort", finish, { once: true });
     try {
+      reportProgress(0);
+      await work.ready();
       const dimensions = await getImageDimensions(file);
       reportProgress(INITIAL_PROGRESS);
 
@@ -62,6 +105,7 @@ export const useUploadReferenceImage = () => {
         throw new Error("upload_button_file_access_error");
       }
       const thumbnail = await resizeImageToFitWidth(file, THUMBNAIL_WIDTH);
+      work.check();
       const thumbnailDataUrl = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
         reader.onerror = () =>
@@ -75,18 +119,20 @@ export const useUploadReferenceImage = () => {
         };
         reader.readAsDataURL(thumbnail);
       });
-      // The import is one local call with nothing to roll back, so a
-      // cancellation is honoured up to the point it starts.
-      if (signal?.aborted) throw createAbortError();
-
-      const asset = await getLocalDesktopApi().assets.importImage({
-        projectId,
-        sourcePath,
-        name: file.name,
-        width: dimensions.width,
-        height: dimensions.height,
-        thumbnailDataUrl
+      // User cancellation is honored up to dispatch. Library teardown also
+      // drains an issued local import and suppresses its renderer settlement.
+      const asset = await work.boundary(() => {
+        if (signal?.aborted) throw createAbortError();
+        return getLocalDesktopApi().assets.importImage({
+          projectId,
+          sourcePath,
+          name: file.name,
+          width: dimensions.width,
+          height: dimensions.height,
+          thumbnailDataUrl
+        });
       });
+      work.check();
       queryClient.setQueryData<ImageAssetResponse>(
         queryKeys.imageAsset.byId(asset.id),
         {
@@ -97,26 +143,35 @@ export const useUploadReferenceImage = () => {
       );
 
       reportProgress(COMPLETE_PROGRESS);
-      setTimeout(() => setUploadProgress(0), PROGRESS_RESET_DELAY_MS);
+      setTimeout(() => {
+        if (!work.signal.aborted && latestAttempt.current === attempt)
+          setProgress({ signal: work.signal, value: 0 });
+      }, PROGRESS_RESET_DELAY_MS);
       return asset.id;
     } catch (caughtError) {
+      work.check();
       console.error(caughtError);
-      setError(caughtError as Error);
+      if (latestAttempt.current === attempt)
+        setFailure({ signal: work.signal, error: caughtError as Error });
       reportProgress(0);
       onError?.(caughtError);
       throw caughtError;
     } finally {
-      inFlightUploadCountRef.current -= 1;
-      if (inFlightUploadCountRef.current === 0) {
-        setIsReferenceImageUploading(false);
-      }
+      work.signal.removeEventListener("abort", finish);
+      finish();
     }
   };
 
   return {
     mutateAsync: uploadReferenceImage,
     isPending: isReferenceImageUploading,
-    uploadProgress,
-    error
+    uploadProgress:
+      !origin.signal.aborted && progress?.signal === origin.signal
+        ? progress.value
+        : 0,
+    error:
+      !origin.signal.aborted && failure?.signal === origin.signal
+        ? failure.error
+        : null
   };
 };

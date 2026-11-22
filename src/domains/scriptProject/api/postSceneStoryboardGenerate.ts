@@ -1,6 +1,10 @@
 import { SceneStoryboardSubmittedSchema } from "@schemas/scriptProject";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest
+} from "@/platform/rendererLibraryWork";
 
 import { buildSceneStoryboardPath } from "./sceneStoryboardPath";
 
@@ -11,10 +15,15 @@ export type GenerateSceneStoryboardRequest = {
 };
 
 export const postSceneStoryboardGenerate = async (
-  request: GenerateSceneStoryboardRequest
+  request: GenerateSceneStoryboardRequest,
+  work = rendererLibrary.capture()
 ) => {
-  const response = await backendApiClient.post(
-    `${buildSceneStoryboardPath(request)}/generate`
+  const response = await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.post(
+      `${buildSceneStoryboardPath(request)}/generate`,
+      undefined,
+      { signal }
+    )
   );
   return SceneStoryboardSubmittedSchema.parse(response.data);
 };

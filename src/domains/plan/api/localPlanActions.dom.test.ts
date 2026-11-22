@@ -122,7 +122,12 @@ describe("mirrored cloud plans", () => {
     await resumePlan("cloud-plan-1");
 
     expect(post).toHaveBeenNthCalledWith(1, "/agent/plans/cloud-plan-1/cancel");
-    expect(post).toHaveBeenNthCalledWith(2, "/agent/plans/cloud-plan-1/resume");
+    expect(post).toHaveBeenNthCalledWith(
+      2,
+      "/agent/plans/cloud-plan-1/resume",
+      undefined,
+      { signal: expect.any(AbortSignal) }
+    );
     expect(cancelLocal).not.toHaveBeenCalled();
     expect(resumeLocal).not.toHaveBeenCalled();
   });

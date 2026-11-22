@@ -4,7 +4,10 @@ import { useTranslation } from "react-i18next";
 
 import { getLocalDesktopApi } from "@/platform/localDesktop";
 
-import { postAdaptI2vPrompt } from "../api/postAdaptI2vPrompt";
+import {
+  hasUnresolvedAdaptedReferences,
+  postAdaptI2vPrompt
+} from "../api/postAdaptI2vPrompt";
 import { postLocalAdaptI2vPrompt } from "../api/postLocalAdaptI2vPrompt";
 import { AdaptI2vPromptRequestBody } from "../interface";
 import { useInferenceCancellation } from "../useInferenceCancellation";
@@ -16,23 +19,32 @@ export const usePostAdaptI2vPrompt = (route: TextModelRoute = "cloud") => {
   const { showToast } = useToast();
   const { run, cancel } = useInferenceCancellation();
 
-  const mutationFn = (requestBody: AdaptI2vPromptRequestBody) =>
-    run(async (signal) => {
+  const mutationFn = ({
+    requestBody,
+    callerSignal
+  }: {
+    requestBody: AdaptI2vPromptRequestBody;
+    callerSignal?: AbortSignal;
+  }) =>
+    run(async (lifetimeSignal) => {
+      const signal = callerSignal
+        ? AbortSignal.any([callerSignal, lifetimeSignal])
+        : lifetimeSignal;
+      signal.throwIfAborted();
       if (
         route !== "cloud" &&
         (await getLocalDesktopApi().vlm.hasExternalText()) !==
           (route === "external")
       )
         throw new Error("External text configuration changed");
+      signal.throwIfAborted();
       const response =
         route !== "cloud"
           ? await postLocalAdaptI2vPrompt(requestBody, signal)
           : await postAdaptI2vPrompt(requestBody, signal);
       signal.throwIfAborted();
 
-      const hasUnresolvedReferences =
-        !response.adapted || (response.label_warnings?.length ?? 0) > 0;
-      if (hasUnresolvedReferences) {
+      if (hasUnresolvedAdaptedReferences(response)) {
         showToast({
           message: t("notifications.adapt_prompt_partial.description")
         });

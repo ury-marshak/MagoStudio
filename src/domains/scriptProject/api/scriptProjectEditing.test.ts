@@ -27,7 +27,8 @@ describe("script project API contracts", () => {
     ).resolves.toMatchObject({ dialogue, tags: null, edited: null });
     expect(backendApiClient.patch).toHaveBeenCalledWith(
       "/projects/project/shots/shot",
-      { dialogue }
+      { dialogue },
+      { signal: expect.any(AbortSignal) }
     );
   });
   it("clears persisted references through the key edit endpoint", async () => {
@@ -49,7 +50,8 @@ describe("script project API contracts", () => {
     });
     expect(backendApiClient.patch).toHaveBeenCalledWith(
       "/timelines/sheets/sheets/hero/edit",
-      { reference_asset_ids: [], reference_instruction: null }
+      { reference_asset_ids: [], reference_instruction: null },
+      { signal: expect.any(AbortSignal) }
     );
   });
   it.each([
@@ -82,7 +84,8 @@ describe("script project API contracts", () => {
         {
           reference_asset_ids: ["image", "second"],
           reference_instruction: "Use the face"
-        }
+        },
+        { signal: expect.any(AbortSignal) }
       );
       expect(backendApiClient.post).toHaveBeenCalledTimes(2);
       expect(backendApiClient.post).toHaveBeenCalledWith(
@@ -100,7 +103,8 @@ describe("script project API contracts", () => {
             input_image_id: "image",
             reference_images: ["second"]
           }
-        })
+        }),
+        { signal: expect.any(AbortSignal) }
       );
     }
   );
@@ -123,7 +127,8 @@ describe("script project API contracts", () => {
     });
     expect(backendApiClient.patch).toHaveBeenCalledWith(
       "/timelines/sheets/sheets/hero/edit",
-      { reference_asset_ids: ["image"], reference_instruction: "" }
+      { reference_asset_ids: ["image"], reference_instruction: "" },
+      { signal: expect.any(AbortSignal) }
     );
     expect(backendApiClient.post).toHaveBeenCalledWith(
       "/assets/img2img/render",
@@ -131,7 +136,8 @@ describe("script project API contracts", () => {
         settings: expect.objectContaining({
           prompt: "Hero portrait, face from image 1"
         })
-      })
+      }),
+      { signal: expect.any(AbortSignal) }
     );
   });
   it("does not submit a render when saving references fails", async () => {
@@ -168,7 +174,8 @@ describe("script project API contracts", () => {
       expect.objectContaining({
         render_model: "gpt_image_2_t2i",
         settings: { prompt: "Hero portrait", width: 1024, height: 1024 }
-      })
+      }),
+      { signal: expect.any(AbortSignal) }
     );
   });
 });

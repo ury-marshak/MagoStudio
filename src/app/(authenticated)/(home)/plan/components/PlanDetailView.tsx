@@ -41,8 +41,11 @@ export const PlanDetailView: React.FC<PlanDetailViewProps> = ({
   const { t } = useTranslation();
   const { showToast, showHintToast } = useToast();
 
-  const { data: progress, isLoading: isProgressLoading } =
-    usePlanProgress(planId);
+  const {
+    data: progress,
+    isLoading: isProgressLoading,
+    work
+  } = usePlanProgress(planId);
   const planIsActive = progress
     ? ACTIVE_PLAN_STATUSES.has(progress.status)
     : isProgressLoading;
@@ -75,7 +78,7 @@ export const PlanDetailView: React.FC<PlanDetailViewProps> = ({
     );
   }
 
-  if (!progress) {
+  if (!progress || work.signal.aborted) {
     return null;
   }
 
@@ -115,8 +118,14 @@ export const PlanDetailView: React.FC<PlanDetailViewProps> = ({
   };
 
   const handleResume = async () => {
-    await resumeMutate(planId);
-    showHintToast(t("plan.plan_resumed.label"));
+    if (work.signal.aborted) return;
+    try {
+      await resumeMutate(planId, work);
+      work.check();
+      showHintToast(t("plan.plan_resumed.label"));
+    } catch (error) {
+      if (!work.signal.aborted) throw error;
+    }
   };
 
   return (

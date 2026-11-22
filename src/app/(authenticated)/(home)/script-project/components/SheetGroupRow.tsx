@@ -54,6 +54,7 @@ type Props = {
     referenceInstruction: string;
   }) => void;
   onUploadReference: (file: File) => Promise<string | undefined>;
+  librarySignal?: AbortSignal;
   isRunActive: boolean;
   onUploadImage: (file: File) => void;
   onDescribeFromImage: (assetId: string) => void;
@@ -75,6 +76,7 @@ export const SheetGroupRow: React.FC<Props> = ({
   onToggleEnabled,
   onRerender,
   onUploadReference,
+  librarySignal,
   onDescribeFromImage,
   onUploadImage,
   isBusy,
@@ -252,12 +254,14 @@ export const SheetGroupRow: React.FC<Props> = ({
           onCommit={() => {
             if (referencesDirty) commitReferences();
           }}
+          librarySignal={librarySignal}
           onUpload={async (file) => {
+            if (librarySignal?.aborted) return;
             setIsUploadingReference(true);
             try {
               return await onUploadReference(file);
             } finally {
-              setIsUploadingReference(false);
+              if (!librarySignal?.aborted) setIsUploadingReference(false);
             }
           }}
         />

@@ -42,6 +42,8 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { PlanCreateSubmitButton } from "./PlanCreateSubmitButton";
 import {
   PlanImg2ImgSection,
@@ -93,6 +95,7 @@ export const PlanCreateForm: React.FC<PlanCreateFormProps> = ({
 }) => {
   const { t } = useTranslation();
   const { mutateAsync } = useCreatePlan();
+  const { work } = useRendererLibraryWork();
   const { showToast, showHintToast } = useToast();
   const { data: shots } = useProject(projectId, (p) => p.timelines ?? []);
   const {
@@ -292,9 +295,11 @@ export const PlanCreateForm: React.FC<PlanCreateFormProps> = ({
     data: PlanFormValues,
     shotImageAssignments: ReturnType<typeof getShotImageAssignments>
   ) => {
+    work.check();
     if (!isVideoOnlyEngine) {
       if (!img2imgRef.current) return;
       const isImg2ImgValid = await img2imgRef.current.trigger();
+      work.check();
       if (!isImg2ImgValid) return;
     }
 
@@ -365,12 +370,15 @@ export const PlanCreateForm: React.FC<PlanCreateFormProps> = ({
       );
     }
 
-    await mutateAsync(payload);
+    await mutateAsync(payload, work);
+    work.check();
     showHintToast(t("plan.plan_created.label"));
     onCreated();
   };
 
   const handleSubmit = (data: PlanFormValues) => {
+    // Form validation may dispatch this callback after a library switch.
+    if (work.signal.aborted) return;
     const liveShotIds = new Set((shots ?? []).map((shot) => shot.id));
     const validTimelineIds = data.timeline_ids.filter((id) =>
       liveShotIds.has(id)
@@ -400,7 +408,13 @@ export const PlanCreateForm: React.FC<PlanCreateFormProps> = ({
         cost: totalCost,
         count: timelineCount
       }),
-      onSubmit: () => executePlan(validatedData, shotImageAssignments),
+      onSubmit: async () => {
+        try {
+          await executePlan(validatedData, shotImageAssignments);
+        } catch (error) {
+          if (!work.signal.aborted) throw error;
+        }
+      },
       onSubmitText: t("plan.confirm_start_yes.label"),
       onCancelText: t("plan.confirm_start_no.label"),
       showTimer: false

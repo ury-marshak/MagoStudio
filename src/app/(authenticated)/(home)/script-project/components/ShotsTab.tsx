@@ -98,6 +98,7 @@ import { cn } from "@utils";
 import { Fragment, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { falVideoSize } from "../../../../../../desktop/shared/falGenerationSettings";
@@ -427,6 +428,7 @@ export const ShotsTab: React.FC<Props> = ({
   );
   const latestShotsRef = useLatestRef(projectState.shots);
 
+  const { work: storyboardWork } = useRendererLibraryWork();
   const { markSceneAwaitingStoryboard } = useKeepStoryboardTagsNonBlocking({
     projectId,
     scenes: projectState.shots,
@@ -535,40 +537,55 @@ export const ShotsTab: React.FC<Props> = ({
     settingsAction?: string;
     unsavedSceneShotEdits?: SceneShotDraftEdits;
   }) => {
+    // The edit and render are one action, even if the selected project changes.
+    const work = storyboardWork;
+    if (work.signal.aborted) return;
+    const submitsSceneStoryboard =
+      scene.storyboard || (isLocalProject && isFalSheetModel(model));
+    const providerSettings = submitsSceneStoryboard
+      ? generation.settingsFor(
+          model,
+          settingsAction ?? `storyboard:${scene.timeline_id}`
+        )
+      : undefined;
     const hasUnsavedSceneShotEdits =
       Object.keys(unsavedSceneShotEdits).length > 0;
     if (hasUnsavedSceneShotEdits) {
       try {
-        await editShotAsync({
-          projectId,
-          timelineId: scene.timeline_id,
-          ...unsavedSceneShotEdits
-        });
+        await editShotAsync(
+          {
+            projectId,
+            timelineId: scene.timeline_id,
+            ...unsavedSceneShotEdits
+          },
+          work
+        );
       } catch {
         return;
       }
     }
-    if (scene.storyboard || (isLocalProject && isFalSheetModel(model))) {
+    if (work.signal.aborted) return;
+    if (submitsSceneStoryboard) {
       await sceneStoryboards.generateSceneStoryboard(
         scene.timeline_id,
         model,
-        generation.settingsFor(
-          model ?? storyboardRenderModel,
-          settingsAction ?? `storyboard:${scene.timeline_id}`
-        )
+        providerSettings,
+        work
       );
       return;
     }
-    generateSceneStoryboardFromSheets({ shot: scene, storyboardBeats });
+    generateSceneStoryboardFromSheets({ shot: scene, storyboardBeats }, work);
   };
   const changeStoryboardVideoUseForScene = (
     scene: ShotState,
     isUsedInVideoRenders: boolean
   ) => {
+    if (storyboardWork.signal.aborted) return;
     if (scene.storyboard) {
       sceneStoryboards.setSceneStoryboardUsedInVideoRenders(
         scene.timeline_id,
-        isUsedInVideoRenders
+        isUsedInVideoRenders,
+        storyboardWork
       );
       return;
     }
@@ -598,15 +615,18 @@ export const ShotsTab: React.FC<Props> = ({
 
   const detachStoryboardFromScene = (shot: ShotState) => {
     const storyboardSheetToken = buildStoryboardSheetToken(shot.timeline_id);
-    editShot({
-      projectId,
-      timelineId: shot.timeline_id,
-      tags: withShotTagRemoved(
-        shot.tags,
-        STORYBOARD_TAG_CATEGORY,
-        storyboardSheetToken
-      )
-    });
+    editShot(
+      {
+        projectId,
+        timelineId: shot.timeline_id,
+        tags: withShotTagRemoved(
+          shot.tags,
+          STORYBOARD_TAG_CATEGORY,
+          storyboardSheetToken
+        )
+      },
+      storyboardWork
+    );
   };
 
   const generateShotFromSavedPrompt = async (
@@ -1535,7 +1555,8 @@ export const ShotsTab: React.FC<Props> = ({
                         onPinStoryboardVersion={(selectedAssetId) =>
                           sceneStoryboards.pinSceneStoryboardVersion(
                             shot.timeline_id,
-                            selectedAssetId
+                            selectedAssetId,
+                            storyboardWork
                           )
                         }
                         isUpdatingStoryboard={sceneStoryboards.isUpdatingSceneStoryboard(
