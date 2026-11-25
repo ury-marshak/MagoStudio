@@ -1,6 +1,8 @@
 import { CutShot } from "@schemas/scriptProject";
 import { act, renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 import { useDownloadCut } from "./useDownloadCut";
 
@@ -49,6 +51,10 @@ describe("useDownloadCut", () => {
     zipBlobs.mockClear();
     toast.showErrorToast.mockClear();
     vi.stubGlobal("fetch", vi.fn());
+  });
+  afterEach(() => {
+    rendererLibrary.reset();
+    vi.unstubAllGlobals();
   });
 
   describe("downloadOneShot", () => {
@@ -115,6 +121,63 @@ describe("useDownloadCut", () => {
       expect(zipBlobs).toHaveBeenCalledTimes(1);
       expect(triggerBlobDownload).toHaveBeenCalledTimes(1);
       expect(toast.showErrorToast).not.toHaveBeenCalled();
+    });
+
+    it("does not drain ZIP work or save its old blob after switching libraries", async () => {
+      vi.stubGlobal("mago", { account: { mode: "offline" } });
+      const shot = buildShot({ url: "mago-media://asset/reused-id" });
+      vi.mocked(fetch).mockResolvedValue(mockOkResponse());
+      const zip = Promise.withResolvers<Blob>();
+      zipBlobs.mockReturnValueOnce(zip.promise);
+      const { result } = renderHook(() => useDownloadCut([shot]));
+      let saving!: Promise<void>;
+      await act(async () => {
+        saving = result.current.downloadCut();
+        await vi.waitFor(() => expect(zipBlobs).toHaveBeenCalledOnce());
+      });
+      expect(result.current.isDownloadingCut).toBe(true);
+      await act(async () => {
+        await rendererLibrary.suspend();
+        rendererLibrary.reset();
+      });
+      expect(result.current.isDownloadingCut).toBe(false);
+      await act(async () => {
+        zip.resolve(new Blob(["old library"]));
+        await saving;
+      });
+      expect(triggerBlobDownload).not.toHaveBeenCalled();
+      expect(toast.showErrorToast).not.toHaveBeenCalled();
+
+      await act(() => result.current.downloadCut());
+      expect(triggerBlobDownload).toHaveBeenCalledOnce();
+    });
+
+    it("retains the origin of a ZIP retry instead of fetching old URLs in a new library", async () => {
+      vi.mocked(fetch).mockResolvedValue(mockFailedResponse(403));
+      const { result } = renderHook(() => useDownloadCut([buildShot()]));
+      await act(() => result.current.downloadCut());
+      const retry = toast.showErrorToast.mock.calls[0][0].onRetry;
+      await act(async () => {
+        await rendererLibrary.suspend();
+        rendererLibrary.reset();
+        retry();
+      });
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(toast.showErrorToast).toHaveBeenCalledOnce();
+      expect(triggerBlobDownload).not.toHaveBeenCalled();
+    });
+
+    it("does not archive a successful HTTP response containing an HTML page", async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response("<html>Sign in</html>", {
+          headers: { "content-type": "text/html; charset=utf-8" }
+        })
+      );
+      const { result } = renderHook(() => useDownloadCut([buildShot()]));
+      await act(() => result.current.downloadCut());
+      expect(zipBlobs).not.toHaveBeenCalled();
+      expect(triggerBlobDownload).not.toHaveBeenCalled();
+      expect(toast.showErrorToast).toHaveBeenCalledOnce();
     });
 
     it("excludes a Shot with no asset URL from the count and the zip", () => {

@@ -11,6 +11,7 @@ import {
   installNodePackRequirements,
   requirementsFileOfNodePack
 } from "./installNodePackRequirements";
+import type { SetupAttempt } from "./setupAttempt";
 
 const LOCAL_HOSTNAMES = ["localhost", "127.0.0.1", "[::1]"];
 const PYTHON_PLACEHOLDER = "<ComfyUI Python>";
@@ -23,10 +24,15 @@ const isEndpointOnThisComputer = (endpoint: string) => {
   }
 };
 
-const readReportedPythonVersion = async (endpoint: string) => {
-  const systemStats = await new ComfyClient(endpoint)
+const readReportedPythonVersion = async (
+  endpoint: string,
+  signal?: AbortSignal
+) => {
+  signal?.throwIfAborted();
+  const systemStats = await new ComfyClient(endpoint, undefined, signal)
     .getJson("/system_stats")
     .catch(() => null);
+  signal?.throwIfAborted();
   const pythonVersion = asRecord(asRecord(systemStats)?.system)?.python_version;
   return typeof pythonVersion === "string" ? pythonVersion : null;
 };
@@ -34,24 +40,37 @@ const readReportedPythonVersion = async (endpoint: string) => {
 export const installManualNodePackDependencies = async ({
   nodePackDirectory,
   endpoint,
-  signal
+  signal,
+  attempt
 }: {
   nodePackDirectory: string;
   endpoint: string;
   signal?: AbortSignal;
+  attempt?: SetupAttempt;
 }): Promise<NodePackDependenciesOutcome> => {
   const hasRequirementsFile = await stat(
     requirementsFileOfNodePack(nodePackDirectory)
   )
     .then((info) => info.isFile())
     .catch(() => false);
+  signal?.throwIfAborted();
   if (!hasRequirementsFile) return { outcome: "no-requirements" };
-  const comfyPython = isEndpointOnThisComputer(endpoint)
-    ? await findComfyPython({
-        comfyDirectory: path.dirname(path.dirname(nodePackDirectory)),
-        reportedPythonVersion: await readReportedPythonVersion(endpoint)
-      })
+  const issue = <T>(work: () => Promise<T>) =>
+    attempt ? attempt.issue(work) : work();
+  const reportedPythonVersion = isEndpointOnThisComputer(endpoint)
+    ? await readReportedPythonVersion(endpoint, signal)
     : null;
+  signal?.throwIfAborted();
+  const comfyPython = reportedPythonVersion
+    ? await issue(() =>
+        findComfyPython({
+          comfyDirectory: path.dirname(path.dirname(nodePackDirectory)),
+          reportedPythonVersion,
+          ...(signal && { signal })
+        })
+      )
+    : null;
+  signal?.throwIfAborted();
   if (!comfyPython)
     return {
       outcome: "manual",
@@ -61,14 +80,17 @@ export const installManualNodePackDependencies = async ({
       )
     };
   try {
-    return {
-      outcome: await installNodePackRequirements({
+    const outcome = await issue(() =>
+      installNodePackRequirements({
         python: comfyPython,
         nodePackDirectory,
         signal
       })
-    };
+    );
+    signal?.throwIfAborted();
+    return { outcome };
   } catch (error) {
+    signal?.throwIfAborted();
     return {
       outcome: "manual",
       pipCommand: describePipInstallCommand(comfyPython, nodePackDirectory),

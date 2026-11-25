@@ -16,5 +16,6 @@ export interface TextModelResponse {
 export type RunCloudTextModel = (
   operation: TextModelOperation,
   body: Record<string, unknown>,
-  isCancelled?: () => boolean
+  isCancelled?: () => boolean,
+  signal?: AbortSignal
 ) => Promise<Record<string, unknown> | null>;

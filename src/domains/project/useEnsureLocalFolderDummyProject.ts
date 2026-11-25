@@ -17,7 +17,10 @@ export const useEnsureLocalFolderDummyProject = () => {
   ): Promise<Project> => {
     await work.ready();
     work.check();
-    const loadedProjects = await queryClient.fetchQuery(projectsQueryOptions);
+    const loadedProjects = await queryClient.fetchQuery({
+      ...projectsQueryOptions(work),
+      retry: false
+    });
     work.check();
     const existingFolderDummyProject = loadedProjects.find((project) =>
       isDummyProject(project, userId)

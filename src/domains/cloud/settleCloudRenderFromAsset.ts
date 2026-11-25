@@ -1,11 +1,13 @@
 import { getLocalDesktopApi } from "@/platform/localDesktop";
 import {
   rendererLibrary,
+  runRendererLibraryRequest,
   type RendererLibraryWork
 } from "@/platform/rendererLibraryWork";
 
 import { CloudApi } from "./mirrorService";
 import { readCloudRenderAsset } from "./readCloudRenderAsset";
+import { rendererCloudBackgroundWork } from "./rendererCloudBackgroundWork";
 
 export type CloudRenderSettlement = "finished" | "failed" | "waiting";
 
@@ -17,8 +19,9 @@ export const settleCloudRenderFromAsset = async (
   api: CloudApi,
   job: { id: string; cloudAssetId: string },
   pendingOutputMeaning: PendingCloudRenderOutputMeaning,
-  work: RendererLibraryWork = rendererLibrary.capture()
+  origin: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<CloudRenderSettlement> => {
+  const work = rendererCloudBackgroundWork(origin);
   await work.ready();
   const renders = getLocalDesktopApi().cloud.renders;
   const asset = await readCloudRenderAsset(api, job.cloudAssetId);
@@ -45,7 +48,7 @@ export const settleCloudRenderFromAsset = async (
   }
 
   try {
-    await work.boundary(() =>
+    await runRendererLibraryRequest(work, () =>
       renders.finish({ jobId: job.id, url: asset.url })
     );
     return "finished";

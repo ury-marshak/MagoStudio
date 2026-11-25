@@ -1,3 +1,5 @@
+import { addAbortListener } from "node:events";
+
 import { asRecord } from "./asRecord";
 import type { ComfyGraph } from "./comfyGraph";
 import { comfyGraphProgressFraction } from "./comfyGraphProgressFraction";
@@ -69,6 +71,8 @@ export class ComfyProgressMonitor {
   private readonly prompts = new Map<string, TrackedPrompt>();
   private readonly unclaimedEvents = new Map<string, ComfyEvent[]>();
   private readonly settledListeners = new Set<(promptId: string) => void>();
+  private readonly waiters = new Set<() => void>();
+  private closed = false;
   private socket: ComfyWebSocket | null = null;
   private connectionGeneration = 0;
   private isSocketOpen = false;
@@ -77,11 +81,12 @@ export class ComfyProgressMonitor {
 
   constructor(
     private readonly endpoint: string,
-    private readonly clientId: string,
+    readonly clientId: string,
     private readonly createWebSocket: CreateComfyWebSocket
   ) {}
 
   watch(promptId: string, graph: ComfyGraph): void {
+    if (this.closed) return;
     const prompt: TrackedPrompt = {
       weights: comfyGraphProgressWeights(graph),
       phase: "queued",
@@ -117,22 +122,35 @@ export class ComfyProgressMonitor {
   }
 
   onPromptSettled(listener: (promptId: string) => void): () => void {
+    if (this.closed) return () => {};
     this.settledListeners.add(listener);
     return () => this.settledListeners.delete(listener);
   }
 
-  waitForSettle(promptId: string, timeoutMs: number): Promise<void> {
-    return new Promise((resolve) => {
+  async waitForSettle(
+    promptId: string,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<void> {
+    signal?.throwIfAborted();
+    if (this.closed || this.prompts.get(promptId)?.phase === "settled") return;
+    await new Promise<void>((resolve) => {
       const timer = setTimeout(finish, timeoutMs);
       const unsubscribe = this.onPromptSettled((settledPromptId) => {
         if (settledPromptId === promptId) finish();
       });
+      const abort = signal && addAbortListener(signal, finish);
+      const waiters = this.waiters;
+      waiters.add(finish);
       function finish() {
         clearTimeout(timer);
         unsubscribe();
+        abort?.[Symbol.dispose]();
+        waiters.delete(finish);
         resolve();
       }
     });
+    signal?.throwIfAborted();
   }
 
   resetConnection(): void {
@@ -143,13 +161,22 @@ export class ComfyProgressMonitor {
   }
 
   close(): void {
+    this.closed = true;
+    for (const finish of this.waiters) finish();
+    this.settledListeners.clear();
     this.prompts.clear();
     this.unclaimedEvents.clear();
     this.disconnect();
   }
 
   private ensureConnected(): void {
-    if (this.socket || this.reconnectTimer || this.prompts.size === 0) return;
+    if (
+      this.closed ||
+      this.socket ||
+      this.reconnectTimer ||
+      this.prompts.size === 0
+    )
+      return;
     let socket: ComfyWebSocket;
     try {
       socket = this.createWebSocket(
@@ -173,8 +200,7 @@ export class ComfyProgressMonitor {
     });
     const handleSocketLoss = () => {
       if (this.socket !== socket) return;
-      this.socket = null;
-      this.isSocketOpen = false;
+      this.disconnectSocket();
       this.scheduleReconnect();
     };
     socket.addEventListener("close", handleSocketLoss);
@@ -204,9 +230,14 @@ export class ComfyProgressMonitor {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.reconnectAttempt = 0;
+    this.disconnectSocket();
+  }
+
+  private disconnectSocket(): void {
     const socket = this.socket;
     this.socket = null;
     this.isSocketOpen = false;
+    this.unclaimedEvents.clear();
     socket?.close();
   }
 

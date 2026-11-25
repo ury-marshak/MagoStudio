@@ -28,6 +28,33 @@ describe("isEligibleRenderTrack", () => {
     expect(isEligibleRenderTrack(renderTrack({}))).toBe(true);
   });
 
+  it.each(["video-edit", "video-upscale"])(
+    "keeps fal %s render tracks without a Mago engine",
+    (kind) => {
+      const effect = {
+        ...renderTrack({}),
+        data: { externalRender: { provider: "fal", kind } }
+      };
+      expect(filterEligibleLayers([effect])).toEqual([effect]);
+      expect(isEligibleRenderTrack({ ...effect, clips: [] })).toBe(false);
+    }
+  );
+
+  it.each([
+    { provider: "fal", kind: "reference-video" },
+    { provider: "other", kind: "video-edit" },
+    { provider: "fal" },
+    "fal",
+    null
+  ])("rejects an unsupported external render tag (%j)", (externalRender) => {
+    expect(
+      isEligibleRenderTrack({
+        ...renderTrack({}),
+        data: { externalRender }
+      })
+    ).toBe(false);
+  });
+
   it("rejects a magoV1 render track", () => {
     expect(isEligibleRenderTrack(renderTrack({ engine: "magov1" }))).toBe(
       false

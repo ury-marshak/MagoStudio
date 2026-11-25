@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
 import { queryKeys } from "@/queryKeys";
 
 import { postProjectCutExport } from "../api/postProjectCutExport";
@@ -8,10 +9,19 @@ import { postProjectCutExport } from "../api/postProjectCutExport";
  * will hand back separate files instead of one MP4. */
 export const useProjectCutExportDryRun = (
   projectId: string | null | undefined
-) =>
-  useQuery({
-    queryKey: queryKeys.projectCut.exportDryRun(projectId),
+) => {
+  const scope = useRendererLibraryQueryScope();
+  const queryKey = scope.key(queryKeys.projectCut.exportDryRun(projectId));
+  return useQuery({
+    queryKey,
     queryFn: () =>
-      postProjectCutExport({ projectId: projectId!, isDryRun: true }),
-    enabled: !!projectId
+      scope.run(() =>
+        postProjectCutExport(
+          { projectId: projectId!, isDryRun: true },
+          scope.work
+        )
+      ),
+    enabled: !!projectId && scope.active,
+    retry: scope.retry(queryKey)
   });
+};

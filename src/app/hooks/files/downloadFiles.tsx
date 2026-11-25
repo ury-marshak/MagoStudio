@@ -17,15 +17,18 @@ const isNotFoundError = (error: unknown): boolean =>
 
 export const getLayerDownloadSignedUrl = async ({
   layerId,
-  kind
+  kind,
+  signal
 }: {
   layerId: Layer["id"];
   kind: LayerDownloadKind;
+  signal?: AbortSignal;
 }): Promise<string> => {
   try {
-    const response = await backendApiClient.get<{ url?: string }>(
-      `/download/${kind}/layer/${layerId}`
-    );
+    const endpoint = `/download/${kind}/layer/${layerId}`;
+    const response = signal
+      ? await backendApiClient.get<{ url?: string }>(endpoint, { signal })
+      : await backendApiClient.get<{ url?: string }>(endpoint);
     const signedUrl = response.data?.url;
     if (!signedUrl) throw new Error("File not found");
     return signedUrl;

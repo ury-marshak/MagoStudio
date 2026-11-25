@@ -43,6 +43,8 @@ import { registerLibraryHandlers } from "../ipc/registerLibraryHandlers";
 import { registerProjectHandlers } from "../ipc/registerProjectHandlers";
 import { registerScriptProjectHandlers } from "../ipc/registerScriptProjectHandlers";
 import type { LibrarySettings } from "../librarySettings";
+import { ProfileIoDrain } from "../providers/profileIoDrain";
+import { ProfileLifetime } from "../providers/profileLifetime";
 import type { LocalScriptChatService } from "../scriptProjects/localScriptChatService";
 import { LocalScriptProjectService } from "../scriptProjects/localScriptProjectService";
 
@@ -51,6 +53,7 @@ import { DatabaseManager } from "./databaseManager";
 import { ProjectRepository } from "./projectRepository";
 import {
   assets,
+  cloudLinks,
   projects,
   scriptProjectMedia,
   scriptProjectSnapshots
@@ -164,7 +167,19 @@ const fixture = async () => {
     allowedHosts: config.cloudStorageHosts,
     fetchFromCloudStorage
   };
-  const mirrors = new CloudProjectMirrorRepository(manager, getRoot, access);
+  const account = new ProfileLifetime();
+  const profileIo = new ProfileIoDrain();
+  const retireAccount = async () => {
+    account.suspend();
+    await profileIo.drainRetired();
+    account.resume();
+  };
+  const mirrors = new CloudProjectMirrorRepository(
+    manager,
+    getRoot,
+    access,
+    profileIo
+  );
   const snapshots = new ScriptProjectSnapshotRepository(
     manager,
     getRoot,
@@ -176,7 +191,18 @@ const fixture = async () => {
     snapshots,
     async () => "http://unused.invalid"
   );
-  registerProjectHandlers(repository, mirrors, manager, settings);
+  registerProjectHandlers(
+    repository,
+    mirrors,
+    manager,
+    settings,
+    undefined,
+    undefined,
+    undefined,
+    () => account.capture(),
+    undefined,
+    profileIo
+  );
   registerScriptProjectHandlers({
     service,
     chat: {} as LocalScriptChatService,
@@ -233,6 +259,7 @@ const fixture = async () => {
     suspend,
     reset,
     choose,
+    retireAccount,
     project,
     asset,
     cache,
@@ -313,56 +340,131 @@ it("drains a complete issued DB open before opening the replacement", async () =
   expect((await f.project()).name).toBe("library 1");
 });
 
-it("drains the whole multi-write mirror operation, not only its first query", async () => {
-  const f = await fixture();
-  // Pause between the project and cloud-link writes in the actual repository.
-  const get = f.manager.get.bind(f.manager);
-  const gate = deferred();
-  let inserts = 0;
-  vi.spyOn(f.manager, "get").mockImplementation(() => {
-    const db = get();
-    return new Proxy(db, {
-      get(target, key, receiver) {
-        if (key !== "insert") return Reflect.get(target, key, receiver);
-        return (...args: Parameters<typeof db.insert>) => {
-          const query = db.insert(...args);
-          if (++inserts !== 2) return query;
-          const values = query.values.bind(query);
-          return {
-            values: (...input: Parameters<typeof values>) => {
-              const q = values(...input);
-              const update = q.onConflictDoUpdate.bind(q);
-              return {
-                onConflictDoUpdate: async (
-                  ...conflict: Parameters<typeof update>
-                ) => {
-                  await gate.promise;
-                  await update(...conflict);
-                }
+it.each(["library", "account"])(
+  "drains the whole metadata transaction on %s retirement, without admitting content",
+  async (scope) => {
+    const f = await fixture();
+    const gate = deferred();
+    const writing = deferred();
+    const transaction = f.manager.transaction.bind(f.manager);
+    const inserts: unknown[] = [];
+    const begin = vi
+      .spyOn(f.manager, "transaction")
+      .mockImplementation((write, signal) =>
+        transaction((db) => {
+          const held = new Proxy(db, {
+            get(target, key, receiver) {
+              if (key !== "insert") return Reflect.get(target, key, receiver);
+              return (...args: Parameters<typeof db.insert>) => {
+                inserts.push(args[0]);
+                const query = db.insert(...args);
+                if (args[0] !== projects) return query;
+                const values = query.values.bind(query);
+                return {
+                  values: (...input: Parameters<typeof values>) => {
+                    const q = values(...input);
+                    return {
+                      onConflictDoUpdate: async (
+                        ...conflict: Parameters<typeof q.onConflictDoUpdate>
+                      ) => {
+                        await q.onConflictDoUpdate(...conflict);
+                        writing.resolve();
+                        await gate.promise;
+                      }
+                    };
+                  }
+                };
               };
             }
-          };
-        };
-      }
+          });
+          return write(held);
+        }, signal)
+      );
+    const stale = observe(
+      invoke(IPC_CHANNELS.projectsMirrorCloud, {
+        project: { ...mirrorInput.project, timelines: [] },
+        includeContent: true
+      })
+    );
+    await writing.promise;
+    expect(inserts).toEqual([projects]);
+    const changed = vi.fn();
+    const switching = (
+      scope === "library" ? f.choose() : f.retireAccount()
+    ).then(changed);
+    if (scope === "library") {
+      await vi.waitFor(() =>
+        expect(f.mirrors.libraryWork.signal.aborted).toBe(true)
+      );
+    }
+    await flush();
+    expect(changed).not.toHaveBeenCalled();
+    gate.resolve();
+    await switching;
+    expect(await stale).toBeInstanceOf(Error);
+    expect(inserts).toEqual([projects, cloudLinks]);
+    expect(begin).toHaveBeenCalledOnce();
+    if (scope === "library") {
+      expect((await f.project()).name).toBe("library 1");
+      await f.manager.open(f.roots[0]!);
+    }
+    expect((await f.project()).name).toBe("old mutation");
+    expect(await f.manager.get().select().from(cloudLinks)).toMatchObject([
+      { kind: "project", localId: "project", cloudId: "project" }
+    ]);
+  }
+);
+
+it("account retirement drains a cache-hit thumbnail write and blocks the source phase", async () => {
+  const f = await fixture();
+  const thumbnailUrl = url.replace("same.mp4", "thumbnail.jpg");
+  await invoke(IPC_CHANNELS.projectsCacheCloudAsset, {
+    ...cacheInput,
+    sourceUrl: undefined,
+    thumbnailUrl
+  });
+  f.fetchFromCloudStorage.mockClear();
+  const gate = deferred();
+  const writing = deferred();
+  const db = f.manager.get();
+  const update = db.update.bind(db);
+  const writes = vi.spyOn(db, "update").mockImplementation((table) => {
+    const query = update(table);
+    const set = query.set.bind(query);
+    vi.spyOn(query, "set").mockImplementation((values) => {
+      const q = set(values);
+      const where = q.where.bind(q);
+      vi.spyOn(q, "where").mockImplementation((condition) => {
+        const statement = where(condition);
+        const execute = statement.execute.bind(statement);
+        vi.spyOn(statement, "execute").mockImplementation(async () => {
+          writing.resolve();
+          await gate.promise;
+          return execute();
+        });
+        return statement;
+      });
+      return q;
     });
+    return query;
   });
-  const stale = observe(invoke(IPC_CHANNELS.projectsMirrorCloud, mirrorInput));
-  await vi.waitFor(() => expect(inserts).toBe(2));
-  let changed = false;
-  const choosing = f.choose().then(() => {
-    changed = true;
-  });
-  await vi.waitFor(() =>
-    expect(f.mirrors.libraryWork.signal.aborted).toBe(true)
+  const stale = observe(
+    invoke(IPC_CHANNELS.projectsCacheCloudAsset, {
+      ...cacheInput,
+      thumbnailUrl
+    })
   );
+  await writing.promise;
+  const changed = vi.fn();
+  const switching = f.retireAccount().then(changed);
   await flush();
-  expect(changed).toBe(false);
+  expect(changed).not.toHaveBeenCalled();
   gate.resolve();
-  await choosing;
+  await switching;
   expect(await stale).toBeInstanceOf(Error);
-  expect((await f.project()).name).toBe("library 1");
-  await f.manager.open(f.roots[0]!);
-  expect((await f.project()).name).toBe("old mutation");
+  expect(writes).toHaveBeenCalledOnce();
+  expect(f.fetchFromCloudStorage).not.toHaveBeenCalled();
+  expect((await f.asset()).status).toBe("pending");
 });
 
 it.each(["mirror", "script"])(
@@ -398,7 +500,7 @@ it.each(["mirror", "script"])(
   }
 );
 
-it.each(["mirror", "script"])(
+it.each(["mirror", "script", "mirror account"] as const)(
   "aborts and drains an already-reading %s body before replacement",
   async (kind) => {
     const f = await fixture();
@@ -408,13 +510,16 @@ it.each(["mirror", "script"])(
     f.fetchFromCloudStorage.mockResolvedValueOnce(
       new Response(new ReadableStream({ pull, cancel }))
     );
-    const stale = observe(kind === "mirror" ? f.cache() : f.scriptCache());
+    const stale = observe(kind === "script" ? f.scriptCache() : f.cache());
     await vi.waitFor(() => expect(pull).toHaveBeenCalled());
     let changed = false;
-    const choosing = f.choose().then(() => {
+    const choosing = (
+      kind === "mirror account" ? f.retireAccount() : f.choose()
+    ).then(() => {
       changed = true;
     });
     await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    await flush();
     expect(changed).toBe(false);
     cancelled.resolve();
     await choosing;
@@ -455,6 +560,7 @@ it("drains all snapshot localization siblings after Promise.all rejects", async 
   const stale = observe(
     invoke(IPC_CHANNELS.scriptProjectsPut, {
       projectId: "project",
+      intent: "cloud-import",
       state: { images: [{ url }, { url: url.replace("same", "second") }] }
     })
   );
@@ -529,6 +635,7 @@ it.each([
       channel === IPC_CHANNELS.scriptProjectsPut
         ? invoke(channel, {
             projectId: "project",
+            intent: "cloud-import",
             state: { changed: true, url }
           })
         : f.scriptCache()
@@ -689,13 +796,15 @@ it("complete issued snapshot writes drain before settings or DB replacement", as
               const q = values(...input);
               const update = q.onConflictDoUpdate.bind(q);
               return {
-                onConflictDoUpdate: async (
+                onConflictDoUpdate: (
                   ...conflict: Parameters<typeof update>
-                ) => {
-                  writing = true;
-                  await gate.promise;
-                  await update(...conflict);
-                }
+                ) => ({
+                  run: async () => {
+                    writing = true;
+                    await gate.promise;
+                    await update(...conflict).run();
+                  }
+                })
               };
             }
           };

@@ -1,6 +1,7 @@
 import { Project } from "@schemas/project";
 import { useQuery } from "@tanstack/react-query";
 
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
 import { queryKeys } from "@/queryKeys";
 
 import {
@@ -37,14 +38,19 @@ export const useProjectStats = (
 ) => {
   const { enabled = true, origin, backfillMissingCost = false } = options ?? {};
 
+  const scope = useRendererLibraryQueryScope();
+  const queryKey = scope.key([
+    ...queryKeys.projectStats.byProjectId(projectId),
+    origin,
+    backfillMissingCost ? "cost-backfill" : "standard"
+  ]);
   return useQuery<ProjectStatsResponse | undefined>({
-    queryKey: [
-      ...queryKeys.projectStats.byProjectId(projectId),
-      origin,
-      backfillMissingCost ? "cost-backfill" : "standard"
-    ],
-    queryFn: () => fetchProjectStats(projectId, origin),
-    enabled: enabled && !!projectId && projectId !== "undefined",
+    queryKey,
+    retry: scope.retry(queryKey),
+    queryFn: () =>
+      scope.run(() => fetchProjectStats(projectId, origin, scope.work)),
+    enabled:
+      scope.active && enabled && !!projectId && projectId !== "undefined",
     staleTime: STALE_TIME_MS,
     refetchOnWindowFocus: true,
     refetchInterval: (query) =>

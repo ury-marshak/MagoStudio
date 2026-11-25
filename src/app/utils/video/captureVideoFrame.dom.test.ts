@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
+import { RendererLibrarySession } from "@/platform/rendererLibraryWork";
+
 import { captureVideoFrame } from "./captureVideoFrame";
 
 describe("captureVideoFrame", () => {
@@ -26,6 +28,9 @@ describe("captureVideoFrame", () => {
       crossOrigin: "",
       src: "",
       load: vi.fn(),
+      removeAttribute: vi.fn(() => {
+        mockVideo.src = "";
+      }),
       addEventListener: vi.fn(),
       removeEventListener: vi.fn()
     } as unknown as HTMLVideoElement;
@@ -49,6 +54,7 @@ describe("captureVideoFrame", () => {
     const fps = 30;
 
     const capturePromise = captureVideoFrame({ videoUrl, frame, fps });
+    await vi.waitFor(() => expect(mockVideo.load).toHaveBeenCalledOnce());
 
     const loadedMetadataHandler = (
       mockVideo.addEventListener as any
@@ -64,7 +70,7 @@ describe("captureVideoFrame", () => {
 
     expect(result).toBe("data:image/jpeg;base64,mockedImageData");
     expect(mockVideo.crossOrigin).toBe("anonymous");
-    expect(mockVideo.src).toBe(videoUrl);
+    expect(mockVideo.src).toBe("");
     expect(mockVideo.currentTime).toBe(1);
     expect(mockCanvas.width).toBe(1920);
     expect(mockCanvas.height).toBe(1080);
@@ -92,6 +98,7 @@ describe("captureVideoFrame", () => {
       imageFormat,
       imageQuality
     });
+    await vi.waitFor(() => expect(mockVideo.load).toHaveBeenCalledOnce());
 
     const loadedMetadataHandler = (
       mockVideo.addEventListener as any
@@ -145,6 +152,7 @@ describe("captureVideoFrame", () => {
     const fps = 30;
 
     const capturePromise = captureVideoFrame({ videoUrl, frame, fps });
+    await vi.waitFor(() => expect(mockVideo.load).toHaveBeenCalledOnce());
 
     const errorHandler = (mockVideo.addEventListener as any).mock.calls.find(
       (call: any) => call[0] === "error"
@@ -160,6 +168,7 @@ describe("captureVideoFrame", () => {
     const frame = 60;
 
     const capturePromise = captureVideoFrame({ videoUrl, frame });
+    await vi.waitFor(() => expect(mockVideo.load).toHaveBeenCalledOnce());
 
     const loadedMetadataHandler = (
       mockVideo.addEventListener as any
@@ -182,6 +191,7 @@ describe("captureVideoFrame", () => {
     const fps = 60;
 
     const capturePromise = captureVideoFrame({ videoUrl, frame, fps });
+    await vi.waitFor(() => expect(mockVideo.load).toHaveBeenCalledOnce());
 
     const loadedMetadataHandler = (
       mockVideo.addEventListener as any
@@ -203,6 +213,7 @@ describe("captureVideoFrame", () => {
     const frame = 30;
 
     const capturePromise = captureVideoFrame({ videoUrl, frame, fps: 30 });
+    await vi.waitFor(() => expect(mockVideo.load).toHaveBeenCalledOnce());
 
     const loadedMetadataHandler = (
       mockVideo.addEventListener as any
@@ -235,6 +246,7 @@ describe("captureVideoFrame", () => {
     const frame = 30;
 
     const capturePromise = captureVideoFrame({ videoUrl, frame, fps: 30 });
+    await vi.waitFor(() => expect(mockVideo.load).toHaveBeenCalledOnce());
 
     const errorHandler = (mockVideo.addEventListener as any).mock.calls.find(
       (call: any) => call[0] === "error"
@@ -255,5 +267,27 @@ describe("captureVideoFrame", () => {
       "error",
       expect.any(Function)
     );
+  });
+
+  it("detaches the source and ignores an already queued seek after retirement", async () => {
+    const library = new RendererLibrarySession();
+    const capture = captureVideoFrame(
+      { videoUrl: "blob:local", frame: 0 },
+      library.capture()
+    );
+    const rejected = expect(capture).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await vi.waitFor(() => expect(mockVideo.load).toHaveBeenCalledOnce());
+    const seeked = vi
+      .mocked(mockVideo.addEventListener)
+      .mock.calls.find(([event]) => event === "seeked")?.[1];
+    await library.suspend();
+    library.reset();
+    if (typeof seeked === "function") seeked(new Event("seeked"));
+    await rejected;
+    expect(mockContext.drawImage).not.toHaveBeenCalled();
+    expect(mockVideo.src).toBe("");
+    expect(mockVideo.load).toHaveBeenCalledTimes(2);
   });
 });

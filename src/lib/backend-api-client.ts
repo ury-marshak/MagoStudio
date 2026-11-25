@@ -3,6 +3,7 @@
 import axios, { AxiosInstance, isAxiosError } from "axios";
 
 import { isCloudAccountActive } from "@/platform/cloudAccount";
+import { captureRendererAccountProfile } from "@/platform/rendererAccountProfile";
 
 const HTTP_UNAUTHORIZED = 401;
 
@@ -39,6 +40,25 @@ const requireCloudAccount = (): void => {
     );
 };
 
+/** Reject credential waits promptly without requiring the SDK to honor abort. */
+const awaitWithSignal = async <T>(
+  promise: Promise<T>,
+  signal?: AbortSignal
+): Promise<T> => {
+  if (!signal) return promise;
+  let onAbort!: () => void;
+  try {
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(new axios.CanceledError());
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+};
+
 const ensureRequestInterceptor = (): void => {
   if (requestInterceptorId !== null) return;
   requestInterceptorId = backendApiClient.interceptors.request.use(
@@ -50,14 +70,25 @@ const ensureRequestInterceptor = (): void => {
         requireCloudAccount();
       };
       checkDispatch();
-      if (apiKeyReadyPromise) await apiKeyReadyPromise;
+      const profile = captureRendererAccountProfile();
+      if (profile) {
+        // Axios also checks this signal after adapter settlement, so a late
+        // response cannot reach callers or trigger the unauthorized handler.
+        const caller = config.signal;
+        const signals = [profile];
+        if (caller instanceof AbortSignal) signals.push(caller);
+        config.signal = AbortSignal.any(signals);
+      }
+      if (apiKeyReadyPromise)
+        await awaitWithSignal(apiKeyReadyPromise, profile);
       checkDispatch();
 
       if (getTokenFunction) {
         try {
-          const token = await getTokenFunction();
+          const token = await awaitWithSignal(getTokenFunction(), profile);
           if (token) config.headers.Authorization = `Bearer ${token}`;
         } catch (error) {
+          checkDispatch();
           console.error("Failed to get auth token:", error);
         }
       }
@@ -111,6 +142,8 @@ export function registerUnauthorizedHandler(onUnauthorized: () => void) {
       (error) => {
         if (
           isAxiosError(error) &&
+          !error.config?.signal?.aborted &&
+          isCloudAccountActive() &&
           error.response?.status === HTTP_UNAUTHORIZED
         ) {
           onUnauthorized();

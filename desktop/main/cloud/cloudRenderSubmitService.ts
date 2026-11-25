@@ -189,12 +189,15 @@ export class CloudRenderSubmitService {
   }
 
   async register(
-    input: CloudRenderRegistration
+    input: CloudRenderRegistration,
+    profile?: AbortSignal
   ): Promise<{ jobId: string; assetId: string; clipId: string }> {
+    profile?.throwIfAborted();
     if (!this.manager.isOpen()) {
       throw new Error("Choose a Mago library folder first");
     }
     const libraryRoot = await this.getLibraryRoot();
+    profile?.throwIfAborted();
     if (!libraryRoot) throw new Error("Choose a Mago library folder first");
 
     const database = this.manager.get();
@@ -203,6 +206,7 @@ export class CloudRenderSubmitService {
       .from(tracks)
       .where(and(eq(tracks.id, input.outputTrackId), eq(tracks.active, true)))
       .limit(1);
+    profile?.throwIfAborted();
     if (!outputTrack) throw new Error("The output track could not be found");
 
     const [sourceAsset] = await database
@@ -210,6 +214,7 @@ export class CloudRenderSubmitService {
       .from(assets)
       .where(eq(assets.id, input.sourceAssetId))
       .limit(1);
+    profile?.throwIfAborted();
     if (!sourceAsset) throw new Error("The source asset could not be found");
     const estimatedOutputDimensions = isLocalImageToVideoModelName(input.model)
       ? estimateImageToVideoOutputDimensions(
@@ -228,6 +233,9 @@ export class CloudRenderSubmitService {
     const outputPath = path.join(libraryRoot, renderOutputPath(jobId));
 
     await this.manager.transaction(async (transaction) => {
+      // Once the first mutation is issued, finish the local transaction so
+      // all rows retain the already-accepted remote IDs together.
+      profile?.throwIfAborted();
       await transaction.insert(assets).values({
         id: assetId,
         name: outputTrack.name,
@@ -303,6 +311,7 @@ export class CloudRenderSubmitService {
       });
     });
 
+    profile?.throwIfAborted();
     return { jobId, assetId, clipId };
   }
 
@@ -317,12 +326,15 @@ export class CloudRenderSubmitService {
    * there is no layer to make here first.
    */
   async registerImage(
-    input: CloudImageRenderRegistration
+    input: CloudImageRenderRegistration,
+    profile?: AbortSignal
   ): Promise<{ jobId: string; assetId: string; clipId: string }> {
+    profile?.throwIfAborted();
     if (!this.manager.isOpen()) {
       throw new Error("Choose a Mago library folder first");
     }
     const libraryRoot = await this.getLibraryRoot();
+    profile?.throwIfAborted();
     if (!libraryRoot) throw new Error("Choose a Mago library folder first");
 
     const jobId = randomUUID();
@@ -336,6 +348,7 @@ export class CloudRenderSubmitService {
     );
 
     await this.manager.transaction(async (transaction) => {
+      profile?.throwIfAborted();
       const [shot] = await transaction
         .select()
         .from(shots)
@@ -343,6 +356,7 @@ export class CloudRenderSubmitService {
           and(eq(shots.id, input.shotId), eq(shots.projectId, input.projectId))
         )
         .limit(1);
+      profile?.throwIfAborted();
       if (!shot) throw new Error("The local shot could not be found");
 
       const [existingTrack] = await transaction
@@ -350,6 +364,7 @@ export class CloudRenderSubmitService {
         .from(tracks)
         .where(and(eq(tracks.shotId, input.shotId), eq(tracks.type, "IMG2IMG")))
         .limit(1);
+      profile?.throwIfAborted();
       const trackId = existingTrack?.id ?? newTrackId;
       if (!existingTrack) {
         const positions = await transaction
@@ -357,6 +372,7 @@ export class CloudRenderSubmitService {
           .from(tracks)
           .where(eq(tracks.shotId, input.shotId))
           .orderBy(asc(tracks.position));
+        profile?.throwIfAborted();
         await transaction.insert(tracks).values({
           id: trackId,
           shotId: input.shotId,
@@ -432,6 +448,7 @@ export class CloudRenderSubmitService {
         .where(eq(projects.id, input.projectId));
     });
 
+    profile?.throwIfAborted();
     return { jobId, assetId, clipId };
   }
 
@@ -445,10 +462,14 @@ export class CloudRenderSubmitService {
       relativePath: string;
       sizeBytes: number;
     },
-    descriptionSession = this.captureImageSession?.()
+    descriptionSession = this.captureImageSession?.(),
+    profile?: AbortSignal
   ): Promise<void> {
-    this.libraryWork.capture();
+    const library = this.libraryWork.capture();
+    const signal = profile ? AbortSignal.any([library, profile]) : library;
+    signal.throwIfAborted();
     const libraryRoot = await this.getLibraryRoot();
+    signal.throwIfAborted();
     if (!libraryRoot) throw new Error("Choose a Mago library folder first");
 
     const database = this.manager.get();
@@ -457,6 +478,7 @@ export class CloudRenderSubmitService {
       .from(cloudRenderJobs)
       .where(eq(cloudRenderJobs.id, input.jobId))
       .limit(1);
+    signal.throwIfAborted();
     if (!job) throw new Error("The cloud render job could not be found");
 
     // `register` recorded the render settings under `data.render_settings.magov2`
@@ -479,6 +501,7 @@ export class CloudRenderSubmitService {
       .from(assets)
       .where(eq(assets.id, job.assetId))
       .limit(1);
+    signal.throwIfAborted();
 
     // A still needs the same finishing touches the local image path gives it
     // (completeImageBytes in imageRenderService.ts): a thumbnail to show in the
@@ -502,6 +525,7 @@ export class CloudRenderSubmitService {
           await mkdir(path.dirname(path.join(libraryRoot, relative)), {
             recursive: true
           });
+          signal.throwIfAborted();
           await atomicWriteFile(
             path.join(libraryRoot, relative),
             image
@@ -518,7 +542,8 @@ export class CloudRenderSubmitService {
 
     const deliveredVideo = isImage
       ? null
-      : await this.probeRenderedVideo(absolutePath, this.libraryWork.signal);
+      : await this.probeRenderedVideo(absolutePath, signal);
+    signal.throwIfAborted();
     const deliveredVideoAssetFields = deliveredVideo
       ? toDeliveredVideoAssetFields(deliveredVideo, request.fps)
       : {};
@@ -532,6 +557,7 @@ export class CloudRenderSubmitService {
 
     const now = new Date();
     await this.manager.transaction(async (transaction) => {
+      signal.throwIfAborted();
       await transaction
         .update(assets)
         .set({
@@ -641,7 +667,7 @@ export class CloudRenderSubmitService {
         })
         .where(eq(cloudRenderJobs.id, input.jobId));
     });
-    this.libraryWork.capture();
+    signal.throwIfAborted();
     if (isImage) this.onImageAvailable?.(job.assetId, descriptionSession);
   }
 

@@ -24,7 +24,10 @@ const stubDesktop = (asset: ReturnType<typeof libraryAsset> | null) => {
     get: vi.fn().mockResolvedValue(asset),
     update: vi.fn().mockResolvedValue(asset)
   };
-  vi.stubGlobal("mago", { assets });
+  vi.stubGlobal("mago", {
+    assets,
+    library: { onWillChange: async () => {}, onDidChange: () => {} }
+  });
   return assets;
 };
 
@@ -52,7 +55,13 @@ describe("putImageAsset in the desktop app", () => {
 
     const response = await putImageAsset("asset-1", { rate: 2 });
 
-    expect(put).toHaveBeenCalledWith("/assets/asset-1", { rate: 2 });
+    expect(put).toHaveBeenCalledWith(
+      "/assets/asset-1",
+      { rate: 2 },
+      {
+        signal: expect.any(AbortSignal)
+      }
+    );
     expect(assets.update).toHaveBeenCalledWith({ assetId: "asset-1", rate: 2 });
     expect(response).toEqual({ s3_url: "https://cloud/asset-1" });
   });

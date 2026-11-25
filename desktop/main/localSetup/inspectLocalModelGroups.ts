@@ -15,6 +15,7 @@ import {
 import { readRunningComfyAvailability } from "./readRunningComfyAvailability";
 import { resolveModelGroupInstallState } from "./resolveModelGroupInstallState";
 import { resolveStarterEnginePaths } from "./resolveStarterEnginePaths";
+import type { SetupAttempt } from "./setupAttempt";
 
 export type InspectedModelGroup = {
   groupId: LocalModelGroupId;
@@ -42,7 +43,8 @@ export const inspectLocalModelGroups = async (
     | "recordInstalledModelGroup"
   > &
     Partial<Pick<LibrarySettings, "getComfyEndpoint">>,
-  selectedModelGroupVariantsOverride?: SelectedModelGroupVariants
+  selectedModelGroupVariantsOverride?: SelectedModelGroupVariants,
+  attempt?: SetupAttempt
 ): Promise<{
   isGetStartedInstall: boolean;
   localModelsRoot: string | null;
@@ -58,9 +60,15 @@ export const inspectLocalModelGroups = async (
       .then((info) => info.isFile())
       .catch(() => false));
   const installedModelGroups = await settings.getInstalledModelGroups();
+  const signal = attempt?.signal;
+  signal?.throwIfAborted();
   const runningAvailability = settings.getComfyEndpoint
-    ? await readRunningComfyAvailability(await settings.getComfyEndpoint())
+    ? await readRunningComfyAvailability(
+        await settings.getComfyEndpoint(),
+        signal
+      )
     : null;
+  signal?.throwIfAborted();
   const groups = await Promise.all(
     LOCAL_MODEL_GROUP_IDS.map(async (groupId) => {
       const items = listModelGroupItems({
@@ -89,11 +97,14 @@ export const inspectLocalModelGroups = async (
         resolved.shouldRecordAsInstalled &&
         !runningAvailability &&
         isInspectingSavedModelGroupVariants
-      )
-        await settings.recordInstalledModelGroup(
-          groupId,
-          items.map((item) => item.sha256)
-        );
+      ) {
+        const hashes = items.map((item) => item.sha256);
+        if (attempt)
+          await attempt.issue(() =>
+            settings.recordInstalledModelGroup(groupId, hashes, signal)
+          );
+        else await settings.recordInstalledModelGroup(groupId, hashes);
+      }
       return {
         groupId,
         state: resolved.state,
@@ -102,5 +113,6 @@ export const inspectLocalModelGroups = async (
       };
     })
   );
+  signal?.throwIfAborted();
   return { isGetStartedInstall, localModelsRoot, groups };
 };

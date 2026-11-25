@@ -1,12 +1,14 @@
 import { getLocalDesktopApi } from "@/platform/localDesktop";
 import {
   rendererLibrary,
+  runRendererLibraryRequest,
   type RendererLibraryWork
 } from "@/platform/rendererLibraryWork";
 
 import { classifyCloudRequestFailure } from "./classifyCloudRequestFailure";
 import { parseImg2ImgStatus, toImg2ImgJobStatus } from "./img2imgStatus";
 import { CloudApi } from "./mirrorService";
+import { rendererCloudBackgroundWork } from "./rendererCloudBackgroundWork";
 
 /**
  * The img2img counterpart of `pollCloudRenders`.
@@ -30,8 +32,9 @@ const bridge = () => getLocalDesktopApi();
 
 export const pollCloudImageRenders = async (
   api: CloudApi,
-  work: RendererLibraryWork = rendererLibrary.capture()
+  origin: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<PollOutcome> => {
+  const work = rendererCloudBackgroundWork(origin);
   await work.ready();
   const jobs = (
     await work.boundary(() => bridge().cloud.renders.listActive())
@@ -69,7 +72,7 @@ export const pollCloudImageRenders = async (
       const outputUrl = parsed.outputUrl;
       if (!outputUrl) continue; // Not downloadable yet; try next tick.
       try {
-        await work.boundary(() =>
+        await runRendererLibraryRequest(work, () =>
           bridge().cloud.renders.finish({
             jobId: job.id,
             url: outputUrl

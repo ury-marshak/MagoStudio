@@ -6,7 +6,7 @@ import { useDeleteQueueItem } from "@hooks/queue/useDeleteQueueItem";
 import { trackingUtils } from "@hooks/tracking/trackingUtils";
 import { Layer } from "@schemas/layer";
 
-import { rendererLibrary } from "@/platform/rendererLibraryWork";
+import { type RendererLibraryWork } from "@/platform/rendererLibraryWork";
 
 import { useFilteredAndSortedTracks } from "./useFilteredAndSortedTracks";
 import { useSetSelectedTrackIds } from "./useSetSelectedTrackIds";
@@ -26,9 +26,9 @@ export const useDeleteTrackFromProject = () => {
   } = useFilteredAndSortedTracks();
   const handleDeleteTrack = async (
     trackToDelete: Layer,
-    queue: QueueItem[] | undefined
+    queue: QueueItem[] | undefined,
+    work: RendererLibraryWork
   ) => {
-    const work = rendererLibrary.capture();
     await work.ready();
     work.check();
     const clip = getTrackClip(trackToDelete);
@@ -39,10 +39,11 @@ export const useDeleteTrackFromProject = () => {
     );
 
     if (queueItem) {
-      await deleteQueueItem({
-        queueItemId: queueItem.id,
-        shouldDeleteCloudOutputLayer: true
-      });
+      await deleteQueueItem(
+        { queueItemId: queueItem.id, shouldDeleteCloudOutputLayer: true },
+        work
+      );
+      work.check();
     }
 
     await deleteTrack(

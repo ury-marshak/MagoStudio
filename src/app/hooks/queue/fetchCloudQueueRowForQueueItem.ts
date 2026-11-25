@@ -7,7 +7,8 @@ import {
 } from "./utils/findCloudQueueRowForAsset";
 
 export const fetchCloudQueueRowForQueueItem = async (
-  queueItem: QueueItem
+  queueItem: QueueItem,
+  signal?: AbortSignal
 ): Promise<CloudQueueRow | null> => {
   const isTrackedByLocalCloudRenderJob =
     queueItem.local_cloud_render_job_id !== undefined;
@@ -31,7 +32,12 @@ export const fetchCloudQueueRowForQueueItem = async (
   }
   const cloudQueueRow = queueItem.cloud_asset_id
     ? findCloudQueueRowForAsset(
-        (await backendApiClient.get<unknown>("/queue")).data,
+        (
+          await backendApiClient.get<unknown>(
+            "/queue",
+            signal ? { signal } : undefined
+          )
+        ).data,
         queueItem.cloud_asset_id
       )
     : null;

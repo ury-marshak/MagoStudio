@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
+import { ProfileIoDrain } from "../providers/profileIoDrain";
 import type { VisionGenerator } from "../vlm/visionGenerator";
 
 import { ComfyScriptProjectClient } from "./comfyScriptProjectClient";
@@ -11,6 +13,7 @@ type Control = {
   planId: string;
   cancelled: boolean;
   abortController: AbortController;
+  signal: AbortSignal;
 };
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
@@ -35,14 +38,17 @@ const setup = (external?: VisionGenerator) => {
     put: vi.fn(async (input: { state?: Value }) => {
       if (input.state) state = structuredClone(input.state);
     }),
-    putPlan: vi.fn(async (_project: string, id: string, value: Value) => {
-      plans.set(id, structuredClone(value));
-    }),
+    putPlan: vi.fn<ScriptProjectSnapshotRepository["putPlan"]>(
+      async (_project, id, value) => {
+        plans.set(id, structuredClone(value));
+      }
+    ),
     getPlan: vi.fn(async (id: string) => plans.get(id)),
     resolveMediaPath: vi.fn(async () => "image.png"),
     storeRemoteMedia: vi.fn()
   };
   const jobs = { cancel: vi.fn(), submit: vi.fn(), refresh: vi.fn() };
+  const profileIo = new ProfileIoDrain();
   const service = new LocalScriptProjectService(
     projects as never,
     snapshots as never,
@@ -52,7 +58,11 @@ const setup = (external?: VisionGenerator) => {
     undefined,
     undefined,
     async () => external ?? null,
-    jobs as never
+    jobs as never,
+    undefined,
+    undefined,
+    undefined,
+    profileIo
   );
   const internals = service as unknown as {
     startRun: (
@@ -85,16 +95,260 @@ const setup = (external?: VisionGenerator) => {
     snapshots,
     plans,
     jobs,
+    profileIo,
     state: () => state,
     setState: (value: Value) => {
       state = value;
     }
   };
 };
+
+const setupCloudSheet = async () => {
+  const test = setup();
+  test.setState({
+    keys: [{ token: "hero", name: "Hero", prompt: "Hero", images: [] }],
+    shots: []
+  });
+  const result = await test.service.generateSheets({
+    projectId: "project",
+    isDryRun: false,
+    settings: { render_model: "gpt_image_2_t2i" }
+  });
+  const planId = String(result.plan_id);
+  const payload = {
+    planId,
+    token: "hero",
+    executionSession: (await test.service.getPlan(planId))
+      ?.local_execution_session
+  };
+  const update = (
+    operation: Parameters<LocalScriptProjectService["update"]>[0]["operation"],
+    profile?: AbortSignal,
+    extra?: Value
+  ) =>
+    test.service.update(
+      { projectId: "project", operation, payload: { ...payload, ...extra } },
+      undefined,
+      profile
+    );
+  return { ...test, planId, update };
+};
+
 afterEach(() => vi.restoreAllMocks());
+
+describe("Cloud sheet account checkpoint ownership", () => {
+  it("does not admit a submission marker after retirement during the step read", async () => {
+    const test = await setupCloudSheet();
+    const profile = new AbortController();
+    const readStarted = deferred<void>();
+    const finishRead = deferred<Value>();
+    const plan = test.plans.get(test.planId)!;
+    test.snapshots.getPlan
+      .mockResolvedValueOnce(plan)
+      .mockImplementationOnce(() => {
+        readStarted.resolve();
+        return finishRead.promise;
+      });
+    test.snapshots.putPlan.mockClear();
+    const begin = test.update("begin-cloud-sheet-submission", profile.signal);
+    const rejected = expect(begin).rejects.toBeInstanceOf(DOMException);
+    await readStarted.promise;
+    profile.abort();
+    finishRead.resolve(plan);
+    await rejected;
+    expect(test.snapshots.putPlan).not.toHaveBeenCalled();
+    await expect(
+      test.update("begin-cloud-sheet-submission", new AbortController().signal)
+    ).resolves.toMatchObject({ status: "RUNNING" });
+  });
+
+  it("does not write a marker after retirement during the repository read", async () => {
+    const test = await setupCloudSheet();
+    const profile = new AbortController();
+    const readStarted = deferred<void>();
+    const finishRead = deferred<Value[]>();
+    const update = vi.fn();
+    const database = {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            limit: () => {
+              readStarted.resolve();
+              return finishRead.promise;
+            }
+          })
+        })
+      }),
+      update
+    };
+    const repository = new ScriptProjectSnapshotRepository(
+      { get: () => database } as never,
+      async () => "mock-library",
+      { allowedHosts: [] }
+    );
+    test.snapshots.putPlan.mockImplementationOnce(repository.putPlan);
+    const begin = test.update("begin-cloud-sheet-submission", profile.signal);
+    const rejected = expect(begin).rejects.toBeInstanceOf(DOMException);
+    await readStarted.promise;
+    profile.abort();
+    finishRead.resolve([
+      {
+        projectId: "project",
+        stateJson: null,
+        scriptVersionsJson: null,
+        planDetailsJson: JSON.stringify(Object.fromEntries(test.plans)),
+        cutJson: null
+      }
+    ]);
+    await rejected;
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("drains an issued marker, keeps uncertainty, and still records accepted IDs", async () => {
+    const test = await setupCloudSheet();
+    const profile = new AbortController();
+    const committed = deferred<void>();
+    const finishWrite = deferred<void>();
+    test.snapshots.putPlan.mockImplementationOnce(
+      async (_project, id, plan) => {
+        test.plans.set(id, plan);
+        committed.resolve();
+        await finishWrite.promise;
+      }
+    );
+    const begin = test.update("begin-cloud-sheet-submission", profile.signal);
+    const rejected = expect(begin).rejects.toBeInstanceOf(DOMException);
+    await committed.promise;
+    profile.abort();
+    let drained = false;
+    const drain = test.profileIo.drainRetired().then(() => {
+      drained = true;
+    });
+    await flush();
+    expect(drained).toBe(false);
+    finishWrite.resolve();
+    await drain;
+    await rejected;
+    await expect(
+      test.update("begin-cloud-sheet-submission", new AbortController().signal)
+    ).rejects.toThrow("already recorded or may have been accepted");
+    await test.update("start-cloud-sheet-render", profile.signal, {
+      cloudClipId: "accepted",
+      cloudAssetId: "asset"
+    });
+    expect(test.plans.get(test.planId)?.steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          tool_name: "submit_img2img_batch",
+          status: "COMPLETED",
+          result: expect.objectContaining({
+            cloud_clip_id: "accepted",
+            cloud_asset_id: "asset"
+          })
+        })
+      ])
+    );
+  });
+
+  const image = {
+    id: "image",
+    url: "mago-media://script-project/image",
+    isImage: true
+  };
+  const output = { outputUrl: "https://mock/output.png" };
+
+  it("does not admit output completion after retirement during the snapshot read", async () => {
+    const test = await setupCloudSheet();
+    const profile = new AbortController();
+    const readStarted = deferred<void>();
+    const finishRead =
+      deferred<Awaited<ReturnType<typeof test.snapshots.get>>>();
+    const snapshot = await test.snapshots.get();
+    test.snapshots.storeRemoteMedia.mockImplementationOnce(async () => {
+      test.snapshots.get.mockImplementationOnce(() => {
+        readStarted.resolve();
+        return finishRead.promise;
+      });
+      return image;
+    });
+    test.snapshots.putPlan.mockClear();
+    const completion = test.update(
+      "add-cloud-sheet-render",
+      profile.signal,
+      output
+    );
+    const rejected = expect(completion).rejects.toBeInstanceOf(DOMException);
+    await readStarted.promise;
+    profile.abort();
+    await test.profileIo.drainRetired();
+    finishRead.resolve(snapshot);
+    await rejected;
+    expect(test.snapshots.storeRemoteMedia).toHaveBeenCalledWith(
+      "project",
+      output.outputUrl,
+      profile.signal
+    );
+    expect(test.snapshots.put).not.toHaveBeenCalled();
+    expect(test.snapshots.putPlan).not.toHaveBeenCalled();
+  });
+
+  it("drains admitted output completion through the final plan save", async () => {
+    const test = await setupCloudSheet();
+    const profile = new AbortController();
+    const writingSnapshot = deferred<void>();
+    const finishSnapshot = deferred<void>();
+    const writingFinalPlan = deferred<void>();
+    const finishFinalPlan = deferred<void>();
+    test.snapshots.storeRemoteMedia.mockResolvedValueOnce(image);
+    test.snapshots.put.mockImplementationOnce(async ({ state }) => {
+      writingSnapshot.resolve();
+      await finishSnapshot.promise;
+      test.setState(state!);
+    });
+    test.snapshots.putPlan.mockImplementation(async (_project, id, plan) => {
+      if (plan.status === "COMPLETED") {
+        writingFinalPlan.resolve();
+        await finishFinalPlan.promise;
+      }
+      test.plans.set(id, plan);
+    });
+    const completion = test.update(
+      "add-cloud-sheet-render",
+      profile.signal,
+      output
+    );
+    await writingSnapshot.promise;
+    profile.abort();
+    let drained = false;
+    const drain = test.profileIo.drainRetired().then(() => {
+      drained = true;
+    });
+    finishSnapshot.resolve();
+    await writingFinalPlan.promise;
+    expect(drained).toBe(false);
+    expect(test.snapshots.put).toHaveBeenCalledWith(
+      expect.objectContaining({ metadataOnly: true })
+    );
+    finishFinalPlan.resolve();
+    await drain;
+    await expect(completion).resolves.toMatchObject({
+      effective_asset_id: "image"
+    });
+    expect(test.plans.get(test.planId)).toMatchObject({
+      status: "COMPLETED",
+      steps: expect.arrayContaining([
+        expect.objectContaining({
+          tool_name: "poll_img2img_batch",
+          status: "COMPLETED"
+        })
+      ])
+    });
+  });
+});
 
 describe("Director plan library ownership", () => {
   it.each([
+    "begin-cloud-sheet-submission",
     "start-cloud-sheet-render",
     "add-cloud-sheet-render",
     "fail-cloud-sheet-render"
@@ -320,65 +574,76 @@ describe("Director plan library ownership", () => {
     expect(test.snapshots.get).not.toHaveBeenCalled();
   });
 
-  it("prevents detached body-plan classification from writing after teardown", async () => {
-    const test = setup();
-    const response = deferred<string>();
-    const classifier = vi
-      .spyOn(ComfyScriptProjectClient.prototype, "runVideoPrompt")
-      .mockReturnValue(response.promise);
-    const key = {
-      token: "hero",
-      name: "Hero",
-      kind: "character",
-      prompt: "courier",
-      seed_description: "seed",
-      effective_asset_id: "image",
-      images: [
-        {
-          asset_id: "image",
-          description: "hero",
-          description_source: "vlm",
-          has_description: true
-        }
-      ]
-    };
-    test.setState({ keys: [key], shots: [] });
-    const plan = {
-      id: "sheet",
-      steps: [
-        {
-          tool_name: "poll_img2img_batch",
-          tool_args: { token: "hero" },
-          status: "COMPLETED",
-          result: { asset_ids: ["image"] }
-        }
-      ]
-    };
-    await test.service.inLibrary(() =>
-      test.internals.renderSheets(
-        {
-          projectId: "project",
-          settings: { render_model: "qwen_image_2512_local" }
-        },
-        [key],
-        plan,
-        {
-          projectId: "project",
-          planId: "sheet",
-          cancelled: false,
-          abortController: new AbortController()
-        }
-      )
-    );
-    await vi.waitFor(() => expect(classifier).toHaveBeenCalledTimes(1));
-    const writes = test.snapshots.put.mock.calls.length;
-    await test.service.suspendPlans();
-    test.service.resetPlans();
-    response.resolve('{"body_plan":"upright"}');
-    await flush();
-    expect(test.snapshots.put).toHaveBeenCalledTimes(writes);
-    expect(test.state()).not.toMatchObject({
-      keys: [expect.objectContaining({ body_plan_auto: "upright" })]
-    });
-  });
+  it.each(["library", "inference profile"])(
+    "prevents detached body-plan classification from writing after %s retirement",
+    async (scope) => {
+      const test = setup();
+      const response = deferred<string>();
+      const classifier = vi
+        .spyOn(ComfyScriptProjectClient.prototype, "runVideoPrompt")
+        .mockReturnValue(response.promise);
+      const key = {
+        token: "hero",
+        name: "Hero",
+        kind: "character",
+        prompt: "courier",
+        seed_description: "seed",
+        effective_asset_id: "image",
+        images: [
+          {
+            asset_id: "image",
+            description: "hero",
+            description_source: "vlm",
+            has_description: true
+          }
+        ]
+      };
+      test.setState({ keys: [key], shots: [] });
+      const plan = {
+        id: "sheet",
+        steps: [
+          {
+            tool_name: "poll_img2img_batch",
+            tool_args: { token: "hero" },
+            status: "COMPLETED",
+            result: { asset_ids: ["image"] }
+          }
+        ]
+      };
+      const abortController = new AbortController();
+      const profile =
+        scope === "inference profile" ? new AbortController() : undefined;
+      await test.service.inLibrary(() =>
+        test.internals.renderSheets(
+          {
+            projectId: "project",
+            settings: { render_model: "qwen_image_2512_local" }
+          },
+          [key],
+          plan,
+          {
+            projectId: "project",
+            planId: "sheet",
+            cancelled: false,
+            abortController,
+            signal: abortController.signal,
+            ...(profile ? { profile: profile.signal } : {})
+          }
+        )
+      );
+      await vi.waitFor(() => expect(classifier).toHaveBeenCalledTimes(1));
+      const writes = test.snapshots.put.mock.calls.length;
+      if (profile) profile.abort();
+      else {
+        await test.service.suspendPlans();
+        test.service.resetPlans();
+      }
+      response.resolve('{"body_plan":"upright"}');
+      await flush();
+      expect(test.snapshots.put).toHaveBeenCalledTimes(writes);
+      expect(test.state()).not.toMatchObject({
+        keys: [expect.objectContaining({ body_plan_auto: "upright" })]
+      });
+    }
+  );
 });

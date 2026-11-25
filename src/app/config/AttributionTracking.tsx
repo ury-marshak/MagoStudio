@@ -4,6 +4,7 @@ import { useSession, useUser } from "@platform/identity";
 import { useEffect, useRef } from "react";
 
 import { isCloudAccountActive } from "@/platform/cloudAccount";
+import { captureRendererCloudAccountScope } from "@/platform/rendererCloudAccountScope";
 
 import { buildAttributionPatch } from "./utils/buildAttributionPatch";
 import { buildUtmMetadata } from "./utils/buildUtmMetadata";
@@ -31,8 +32,9 @@ export function AttributionTracking(): null {
   });
 
   useEffect(() => {
+    const account = captureRendererCloudAccountScope();
     if (
-      !isCloudAccountActive() ||
+      !account.isActive() ||
       typeof window === "undefined" ||
       !isLoaded ||
       !user
@@ -55,7 +57,7 @@ export function AttributionTracking(): null {
       const storedCountry = user.unsafeMetadata?.country as string | undefined;
       const sessions = storedCountry ? [] : await user.getSessions();
 
-      if (!isCloudAccountActive()) return;
+      if (!account.isActive()) return;
       const patch = buildAttributionPatch({
         pendingUtm,
         sessions,
@@ -68,10 +70,12 @@ export function AttributionTracking(): null {
       }
 
       await enrichUnsafeMetadata(user, patch);
+      if (!account.isActive()) return;
       localStorage.removeItem(UTM_STORAGE_KEY);
     };
 
     flush().catch((error) => {
+      if (!account.isActive()) return;
       hasFlushed.current = false;
       console.error("Failed to store attribution in unsafeMetadata:", error);
     });

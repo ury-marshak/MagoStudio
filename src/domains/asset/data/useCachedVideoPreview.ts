@@ -1,5 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { isLocalVideoUrl } from "../utils/isLocalVideoUrl";
 import { DOWNLOAD_PRIORITY } from "../utils/mediaDownloadScheduler";
 import { resolveCachedVideoPreview } from "../utils/resolveCachedVideoPreview";
@@ -29,7 +31,9 @@ export const useCachedVideoPreview = ({
   isError: boolean;
   isVideoAvailable: boolean;
 } => {
-  useAssetDownloadPriority(assetId, enabled && !!videoUrl, priority);
+  const { work, libraryVersion } = useRendererLibraryWork();
+  const active = !work.signal.aborted;
+  useAssetDownloadPriority(assetId, active && enabled && !!videoUrl, priority);
   const {
     data: preview,
     isLoading,
@@ -40,29 +44,35 @@ export const useCachedVideoPreview = ({
       assetId,
       fps,
       loadVideo,
-      isLocalVideoUrl(videoUrl)
+      isLocalVideoUrl(videoUrl),
+      libraryVersion
     ],
     queryFn: () =>
-      resolveCachedVideoPreview({
-        assetId: assetId!,
-        videoUrl: videoUrl!,
-        fps,
-        loadVideo
-      }),
-    enabled: enabled && !!assetId && !!videoUrl,
+      resolveCachedVideoPreview(
+        {
+          assetId: assetId!,
+          videoUrl: videoUrl!,
+          fps,
+          loadVideo
+        },
+        work
+      ),
+    enabled: active && enabled && !!assetId && !!videoUrl,
     staleTime: Infinity,
     gcTime: Infinity
   });
 
   return {
     isVideoAvailable:
-      isLocalVideoUrl(videoUrl) || preview?.isVideoAvailable === true,
+      active &&
+      (isLocalVideoUrl(videoUrl) || preview?.isVideoAvailable === true),
     isLoading,
     isError,
     videoFirstFrameUrl: preview?.firstFrameUrl ?? undefined,
-    playableVideoUrl: loadVideo
-      ? (preview?.videoObjectUrl ??
-        (isLocalVideoUrl(videoUrl) ? videoUrl : undefined))
-      : undefined
+    playableVideoUrl:
+      active && loadVideo
+        ? (preview?.videoObjectUrl ??
+          (isLocalVideoUrl(videoUrl) ? videoUrl : undefined))
+        : undefined
   };
 };

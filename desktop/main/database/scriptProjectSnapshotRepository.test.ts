@@ -14,6 +14,7 @@ vi.mock("electron", () => ({
 }));
 
 import type { FetchCloudStorage } from "../cloudStorage/fetchCloudStorageObject";
+import { ProfileIoDrain } from "../providers/profileIoDrain";
 
 import { DatabaseManager } from "./databaseManager";
 import { ProjectRepository } from "./projectRepository";
@@ -24,6 +25,14 @@ import {
 } from "./scriptProjectSnapshotRepository";
 
 const CLOUD_STORAGE_HOST = "mago-s3-prod.s3.eu-north-1.amazonaws.com";
+
+const deferred = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
 
 const temporaryDirectories: string[] = [];
 const managers: DatabaseManager[] = [];
@@ -39,6 +48,154 @@ afterEach(async () => {
 });
 
 describe("ScriptProjectSnapshotRepository", () => {
+  describe("Cloud profile I/O", () => {
+    const setupProfile = (
+      root = "/fixture",
+      fetchFromCloudStorage?: FetchCloudStorage
+    ) => {
+      const profile = new AbortController();
+      const profileIo = new ProfileIoDrain();
+      const read = vi.fn<() => Promise<Record<string, unknown>[]>>(
+        async () => []
+      );
+      const insert = vi.fn<() => Promise<void>>(async () => {});
+      const update = vi.fn<() => Promise<void>>(async () => {});
+      const database = {
+        select: () => ({ from: () => ({ where: () => ({ limit: read }) }) }),
+        insert: () => ({
+          values: () => ({
+            onConflictDoNothing: () => ({ run: insert }),
+            onConflictDoUpdate: () => ({ run: insert })
+          })
+        }),
+        update: () => ({ set: () => ({ where: () => ({ run: update }) }) })
+      };
+      const snapshots = new ScriptProjectSnapshotRepository(
+        { get: () => database } as unknown as DatabaseManager,
+        async () => root,
+        { allowedHosts: [CLOUD_STORAGE_HOST], fetchFromCloudStorage },
+        profileIo
+      );
+      return { profile, profileIo, read, insert, update, snapshots };
+    };
+    const importInput = {
+      projectId: "fixture",
+      intent: "cloud-import" as const,
+      metadataOnly: true,
+      project: { name: "Fixture" },
+      state: { saved: true }
+    };
+
+    test.each(["project", "snapshot"])(
+      "does not admit a %s upsert after its read crosses retirement",
+      async (phase) => {
+        const { profile, profileIo, read, insert, snapshots } = setupProfile();
+        const lookup = deferred<Record<string, unknown>[]>();
+        if (phase === "snapshot") read.mockResolvedValueOnce([]);
+        read.mockReturnValueOnce(lookup.promise);
+        const failed = expect(
+          snapshots.put(importInput, profile.signal)
+        ).rejects.toMatchObject({ name: "AbortError" });
+        await vi.waitFor(() =>
+          expect(read).toHaveBeenCalledTimes(phase === "snapshot" ? 2 : 1)
+        );
+        profile.abort();
+        await profileIo.drainRetired();
+        lookup.resolve([]);
+        await failed;
+        expect(insert).toHaveBeenCalledTimes(phase === "snapshot" ? 1 : 0);
+        // An ordinary metadata edit does not inherit authorization from the Cloud profile.
+        await snapshots.put(
+          { projectId: "fixture", metadataOnly: true, state: { edited: true } },
+          profile.signal
+        );
+        expect(insert).toHaveBeenCalledTimes(phase === "snapshot" ? 3 : 2);
+      }
+    );
+
+    test.each(["project", "snapshot"])(
+      "drains an already issued %s upsert",
+      async (phase) => {
+        const { profile, profileIo, insert, snapshots } = setupProfile();
+        const write = deferred<void>();
+        if (phase === "snapshot") insert.mockResolvedValueOnce(undefined);
+        insert.mockReturnValueOnce(write.promise);
+        const count = phase === "snapshot" ? 2 : 1;
+        const failed = expect(
+          snapshots.put(importInput, profile.signal)
+        ).rejects.toMatchObject({ name: "AbortError" });
+        await vi.waitFor(() => expect(insert).toHaveBeenCalledTimes(count));
+        profile.abort();
+        const drained = vi.fn();
+        const drain = profileIo.drainRetired().then(drained);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(drained).not.toHaveBeenCalled();
+        write.resolve();
+        await Promise.all([drain, failed]);
+        expect(insert).toHaveBeenCalledTimes(count);
+      }
+    );
+
+    test("drains a cache-hit preview write already issued", async () => {
+      const url = `https://${CLOUD_STORAGE_HOST}/assets/hit.png`;
+      const root = await mkdtemp(path.join(tmpdir(), "mago-script-profile-"));
+      temporaryDirectories.push(root);
+      await writeFile(path.join(root, "hit.png"), "fixture bytes");
+      const { profile, profileIo, read, update, snapshots } =
+        setupProfile(root);
+      read.mockResolvedValueOnce([{ id: "hit", relativePath: "hit.png" }]);
+      const write = deferred<void>();
+      update.mockReturnValueOnce(write.promise);
+      const failed = expect(
+        snapshots.cacheScheduledMedia("fixture", url, profile.signal)
+      ).rejects.toMatchObject({ name: "AbortError" });
+      await vi.waitFor(() => expect(update).toHaveBeenCalledOnce());
+      profile.abort();
+      const drained = vi.fn();
+      const drain = profileIo.drainRetired().then(drained);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(drained).not.toHaveBeenCalled();
+      write.resolve();
+      await Promise.all([drain, failed]);
+    });
+
+    test.each(["import", "cache"])(
+      "drains the %s transport through late body cancellation",
+      async (route) => {
+        const url = `https://${CLOUD_STORAGE_HOST}/assets/late.png`;
+        const headers = deferred<Response>();
+        const closing = deferred<void>();
+        const cancel = vi.fn(() => closing.promise);
+        const fetch = vi.fn<FetchCloudStorage>(() => headers.promise);
+        const { profile, profileIo, insert, update, snapshots } = setupProfile(
+          "/fixture",
+          fetch
+        );
+        const pending =
+          route === "import"
+            ? snapshots.put(
+                { ...importInput, metadataOnly: false, state: { url } },
+                profile.signal
+              )
+            : snapshots.cacheScheduledMedia("fixture", url, profile.signal);
+        const failed = expect(pending).rejects.toMatchObject({
+          name: "AbortError"
+        });
+        await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+        profile.abort();
+        const drained = vi.fn();
+        const drain = profileIo.drainRetired().then(drained);
+        headers.resolve(new Response(new ReadableStream({ cancel })));
+        await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+        expect(drained).not.toHaveBeenCalled();
+        closing.resolve();
+        await Promise.all([drain, failed]);
+        expect(insert).toHaveBeenCalledTimes(route === "import" ? 1 : 0);
+        expect(update).not.toHaveBeenCalled();
+      }
+    );
+  });
+
   test("looks up only the requested plan, tolerating invalid maps and literal keys", async () => {
     const { manager, snapshots } = await openSnapshotRepository();
     await snapshots.put({

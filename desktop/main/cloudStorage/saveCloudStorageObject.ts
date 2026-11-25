@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
@@ -5,32 +6,32 @@ import { pipeline } from "node:stream/promises";
 import { publishFile } from "../storage/atomicFile";
 
 import type { FetchCloudStorage } from "./fetchCloudStorageObject";
-import { openCloudStorageDownload } from "./openCloudStorageDownload";
+import { withCloudStorageDownload } from "./openCloudStorageDownload";
 
 export const saveCloudStorageObject = async ({
   url,
   allowedHosts,
   destinationPath,
   assertAccess,
-  fetchFromCloudStorage
+  fetchFromCloudStorage,
+  signal
 }: {
   url: unknown;
   allowedHosts: readonly string[];
   destinationPath: string;
   assertAccess?: () => Promise<void>;
   fetchFromCloudStorage?: FetchCloudStorage;
+  signal?: AbortSignal;
 }): Promise<void> => {
-  const download = await openCloudStorageDownload({
-    url,
-    allowedHosts,
-    assertAccess,
-    fetchFromCloudStorage
-  });
-
-  const partialPath = `${destinationPath}.partial`;
+  const partialPath = `${destinationPath}.${randomUUID()}.partial`;
   try {
-    await pipeline(download.body, createWriteStream(partialPath));
-    await publishFile(partialPath, destinationPath);
+    await withCloudStorageDownload(
+      { url, allowedHosts, assertAccess, fetchFromCloudStorage, signal },
+      ({ body }) => pipeline(body, createWriteStream(partialPath), { signal })
+    );
+    // The body and file writer are closed before publication. Once the
+    // rename succeeds, cancellation cannot retract the completed export.
+    await publishFile(partialPath, destinationPath, signal);
   } catch (error) {
     await unlink(partialPath).catch(() => undefined);
     throw error;

@@ -1,4 +1,5 @@
 /* oxlint-disable eslint/no-magic-numbers -- screenplay limits, hashes and progress percentages are domain constants kept next to their use */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 
 import type {
@@ -30,11 +31,13 @@ import {
 import { falVideoTailEstimate } from "../../shared/falVideoTailPricing";
 import type { RunCloudTextModel } from "../../shared/textModelRequest";
 import { probeRenderedVideoMetadata } from "../cloud/probeRenderedVideoMetadata";
+import { ComfyClient, createProfileComfyClient } from "../comfy/ComfyClient";
 import { ProjectRepository } from "../database/projectRepository";
 import { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import { probeComfyRenderModel } from "../imageRenders/comfyModelValidation";
 import { LibraryWorkSession } from "../libraryWorkSession";
 import type { ExternalRenderJobService } from "../providers/externalRenderJobService";
+import type { ProfileIoDrain } from "../providers/profileIoDrain";
 import {
   SharedInference,
   waitForInference
@@ -63,7 +66,8 @@ import {
   LocalH3Steps,
   LocalH3TextEncoder,
   LOCAL_SCRIPT_TEXT_MODEL_FILES,
-  resolveLocalScriptImageModel
+  resolveLocalScriptImageModel,
+  type ScriptComfySubmission
 } from "./comfyScriptProjectClient";
 import {
   concatenateVideos,
@@ -93,6 +97,16 @@ import {
   sheetSpecsInFlight,
   REFERENCE_INSTRUCTION_PREFIX
 } from "./sheets/planSheetRun";
+import {
+  decodedPngDimensions,
+  FAL_OPENING_FRAME_POLICY,
+  falOpeningFrameSchema,
+  hasUnboundImageNumber,
+  isFalOpeningPin,
+  numberedContinuitySlots,
+  openingFrameMatchesAspect,
+  openingFrameMismatch
+} from "./shots/falOpeningFrame";
 import {
   FAL_SHOT_IMAGE_SLOTS,
   renderFalShot,
@@ -205,7 +219,8 @@ export const resolveCastOptions = (
 type DescribeEntityImage = (
   sourcePath: string,
   kind: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  profile?: AbortSignal
 ) => Promise<string>;
 
 const record = (value: unknown): JsonRecord | null =>
@@ -331,12 +346,27 @@ export const ensureDesignMasterKeys = (
 
 const nowIso = (): string => new Date().toISOString();
 
+const UNCERTAIN_COMFY_SUBMISSION =
+  "ComfyUI may have accepted this render. Check its queue/history before cancelling the plan and starting a new render.";
+
+const savedComfySubmission = (step?: JsonRecord): JsonRecord | null => {
+  const saved = record(step?.local_comfy_submission);
+  if (saved && textValue(saved.prompt_id, "") && textValue(saved.endpoint, ""))
+    return saved;
+  // Older plans marked the submit step complete before making the POST.
+  // Without a checkpoint we cannot know whether those prompts were accepted.
+  if (saved || completedStep(step)) throw new Error(UNCERTAIN_COMFY_SUBMISSION);
+  return null;
+};
+
 type RunControl = {
   planId: string;
   projectId: string;
   cancelled: boolean;
   recovering?: boolean;
   abortController: AbortController;
+  signal: AbortSignal;
+  profile?: AbortSignal;
 };
 
 type LocalPlanOperation = "cast" | "sheets" | "shots" | "cut";
@@ -464,12 +494,10 @@ const LOCAL_H3_IMAGE_REFERENCE_SLOTS = 9;
 const referenceImageSlotBudget = (
   sequential: JsonRecord | null,
   hasStoryboard: boolean,
-  maxSlots = LOCAL_H3_IMAGE_REFERENCE_SLOTS
+  isFal: boolean
 ): number =>
-  maxSlots -
-  (sequential?.mode === "last_frame" || sequential?.mode === "key_frames"
-    ? 1
-    : 0) -
+  (isFal ? FAL_SHOT_IMAGE_SLOTS : LOCAL_H3_IMAGE_REFERENCE_SLOTS) -
+  numberedContinuitySlots(sequential, isFal) -
   Number(hasStoryboard);
 
 /** Mago Cloud sheet models a signed-in local project may render with. */
@@ -496,7 +524,11 @@ export class LocalScriptProjectService {
     >(),
     queuedRuns: new Map<
       string,
-      Array<{ planId: string; task: (control: RunControl) => Promise<void> }>
+      Array<{
+        planId: string;
+        task: (control: RunControl) => Promise<void>;
+        profile?: AbortSignal;
+      }>
     >(),
     rendererPlanWaiters: new Map<string, () => void>(),
     storyboardRequests: new Set<string>(),
@@ -506,6 +538,14 @@ export class LocalScriptProjectService {
   private get projectRuns() {
     return this.planWork.state.projectRuns;
   }
+  private readonly inferenceOrigin = new AsyncLocalStorage<
+    AbortSignal | undefined
+  >();
+  private readonly descriptionProfiles = new WeakMap<AbortSignal, string>();
+  private readonly inferenceWrites = new WeakMap<
+    AbortSignal,
+    Set<Promise<unknown>>
+  >();
   private readonly pendingDescriptions = new Map<string, Promise<JsonRecord>>();
   private descriptionLifetime = new AbortController();
   private sharedDescriptions = new SharedInference<JsonRecord>();
@@ -532,31 +572,45 @@ export class LocalScriptProjectService {
   constructor(
     private readonly projects: ProjectRepository,
     private readonly snapshots: ScriptProjectSnapshotRepository,
-    private readonly getComfyEndpoint: () => Promise<string>,
+    private readonly getComfyEndpoint: (
+      signal?: AbortSignal
+    ) => Promise<string>,
     private readonly getScriptTextModel: () => Promise<LocalScriptTextModel> = async () =>
       "qwen38-27b-q5",
     private readonly describeEntityImage?: DescribeEntityImage,
-    private readonly runCloudTextModel: RunCloudTextModel = async () => null,
+    private readonly runCloudTextModel: (
+      ...args: [...Parameters<RunCloudTextModel>, signal?: AbortSignal]
+    ) => ReturnType<RunCloudTextModel> = async () => null,
     private readonly evaluateShotVideo?: (
       input: ShotVideoEvaluationInput,
       signal?: AbortSignal
     ) => Promise<JsonRecord>,
-    private readonly getExternalTextGenerator?: () => Promise<VisionGenerator | null>,
+    private readonly getExternalTextGenerator?: (
+      signal?: AbortSignal
+    ) => Promise<VisionGenerator | null>,
     private readonly externalRenderJobs?: ExternalRenderJobService,
     private readonly describeExternalEntityImage?: DescribeEntityImage,
     private readonly getFalGenerationDefaults?: () => Promise<
       FalGenerationDefaults | undefined
-    >
+    >,
+    private readonly captureInferenceProfile?: () => AbortSignal,
+    private readonly profileIo?: Pick<ProfileIoDrain, "run">
   ) {
     // All repository boundaries retain the session of their caller, including
     // detached classification/media continuations. Drain these boundaries, not
     // provider inference, before DatabaseManager replaces its mutable handle.
     this.projects = this.planWork.guard(projects);
-    this.snapshots = this.planWork.guard(snapshots);
+    this.snapshots = this.guardInference(this.planWork.guard(snapshots));
     if (externalRenderJobs)
-      this.externalRenderJobs = this.planWork.guard(externalRenderJobs, false);
+      this.externalRenderJobs = this.guardInference(
+        this.planWork.guard(externalRenderJobs, false)
+      );
     this.getSnapshot = this.planWork.bind(this.getSnapshot.bind(this));
-    this.cast = this.planWork.bind(this.cast.bind(this));
+    const cast = this.cast.bind(this);
+    this.cast = this.planWork.bind((input, origin) => {
+      const profile = origin ?? this.captureInferenceProfile?.();
+      return this.inferenceOrigin.run(profile, () => cast(input, profile));
+    });
     this.cancelPlan = this.planWork.bind(this.cancelPlan.bind(this));
     const getPlan = this.getPlan.bind(this);
     this.getPlan = this.planWork.bind(
@@ -600,6 +654,88 @@ export class LocalScriptProjectService {
     });
   }
 
+  /** Guard repository dispatch, including detached continuations of a run. */
+  private guardInference<T extends object>(target: T): T {
+    return new Proxy(target, {
+      get: (object, key) => {
+        const value: unknown = Reflect.get(object, key);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          const profile = this.inferenceOrigin.getStore();
+          // The fal wait helper normally treats an aborted caller as an explicit
+          // cancellation. Never send that cancellation for a retired profile.
+          if (key === "cancel" && profile?.aborted)
+            return Promise.reject(profile.reason);
+          profile?.throwIfAborted();
+          const result: unknown = Reflect.apply(value, object, args);
+          if (
+            profile &&
+            typeof key === "string" &&
+            [
+              "put",
+              "putPlan",
+              "storeGeneratedMedia",
+              "registerGeneratedAsset"
+            ].includes(key)
+          ) {
+            const operation = Promise.resolve(result);
+            const writes = this.inferenceWrites.get(profile) ?? new Set();
+            this.inferenceWrites.set(profile, writes);
+            writes.add(operation);
+            const finished = () => writes.delete(operation);
+            void operation.then(finished, finished);
+          }
+          return result;
+        };
+      }
+    });
+  }
+
+  async drainInferenceProfile(profile: AbortSignal): Promise<void> {
+    const writes = this.inferenceWrites.get(profile);
+    if (writes) await Promise.allSettled(writes);
+  }
+
+  private comfyClient(
+    endpoint: string,
+    profile?: AbortSignal,
+    model?: LocalScriptTextModel
+  ) {
+    profile?.throwIfAborted();
+    const library = this.planWork.capture();
+    const signal = profile ? AbortSignal.any([profile, library]) : library;
+    const comfy = profile
+      ? createProfileComfyClient(endpoint, profile, library)
+      : new ComfyClient(endpoint, undefined, library);
+    return new ComfyScriptProjectClient(endpoint, model, comfy, signal);
+  }
+
+  private ownedInference<T>(
+    control: RunControl,
+    run: () => Promise<T>
+  ): Promise<T> {
+    this.throwIfCancelled(control);
+    return waitForInference(
+      Promise.resolve().then(() => {
+        this.throwIfCancelled(control);
+        return run();
+      }),
+      control.signal
+    );
+  }
+
+  private async comfyEndpoint(
+    signal?: AbortSignal,
+    profile = signal
+  ): Promise<string> {
+    signal?.throwIfAborted();
+    const lookup = Promise.resolve().then(() => {
+      signal?.throwIfAborted();
+      return this.getComfyEndpoint(profile);
+    });
+    return signal ? waitForInference(lookup, signal) : lookup;
+  }
+
   inLibrary<Result>(operation: () => Promise<Result>): Promise<Result> {
     return this.planWork.run(operation);
   }
@@ -608,12 +744,19 @@ export class LocalScriptProjectService {
     return this.planWork.boundary(operation);
   }
 
-  async putSnapshot(input: LocalScriptProjectSnapshotInput): Promise<void> {
-    await this.snapshots.put(input);
+  async putSnapshot(
+    input: LocalScriptProjectSnapshotInput,
+    profile?: AbortSignal
+  ): Promise<void> {
+    await this.snapshots.put(input, profile);
   }
 
-  async cacheMedia(projectId: string, sourceUrl: string): Promise<void> {
-    await this.snapshots.cacheScheduledMedia(projectId, sourceUrl);
+  async cacheMedia(
+    projectId: string,
+    sourceUrl: string,
+    profile?: AbortSignal
+  ): Promise<void> {
+    await this.snapshots.cacheScheduledMedia(projectId, sourceUrl, profile);
   }
 
   async cancelMedia(projectId: string, sourceUrl: string): Promise<void> {
@@ -823,8 +966,10 @@ export class LocalScriptProjectService {
   }
 
   async cast(
-    rawInput: LocalScriptCastInput
+    rawInput: LocalScriptCastInput,
+    profile?: AbortSignal
   ): Promise<{ version: number; plan_id: string }> {
+    profile?.throwIfAborted();
     const input = resolveCastOptions(rawInput);
     await this.assertLocalProject(input.projectId);
     this.assertIdle(input.projectId);
@@ -863,7 +1008,9 @@ export class LocalScriptProjectService {
       { ...input, version },
       steps
     );
+    profile?.throwIfAborted();
     await this.snapshots.putPlan(input.projectId, planId, plan);
+    profile?.throwIfAborted();
     // POST /projects/:id/script records the version, and makes it the active
     // one, as soon as casting starts — not when it finishes.
     await this.snapshots.put({
@@ -885,13 +1032,24 @@ export class LocalScriptProjectService {
         ]
       }
     });
-    this.startRun(input.projectId, planId, (control) =>
-      this.runCastingPlan(input, version, plan, control)
+    this.startRun(
+      input.projectId,
+      planId,
+      (control) => this.runCastingPlan(input, version, plan, control),
+      profile
     );
+    profile?.throwIfAborted();
     return { version, plan_id: planId };
   }
 
-  async cancelPlan(planId: string): Promise<JsonRecord> {
+  async cancelPlan(planId: string, profile?: AbortSignal): Promise<JsonRecord> {
+    if (!profile && this.captureInferenceProfile) {
+      try {
+        profile = this.captureInferenceProfile();
+      } catch (error) {
+        profile = AbortSignal.abort(error);
+      }
+    }
     const plan = await this.requireLocallyRunPlan(planId);
     const projectId = String(plan.project_id);
     const running = this.projectRuns.get(projectId);
@@ -916,7 +1074,7 @@ export class LocalScriptProjectService {
     await this.snapshots.putPlan(projectId, planId, updated);
     this.releaseRenderer(planId);
     const jobs = this.externalRenderJobs;
-    if (jobs && running?.control.planId !== planId) {
+    if (jobs && running?.control.planId !== planId && !profile?.aborted) {
       for (const step of records(plan.steps)) {
         if (
           step.tool_name !== "submit_video_render" &&
@@ -928,11 +1086,16 @@ export class LocalScriptProjectService {
           void jobs
             .get(id)
             .then((job) =>
-              job?.status === "SUBMITTED" ? jobs.cancel(id) : null
+              job?.status === "SUBMITTED" && !profile?.aborted
+                ? profile
+                  ? jobs.cancel(id, profile)
+                  : jobs.cancel(id)
+                : null
             )
-            .catch((error: unknown) =>
-              console.warn("Could not cancel external render", error)
-            );
+            .catch((error: unknown) => {
+              if (!profile?.aborted)
+                console.warn("Could not cancel external render", error);
+            });
       }
     }
     return updated;
@@ -978,10 +1141,12 @@ export class LocalScriptProjectService {
 
   async recoverExternalRenderPlans(): Promise<void> {
     if (!this.externalRenderJobs) return;
+    const profile = this.captureInferenceProfile?.();
     for (const projectId of await this.snapshots.listProjectIds()) {
       if (this.projectRuns.has(projectId)) continue;
       const snapshot = await this.snapshots.get(projectId);
       for (const plan of Object.values(snapshot?.planDetails ?? {})) {
+        profile?.throwIfAborted();
         if (
           !["PENDING", "RUNNING", "PAUSED"].includes(textValue(plan.status, ""))
         )
@@ -1004,10 +1169,12 @@ export class LocalScriptProjectService {
         );
         const id = textValue(submit?.id, "");
         const job = id ? await this.externalRenderJobs.get(id) : null;
+        profile?.throwIfAborted();
         if (!job) continue;
         const planId = textValue(plan.id, "");
         if (!planId) continue;
         const recovered = await this.getPlan(planId);
+        profile?.throwIfAborted();
         if (recovered?.status !== "PAUSED") continue;
         if (
           job.status === "SUBMISSION_UNKNOWN" ||
@@ -1025,7 +1192,8 @@ export class LocalScriptProjectService {
           continue;
         }
         if (recoverableExternalRenderStatuses.has(job.status)) {
-          await this.resumePlan(planId, true);
+          profile?.throwIfAborted();
+          await this.resumePlan(planId, true, profile);
           break;
         }
       }
@@ -1037,7 +1205,6 @@ export class LocalScriptProjectService {
     tool: string,
     targets: Set<string>
   ): Promise<void> {
-    if (!this.externalRenderJobs) return;
     for (const plan of plans) {
       if (
         !["PAUSED", "FAILED", "PENDING", "RUNNING"].includes(
@@ -1052,7 +1219,29 @@ export class LocalScriptProjectService {
           textValue(record(step.tool_args)?.token, "");
         if (!targets.has(target)) continue;
         const id = textValue(step.id, "");
-        const job = id ? await this.externalRenderJobs.get(id) : null;
+        const poll =
+          tool === "submit_video_render"
+            ? this.findStep(plan, "poll_video_render", target)
+            : this.findStep(plan, "poll_img2img_batch", undefined, target);
+        const request = record(plan.local_request);
+        const sheetModel = textValue(
+          record(request?.settings)?.render_model,
+          ""
+        );
+        const isLegacy =
+          plan.local_executor !== CLOUD_SHEET_EXECUTOR &&
+          !(tool === "submit_video_render"
+            ? record(request?.videoSettings)?.render_provider ===
+              FAL_SHOT_PROVIDER
+            : isFalSheetModel(sheetModel) ||
+              CLOUD_SHEET_RENDER_MODELS.has(sheetModel));
+        if (isLegacy && !completedStep(poll)) {
+          if (savedComfySubmission(step))
+            throw new Error(
+              "An earlier ComfyUI render is still pending. Resume its plan to retrieve it."
+            );
+        }
+        const job = id ? await this.externalRenderJobs?.get(id) : null;
         if (
           job?.status === "SUBMITTING" ||
           job?.status === "SUBMISSION_UNKNOWN"
@@ -1061,10 +1250,6 @@ export class LocalScriptProjectService {
             "fal may have accepted an earlier render for this item. Review fal's request history and cancel the earlier plan before starting a new render."
           );
         if (job && recoverableExternalRenderStatuses.has(job.status)) {
-          const poll =
-            tool === "submit_video_render"
-              ? this.findStep(plan, "poll_video_render", target)
-              : this.findStep(plan, "poll_img2img_batch", undefined, target);
           if (!completedStep(poll))
             throw new Error(
               "An earlier fal render is still pending for this item. Resume or cancel its plan before starting a new render."
@@ -1074,8 +1259,29 @@ export class LocalScriptProjectService {
     }
   }
 
-  async resumePlan(planId: string, recovering = false): Promise<JsonRecord> {
+  async resumePlan(
+    planId: string,
+    recovering = false,
+    origin?: AbortSignal
+  ): Promise<JsonRecord> {
+    // Capture before loading the plan, but do not require inference admission for exports.
+    let profile = origin;
+    let admissionError: unknown;
+    try {
+      profile ??= this.captureInferenceProfile?.();
+    } catch (error) {
+      admissionError = error;
+    }
     const plan = await this.requireLocallyRunPlan(planId);
+    if (
+      plan.local_operation === "cut" ||
+      plan.local_executor === CLOUD_SHEET_EXECUTOR
+    )
+      profile = undefined;
+    else {
+      if (admissionError) throw admissionError;
+      profile?.throwIfAborted();
+    }
     const projectId = String(plan.project_id);
     await this.assertLocalProject(projectId);
     this.assertIdle(projectId);
@@ -1096,7 +1302,10 @@ export class LocalScriptProjectService {
         : step
     );
     const pending = planAt(resumed, "PENDING");
-    await this.snapshots.putPlan(projectId, planId, pending);
+    profile?.throwIfAborted();
+    await this.inferenceOrigin.run(profile, () =>
+      this.snapshots.putPlan(projectId, planId, pending)
+    );
     const request = record(plan.local_request);
     const operation = plan.local_operation;
     if (!request)
@@ -1110,45 +1319,51 @@ export class LocalScriptProjectService {
       );
       return pending;
     }
-    this.startRun(projectId, planId, async (control) => {
-      control.recovering = recovering;
-      if (operation === "cast") {
-        await this.runCastingPlan(
-          request as unknown as LocalScriptCastInput,
-          Number(request.version),
-          pending,
-          control
-        );
-      } else if (operation === "sheets") {
-        const input = request as unknown as LocalScriptSheetsInput;
-        // The planned targets carry their prompt and spec; a plan made
-        // before they were stored re-derives its keys from the request.
-        const planned = records(plan.local_targets);
-        const snapshot = await this.requireSnapshot(projectId);
-        const keys = planned.length
-          ? planned
-          : records(snapshot.state?.keys).filter(
-              (key) =>
-                !input.tokens?.length ||
-                input.tokens.includes(String(key.token))
-            );
-        await this.renderSheets(input, keys, pending, control);
-      } else if (operation === "shots") {
-        const input = request as unknown as LocalScriptShotsInput;
-        const shots = records(plan.local_targets);
-        await this.renderShots(input, shots, pending, control);
-      } else if (operation === "cut") {
-        await this.runCutExport(
-          request as unknown as LocalScriptCutExportInput,
-          strings(plan.local_paths),
-          textValue(plan.local_fingerprint, ""),
-          pending,
-          control
-        );
-      } else {
-        throw new Error("Unknown local plan operation");
-      }
-    });
+    this.startRun(
+      projectId,
+      planId,
+      async (control) => {
+        control.recovering = recovering;
+        if (operation === "cast") {
+          await this.runCastingPlan(
+            request as unknown as LocalScriptCastInput,
+            Number(request.version),
+            pending,
+            control
+          );
+        } else if (operation === "sheets") {
+          const input = request as unknown as LocalScriptSheetsInput;
+          // The planned targets carry their prompt and spec; a plan made
+          // before they were stored re-derives its keys from the request.
+          const planned = records(plan.local_targets);
+          const snapshot = await this.requireSnapshot(projectId);
+          const keys = planned.length
+            ? planned
+            : records(snapshot.state?.keys).filter(
+                (key) =>
+                  !input.tokens?.length ||
+                  input.tokens.includes(String(key.token))
+              );
+          await this.renderSheets(input, keys, pending, control);
+        } else if (operation === "shots") {
+          const input = request as unknown as LocalScriptShotsInput;
+          const shots = records(plan.local_targets);
+          await this.renderShots(input, shots, pending, control);
+        } else if (operation === "cut") {
+          await this.runCutExport(
+            request as unknown as LocalScriptCutExportInput,
+            strings(plan.local_paths),
+            textValue(plan.local_fingerprint, ""),
+            pending,
+            control
+          );
+        } else {
+          throw new Error("Unknown local plan operation");
+        }
+      },
+      profile
+    );
+    profile?.throwIfAborted();
     return pending;
   }
 
@@ -1187,12 +1402,30 @@ export class LocalScriptProjectService {
     return null;
   }
 
-  async generateSheets(input: LocalScriptSheetsInput): Promise<JsonRecord> {
-    return this.generateSheetsInternal(input);
+  async generateSheets(
+    input: LocalScriptSheetsInput,
+    origin?: AbortSignal
+  ): Promise<JsonRecord> {
+    const profile =
+      input.isDryRun ||
+      CLOUD_SHEET_RENDER_MODELS.has(textValue(input.settings?.render_model, ""))
+        ? undefined
+        : (origin ?? this.captureInferenceProfile?.());
+    return this.inferenceOrigin.run(profile, () =>
+      this.generateSheetsInternal(input, profile)
+    );
   }
 
-  async generateShots(input: LocalScriptShotsInput): Promise<JsonRecord> {
-    return this.generateShotsInternal(input);
+  async generateShots(
+    input: LocalScriptShotsInput,
+    origin?: AbortSignal
+  ): Promise<JsonRecord> {
+    const profile = input.isDryRun
+      ? undefined
+      : (origin ?? this.captureInferenceProfile?.());
+    return this.inferenceOrigin.run(profile, () =>
+      this.generateShotsInternal(input, profile)
+    );
   }
 
   async exportCut(input: LocalScriptCutExportInput): Promise<JsonRecord> {
@@ -1338,8 +1571,22 @@ export class LocalScriptProjectService {
         | "storyboard-update";
       payload: JsonRecord;
     },
-    caller = this.captureDescriptionSession()
+    caller = this.captureDescriptionSession(),
+    cloudProfile?: AbortSignal,
+    inferenceProfile?: AbortSignal
   ): Promise<JsonRecord> {
+    if (
+      ["storyboard-generate", "describe-sheet", "add-sheet-image"].includes(
+        input.operation
+      )
+    ) {
+      try {
+        inferenceProfile ??= this.captureInferenceProfile?.();
+      } catch (error) {
+        if (input.operation !== "add-sheet-image") throw error;
+        inferenceProfile = AbortSignal.abort(error);
+      }
+    }
     const descriptionSignal = AbortSignal.any([
       caller,
       this.captureDescriptionSession()
@@ -1348,7 +1595,11 @@ export class LocalScriptProjectService {
     await this.assertLocalProject(input.projectId);
     descriptionSignal.throwIfAborted();
     if (input.operation === "storyboard-generate")
-      return this.generateStoryboard(input.projectId, input.payload);
+      return this.generateStoryboard(
+        input.projectId,
+        input.payload,
+        inferenceProfile
+      );
     if (
       input.operation === "storyboard" ||
       input.operation === "storyboard-update"
@@ -1369,7 +1620,8 @@ export class LocalScriptProjectService {
           : undefined,
         input.payload.shouldOverwrite === true,
         true,
-        descriptionSignal
+        descriptionSignal,
+        inferenceProfile
       );
     }
     const snapshot = await this.requireSnapshot(input.projectId);
@@ -1478,10 +1730,12 @@ export class LocalScriptProjectService {
           assetId,
           false,
           false,
-          descriptionSignal
+          descriptionSignal,
+          inferenceProfile
         );
       } catch (error) {
         descriptionSignal.throwIfAborted();
+        if (inferenceProfile?.aborted) return key;
         if (error instanceof Error && error.name === "AbortError") throw error;
         return key;
       }
@@ -1508,11 +1762,19 @@ export class LocalScriptProjectService {
       return { asset_id: assetId, description };
     }
     if (input.operation === "begin-cloud-sheet-submission")
-      return this.beginCloudSheetSubmission(input.projectId, input.payload);
+      return this.beginCloudSheetSubmission(
+        input.projectId,
+        input.payload,
+        cloudProfile
+      );
     if (input.operation === "start-cloud-sheet-render")
       return this.startCloudSheetRender(input.projectId, input.payload);
     if (input.operation === "add-cloud-sheet-render")
-      return this.addCloudSheetRender(input.projectId, input.payload);
+      return this.addCloudSheetRender(
+        input.projectId,
+        input.payload,
+        cloudProfile
+      );
     if (input.operation === "fail-cloud-sheet-render")
       return this.failCloudSheetRender(input.projectId, input.payload);
     if (input.operation === "pin-sheet") {
@@ -1685,7 +1947,8 @@ export class LocalScriptProjectService {
     sourcePath: string,
     kind: string,
     externalOnly: boolean,
-    signal: AbortSignal
+    signal: AbortSignal,
+    profile?: AbortSignal
   ): Promise<string | null> {
     signal.throwIfAborted();
     const describe = externalOnly
@@ -1693,7 +1956,9 @@ export class LocalScriptProjectService {
       : this.describeEntityImage;
     if (!describe) return null;
     try {
-      const description = await describe(sourcePath, kind, signal);
+      const description = await (profile
+        ? describe(sourcePath, kind, signal, profile)
+        : describe(sourcePath, kind, signal));
       signal.throwIfAborted();
       return description.trim() || null;
     } catch (error) {
@@ -1709,7 +1974,8 @@ export class LocalScriptProjectService {
     token: string,
     assetId: string,
     overwrite: boolean,
-    signal: AbortSignal
+    signal: AbortSignal,
+    profile?: AbortSignal
   ): Promise<JsonRecord> {
     signal.throwIfAborted();
     const snapshot = await this.requireSnapshot(projectId);
@@ -1735,7 +2001,8 @@ export class LocalScriptProjectService {
           sourcePath,
           textValue(key.kind, ""),
           record(image.render_settings)?.provider === "fal",
-          signal
+          signal,
+          profile
         )
       : null;
     signal.throwIfAborted();
@@ -1793,10 +2060,13 @@ export class LocalScriptProjectService {
     requestedAssetId: string | undefined,
     overwrite: boolean,
     required: boolean,
-    caller = this.captureDescriptionSession()
+    caller = this.captureDescriptionSession(),
+    profile?: AbortSignal
   ): Promise<JsonRecord> {
     const lifetime = this.captureDescriptionSession();
-    const signal = AbortSignal.any([caller, lifetime]);
+    const signal = AbortSignal.any(
+      profile ? [caller, lifetime, profile] : [caller, lifetime]
+    );
     signal.throwIfAborted();
     const snapshot = await this.requireSnapshot(projectId);
     signal.throwIfAborted();
@@ -1805,11 +2075,18 @@ export class LocalScriptProjectService {
     );
     if (!key) throw new Error("Local reference-sheet entity not found");
     const assetId = requestedAssetId ?? textValue(key.effective_asset_id, "");
-    const pendingKey = JSON.stringify([projectId, token, assetId]);
+    if (profile && !this.descriptionProfiles.has(profile))
+      this.descriptionProfiles.set(profile, randomUUID());
+    const profileId = profile
+      ? this.descriptionProfiles.get(profile)
+      : undefined;
+    const pendingKey = JSON.stringify([projectId, token, assetId, profileId]);
     const result = await this.sharedDescriptions.run(
-      JSON.stringify([projectId, token, assetId, overwrite]),
+      JSON.stringify([projectId, token, assetId, overwrite, profileId]),
       async (ownedSignal) => {
-        const operationSignal = AbortSignal.any([ownedSignal, lifetime]);
+        const operationSignal = AbortSignal.any(
+          profile ? [ownedSignal, lifetime, profile] : [ownedSignal, lifetime]
+        );
         operationSignal.throwIfAborted();
         const previous = this.pendingDescriptions.get(pendingKey);
         const run = (async () => {
@@ -1822,12 +2099,15 @@ export class LocalScriptProjectService {
           // Release the serialization slot on abort even if the provider ignores
           // its signal. The detached operation still checks ownership before writes.
           return waitForInference(
-            this.describeSheetVersion(
-              projectId,
-              token,
-              assetId,
-              overwrite,
-              operationSignal
+            this.inferenceOrigin.run(profile, () =>
+              this.describeSheetVersion(
+                projectId,
+                token,
+                assetId,
+                overwrite,
+                operationSignal,
+                profile
+              )
             ),
             operationSignal
           );
@@ -1854,7 +2134,8 @@ export class LocalScriptProjectService {
   private async ensureReferenceDescriptions(
     projectId: string,
     references: JsonRecord[],
-    signal: AbortSignal
+    signal: AbortSignal,
+    profile?: AbortSignal
   ): Promise<void> {
     signal.throwIfAborted();
     for (const reference of references) {
@@ -1868,7 +2149,8 @@ export class LocalScriptProjectService {
           assetId,
           false,
           false,
-          signal
+          signal,
+          profile
         );
       } catch (error) {
         signal.throwIfAborted();
@@ -1880,8 +2162,10 @@ export class LocalScriptProjectService {
 
   private generateStoryboard(
     projectId: string,
-    payload: JsonRecord
+    payload: JsonRecord,
+    profile?: AbortSignal
   ): Promise<JsonRecord> {
+    profile?.throwIfAborted();
     const requestId = `${projectId}:${String(payload.timelineId)}`;
     if (this.storyboardRequests.has(requestId))
       return Promise.reject(new Error("Storyboard is already generating"));
@@ -1890,109 +2174,122 @@ export class LocalScriptProjectService {
       this.storyboardPreparation.get(projectId) ?? Promise.resolve();
     const result = previous
       .catch(() => undefined)
-      .then(async () => {
-        await this.getSnapshot(projectId);
-        const snapshot = await this.requireSnapshot(projectId);
-        const shot = records(snapshot.state?.shots).find(
-          (item) => item.timeline_id === payload.timelineId
-        );
-        if (!shot) throw new Error("Scene not found");
-        if (shot.locked) throw new Error("Scene is locked");
-        const keys = records(snapshot.state?.keys);
-        if (
-          storyboardState(shot, keys, Object.values(snapshot.planDetails ?? {}))
-            .status === "generating"
-        )
-          throw new Error("Storyboard is already generating");
-        const count = sceneCuts(shot.video_prompt).cuts.length;
-        const project = await this.projects.get(projectId);
-        const savedSize =
-          record(project?.settings)?.output_size ?? snapshot.state?.output_size;
-        const size = Array.isArray(savedSize) ? savedSize : [720, 1280];
-        const bytes = templatePng(count, size);
-        const template = await this.snapshots.storeGeneratedMedia(
-          projectId,
-          bytes,
-          "png",
-          false
-        );
-        const token = storyboardToken(String(shot.timeline_id));
-        const renderModel =
-          payload.renderModel ??
-          record(project?.settings)?.storyboard_render_model ??
-          "qwen_image_2512_local";
-        const referenceIds = [template.id];
-        const referenceNotes: string[] = [];
-        if (isFalSheetModel(renderModel)) {
-          const limit = falImageReferenceLimit(renderModel);
-          for (const group of GROUP_ORDER) {
-            for (const reference of records(record(shot.references)?.[group])) {
-              const id = textValue(reference.asset_id, "");
-              if (
-                !id ||
-                referenceIds.includes(id) ||
-                referenceIds.length >= limit
-              )
-                continue;
-              referenceIds.push(id);
-              const key = keys.find((item) => item.token === reference.token);
-              referenceNotes.push(
-                `Image ${referenceIds.length} shows ${textValue(key?.name, String(reference.token))}.`
-              );
+      .then(() =>
+        this.inferenceOrigin.run(profile, async () => {
+          await this.getSnapshot(projectId);
+          const snapshot = await this.requireSnapshot(projectId);
+          const shot = records(snapshot.state?.shots).find(
+            (item) => item.timeline_id === payload.timelineId
+          );
+          if (!shot) throw new Error("Scene not found");
+          if (shot.locked) throw new Error("Scene is locked");
+          const keys = records(snapshot.state?.keys);
+          if (
+            storyboardState(
+              shot,
+              keys,
+              Object.values(snapshot.planDetails ?? {})
+            ).status === "generating"
+          )
+            throw new Error("Storyboard is already generating");
+          const count = sceneCuts(shot.video_prompt).cuts.length;
+          const project = await this.projects.get(projectId);
+          const savedSize =
+            record(project?.settings)?.output_size ??
+            snapshot.state?.output_size;
+          const size = Array.isArray(savedSize) ? savedSize : [720, 1280];
+          const bytes = templatePng(count, size);
+          const template = await this.snapshots.storeGeneratedMedia(
+            projectId,
+            bytes,
+            "png",
+            false
+          );
+          const token = storyboardToken(String(shot.timeline_id));
+          const renderModel =
+            payload.renderModel ??
+            record(project?.settings)?.storyboard_render_model ??
+            "qwen_image_2512_local";
+          const referenceIds = [template.id];
+          const referenceNotes: string[] = [];
+          if (isFalSheetModel(renderModel)) {
+            const limit = falImageReferenceLimit(renderModel);
+            for (const group of GROUP_ORDER) {
+              for (const reference of records(
+                record(shot.references)?.[group]
+              )) {
+                const id = textValue(reference.asset_id, "");
+                if (
+                  !id ||
+                  referenceIds.includes(id) ||
+                  referenceIds.length >= limit
+                )
+                  continue;
+                referenceIds.push(id);
+                const key = keys.find((item) => item.token === reference.token);
+                referenceNotes.push(
+                  `Image ${referenceIds.length} shows ${textValue(key?.name, String(reference.token))}.`
+                );
+              }
             }
           }
-        }
-        const prompt = [
-          buildStoryboardPrompt(shot, keys, size),
-          ...(referenceNotes.length
-            ? [
-                "Image 1 is the blank layout. Use the other images as visual references:",
-                ...referenceNotes
-              ]
-            : [])
-        ].join("\n");
-        await this.withProjectStateWrite(projectId, async () => {
-          const latest = await this.requireSnapshot(projectId);
-          const state = structuredClone(latest.state!);
-          const oldKey = records(state.keys).find((key) => key.token === token);
-          const board = {
-            ...oldKey,
-            layer_id: oldKey?.layer_id ?? randomUUID(),
-            token,
-            name: "Storyboard",
-            role: "storyboard",
+          const prompt = [
+            buildStoryboardPrompt(shot, keys, size),
+            ...(referenceNotes.length
+              ? [
+                  "Image 1 is the blank layout. Use the other images as visual references:",
+                  ...referenceNotes
+                ]
+              : [])
+          ].join("\n");
+          await this.withProjectStateWrite(projectId, async () => {
+            const latest = await this.requireSnapshot(projectId);
+            const state = structuredClone(latest.state!);
+            const oldKey = records(state.keys).find(
+              (key) => key.token === token
+            );
+            const board = {
+              ...oldKey,
+              layer_id: oldKey?.layer_id ?? randomUUID(),
+              token,
+              name: "Storyboard",
+              role: "storyboard",
+              timeline_id: shot.timeline_id,
+              enabled: true,
+              selected_asset_id: null,
+              images: records(oldKey?.images),
+              prompt,
+              reference_asset_ids: referenceIds,
+              storyboard_scene_fingerprint: sceneFingerprint(shot, keys),
+              panel_count: count
+            };
+            state.keys = [
+              ...records(state.keys).filter((key) => key.token !== token),
+              board
+            ];
+            await this.snapshots.put({ projectId, state });
+          });
+          const result = await this.generateSheetsInternal(
+            {
+              projectId,
+              isDryRun: false,
+              tokens: [token],
+              outputSize: [1536, 864],
+              settings: {
+                render_model: renderModel,
+                provider_settings: payload.providerSettings
+              }
+            },
+            profile
+          );
+          return {
             timeline_id: shot.timeline_id,
-            enabled: true,
-            selected_asset_id: null,
-            images: records(oldKey?.images),
-            prompt,
-            reference_asset_ids: referenceIds,
-            storyboard_scene_fingerprint: sceneFingerprint(shot, keys),
-            panel_count: count
+            asset_id: null,
+            clip_id: null,
+            plan_id: result.plan_id
           };
-          state.keys = [
-            ...records(state.keys).filter((key) => key.token !== token),
-            board
-          ];
-          await this.snapshots.put({ projectId, state });
-        });
-        const result = await this.generateSheetsInternal({
-          projectId,
-          isDryRun: false,
-          tokens: [token],
-          outputSize: [1536, 864],
-          settings: {
-            render_model: renderModel,
-            provider_settings: payload.providerSettings
-          }
-        });
-        return {
-          timeline_id: shot.timeline_id,
-          asset_id: null,
-          clip_id: null,
-          plan_id: result.plan_id
-        };
-      })
+        })
+      )
       .finally(() => {
         this.storyboardRequests.delete(requestId);
         if (this.storyboardPreparation.get(projectId) === result)
@@ -2064,7 +2361,8 @@ export class LocalScriptProjectService {
   }
 
   private async generateSheetsInternal(
-    input: LocalScriptSheetsInput
+    input: LocalScriptSheetsInput,
+    profile?: AbortSignal
   ): Promise<JsonRecord> {
     await this.assertLocalProject(input.projectId);
     const snapshot = await this.requireSnapshot(input.projectId);
@@ -2268,9 +2566,10 @@ export class LocalScriptProjectService {
           ? "flux2-klein-4b-q8"
           : "flux2-klein-9b-q8";
       const status = await probeComfyRenderModel(
-        await this.getComfyEndpoint(),
+        await this.comfyEndpoint(profile),
         "qwen",
-        { qwen_image_edit_setup: setup }
+        { qwen_image_edit_setup: setup },
+        profile
       );
       if (!status.ready)
         throw new Error(
@@ -2332,20 +2631,26 @@ export class LocalScriptProjectService {
     if (isCloudRender)
       this.waitForRenderer(input.projectId, planId, isStoryboardRun);
     else
-      this.startOrQueueRun(input.projectId, planId, (control) =>
-        this.renderSheets(input, keys, plan, control)
+      this.startOrQueueRun(
+        input.projectId,
+        planId,
+        (control) => this.renderSheets(input, keys, plan, control),
+        profile
       );
+    profile?.throwIfAborted();
     return { ...answer, plan_id: planId };
   }
 
   private async generateShotsInternal(
-    input: LocalScriptShotsInput
+    input: LocalScriptShotsInput,
+    profile?: AbortSignal
   ): Promise<JsonRecord> {
     await this.assertLocalProject(input.projectId);
     const isFalRender =
       input.videoSettings?.render_provider === FAL_SHOT_PROVIDER;
     if (isFalRender) {
       const project = await this.projects.get(input.projectId);
+      profile?.throwIfAborted();
       const settings = resolveFalGenerationSettings(
         FAL_SHOT_ENGINE,
         input.videoSettings?.provider_settings,
@@ -2471,7 +2776,7 @@ export class LocalScriptProjectService {
       const referenceLimit = referenceImageSlotBudget(
         sequential,
         !!record(shot._local_storyboard),
-        isFalRender ? FAL_SHOT_IMAGE_SLOTS : undefined
+        isFalRender
       );
       if (referenceCount > referenceLimit) {
         steps.push(
@@ -2551,9 +2856,13 @@ export class LocalScriptProjectService {
           supersededTimelineIdsWithDependents.has(String(step.timeline_id));
       }
     );
-    this.startRun(input.projectId, planId, (control) =>
-      this.renderShots(input, runnable, plan, control)
+    this.startRun(
+      input.projectId,
+      planId,
+      (control) => this.renderShots(input, runnable, plan, control),
+      profile
     );
+    profile?.throwIfAborted();
     return { ...answer, plan_id: planId };
   }
 
@@ -2565,7 +2874,7 @@ export class LocalScriptProjectService {
   ): Promise<void> {
     const descriptionSignal = AbortSignal.any([
       this.captureDescriptionSession(),
-      control.abortController.signal
+      control.signal
     ]);
     const planId = String(basePlan.id);
     let plan = planAt(basePlan, "RUNNING");
@@ -2575,9 +2884,9 @@ export class LocalScriptProjectService {
       const requestedModel = input.settings?.render_model;
       const falModel = isFalSheetModel(requestedModel) ? requestedModel : null;
       const isFalRender = falModel !== null;
-      const client = isFalRender
+      const endpoint = isFalRender
         ? null
-        : new ComfyScriptProjectClient(await this.getComfyEndpoint());
+        : await this.comfyEndpoint(control.signal, control.profile);
       if (isFalRender && !this.externalRenderJobs)
         throw new Error("fal reference sheet rendering is unavailable");
       const initialSnapshot = await this.requireSnapshot(input.projectId);
@@ -2604,6 +2913,8 @@ export class LocalScriptProjectService {
           undefined,
           token
         );
+        const submit = activeStep;
+        const savedComfy = endpoint ? savedComfySubmission(submit) : null;
         const externalJobId = textValue(activeStep?.id, "");
         if (isFalRender && !externalJobId)
           throw new Error("The sheet plan has no saved submission step");
@@ -2642,7 +2953,6 @@ export class LocalScriptProjectService {
             "RUNNING"
           );
         };
-        if (client) await startPolling();
         // The planned prompt (sheet_prompt, with the reference instruction
         // when it renders from references); plans made before the planner
         // existed carry none and fall back to the key's own text.
@@ -2680,6 +2990,9 @@ export class LocalScriptProjectService {
             ? (savedJob.inputAssetIds[0] ?? null)
             : null;
           renderPrompt = textValue(savedJob.requestJson.prompt, renderPrompt);
+        } else if (savedComfy) {
+          masterAssetId = textValue(savedComfy.master_asset_id, "") || null;
+          renderPrompt = textValue(savedComfy.prompt, renderPrompt);
         } else if (masterToken) {
           const current = await this.requireSnapshot(input.projectId);
           const master = records(current.state?.keys).find(
@@ -2697,6 +3010,7 @@ export class LocalScriptProjectService {
         // puts the first reference in as the source.
         const sourceIds =
           savedJob?.inputAssetIds ??
+          (savedComfy ? strings(savedComfy.source_ids) : undefined) ??
           [
             ...(masterAssetId ? [masterAssetId] : []),
             ...strings(target._local_reference_asset_ids)
@@ -2720,24 +3034,41 @@ export class LocalScriptProjectService {
         let falJob:
           | Awaited<ReturnType<typeof renderFalSheet>>["job"]
           | undefined;
-        if (client) {
-          const sourcePaths = await Promise.all(
-            sourceIds.map(async (id) => {
-              const resolved =
-                (await this.snapshots.resolveMediaPath(id)) ??
-                (await this.projects.resolveMediaPath("asset", id));
-              if (!resolved)
-                throw new Error(
-                  masterToken && id === masterAssetId
-                    ? `The master design image for ${masterToken} is unavailable locally`
-                    : `Reference image ${id} is unavailable locally`
-                );
-              return resolved;
-            })
+        if (endpoint) {
+          const renderEndpoint = textValue(savedComfy?.endpoint, endpoint);
+          const client = this.comfyClient(renderEndpoint, control.profile);
+          const submission = this.comfySubmission(
+            control,
+            submit,
+            savedComfy,
+            {
+              endpoint: client.endpoint,
+              master_asset_id: masterAssetId,
+              source_ids: sourceIds,
+              prompt: renderPrompt
+            },
+            startPolling
           );
-          const bytes = sourcePaths.length
+          if (savedComfy) await startPolling();
+          const sourcePaths = savedComfy
+            ? []
+            : await Promise.all(
+                sourceIds.map(async (id) => {
+                  const resolved =
+                    (await this.snapshots.resolveMediaPath(id)) ??
+                    (await this.projects.resolveMediaPath("asset", id));
+                  if (!resolved)
+                    throw new Error(
+                      masterToken && id === masterAssetId
+                        ? `The master design image for ${masterToken} is unavailable locally`
+                        : `Reference image ${id} is unavailable locally`
+                    );
+                  return resolved;
+                })
+              );
+          const bytes = sourceIds.length
             ? await client.runImageEdit({
-                sourcePath: sourcePaths[0]!,
+                sourcePath: sourcePaths[0] ?? "",
                 ...(Number(frame[0]) > 0 && Number(frame[1]) > 0
                   ? {
                       outputSize: [Number(frame[0]), Number(frame[1])] as [
@@ -2749,14 +3080,16 @@ export class LocalScriptProjectService {
                 referencePaths: sourcePaths.slice(1),
                 prompt: renderPrompt,
                 model: resolveLocalScriptImageModel(imageModel),
-                isCancelled: () => control.cancelled
+                isCancelled: () => control.cancelled,
+                submission
               })
             : await client.runImage({
                 prompt: renderPrompt,
                 model: resolveLocalScriptImageModel(imageModel),
                 width: Number(frame[0]) || undefined,
                 height: Number(frame[1]) || undefined,
-                isCancelled: () => control.cancelled
+                isCancelled: () => control.cancelled,
+                submission
               });
           this.throwIfCancelled(control);
           media = await this.snapshots.storeGeneratedMedia(
@@ -2777,7 +3110,8 @@ export class LocalScriptProjectService {
             prompt: renderPrompt,
             frame,
             sourceIds,
-            signal: control.abortController.signal,
+            signal: control.signal,
+            profile: control.profile,
             onSubmitted: startPolling
           });
           falJob = result.job;
@@ -2939,7 +3273,8 @@ export class LocalScriptProjectService {
                 assetId,
                 false,
                 false,
-                descriptionSignal
+                descriptionSignal,
+                control.profile
               )
             );
           }
@@ -2960,10 +3295,11 @@ export class LocalScriptProjectService {
         planId,
         planAt(plan, "COMPLETED")
       );
-      if (!client) return;
+      if (!endpoint) return;
+      const classificationClient = this.comfyClient(endpoint, control.profile);
       void (async () => {
         for (const target of targetKeys) {
-          this.planWork.capture();
+          this.throwIfCancelled(control);
           if (
             target.kind !== "character" ||
             resolveBodyPlan(target.body_plan) ||
@@ -2979,16 +3315,14 @@ export class LocalScriptProjectService {
           const bodyPlan = await classifyBodyPlan(
             appearance,
             async (prompt) => {
-              this.planWork.capture();
-              const response = await client.runVideoPrompt(
-                prompt,
-                () => this.planWork.signal.aborted
-              );
-              this.planWork.capture();
+              this.throwIfCancelled(control);
+              const response =
+                await classificationClient.runVideoPrompt(prompt);
+              this.throwIfCancelled(control);
               return stripQwenReasoning(response);
             }
           );
-          this.planWork.capture();
+          this.throwIfCancelled(control);
           if (!bodyPlan) continue;
           const fresh = await this.requireSnapshot(input.projectId);
           const state = structuredClone(fresh.state!);
@@ -3001,6 +3335,7 @@ export class LocalScriptProjectService {
         }
       })().catch(() => undefined);
     } catch (error) {
+      control.profile?.throwIfAborted();
       if (control.cancelled || descriptionSignal.aborted) return;
       const message =
         error instanceof Error ? error.message : "Local sheet rendering failed";
@@ -3029,7 +3364,7 @@ export class LocalScriptProjectService {
   ): Promise<void> {
     const descriptionSignal = AbortSignal.any([
       this.captureDescriptionSession(),
-      control.abortController.signal
+      control.signal
     ]);
     const planId = String(basePlan.id);
     const localH3Steps = resolveLocalH3Steps(
@@ -3051,8 +3386,9 @@ export class LocalScriptProjectService {
     try {
       const isFalRender =
         input.videoSettings?.render_provider === FAL_SHOT_PROVIDER;
-      const endpoint = isFalRender ? null : await this.getComfyEndpoint();
-      const client = endpoint ? new ComfyScriptProjectClient(endpoint) : null;
+      const endpoint = isFalRender
+        ? null
+        : await this.comfyEndpoint(control.signal, control.profile);
       if (isFalRender && !this.externalRenderJobs)
         throw new Error("fal shot rendering is unavailable");
       for (const target of [...targetShots].sort(
@@ -3068,6 +3404,7 @@ export class LocalScriptProjectService {
           "submit_video_render",
           timelineId
         );
+        const savedComfy = endpoint ? savedComfySubmission(submitRender) : null;
         const jobId = textValue(submitRender?.id, "");
         if (isFalRender && !jobId)
           throw new Error("The shot plan has no saved submission step");
@@ -3084,6 +3421,22 @@ export class LocalScriptProjectService {
           throw new Error(
             "fal may have accepted this render. Check the provider's request history before starting a new render."
           );
+        const sequential = record(target._local_sequential);
+        const openingPin = isFalRender && isFalOpeningPin(sequential);
+        const previousTimelineId = textValue(
+          target._local_previous_timeline_id,
+          ""
+        );
+        const predecessorPoll =
+          openingPin && target._local_previous_in_run === true
+            ? this.findStep(plan, "poll_video_render", previousTimelineId)
+            : undefined;
+        const expectedOpeningSource = openingPin
+          ? target._local_previous_in_run === true
+            ? completedStep(predecessorPoll) &&
+              record(predecessorPoll?.result)?.render_asset_id
+            : target._local_previous_asset_id
+          : null;
         const savedPreparation = record(plan.local_prepared_shots)?.[
           timelineId
         ];
@@ -3105,21 +3458,27 @@ export class LocalScriptProjectService {
           if (savedJob) assertPreparedShotJob(preparedShot, savedJob);
         } else if (
           submitRender?.local_preparation_digest ||
-          (savedJob && plan.local_shot_preparation_version === 1)
+          (savedJob &&
+            (openingPin || plan.local_shot_preparation_version === 1))
         ) {
           throw new Error(
             "The shot preparation checkpoint is missing its saved request"
           );
         }
-        let durationSeconds = preparedShot?.duration ?? 5;
-        let numberedImageIds = preparedShot?.image_ids ?? [];
+        let durationSeconds =
+          preparedShot?.duration ?? Number(savedComfy?.duration_s ?? 5);
+        let numberedImageIds =
+          preparedShot?.image_ids ?? strings(savedComfy?.image_ids);
         const numberedVideoIds: string[] =
-          preparedShot?.video_inputs.map((video) => video.asset_id) ?? [];
+          preparedShot?.video_inputs.map((video) => video.asset_id) ??
+          strings(savedComfy?.video_ids);
         let tailProvenance: VideoTailProvenance | null =
           preparedShot?.video_inputs[0]?.provenance ?? null;
         let continuesFrom: JsonRecord | null =
-          preparedShot?.continues_from ?? null;
-        let adaptedPrompt: string | undefined = preparedShot?.prompt;
+          preparedShot?.continues_from ?? record(savedComfy?.continues_from);
+        let adaptedPrompt =
+          preparedShot?.prompt ??
+          (textValue(savedComfy?.prompt, "") || undefined);
         let referencePaths: string[] = [];
         let openingFramePath: string | undefined;
         const referenceVideos: Array<{
@@ -3129,7 +3488,7 @@ export class LocalScriptProjectService {
         }> = [];
         // A complete preparation is authoritative. Do not re-read mutable keys,
         // pins, source media, reference grids, prompt composers or defaults.
-        if (!preparedShot) {
+        if (!preparedShot && !savedComfy) {
           let snapshot = await this.requireSnapshot(input.projectId);
           const referenceItems = Object.values(
             record(target.references) ?? {}
@@ -3138,28 +3497,49 @@ export class LocalScriptProjectService {
             await this.ensureReferenceDescriptions(
               input.projectId,
               referenceItems,
-              descriptionSignal
+              descriptionSignal,
+              control.profile
             );
             snapshot = await this.requireSnapshot(input.projectId);
           }
           const stateKeys = new Map(
             records(snapshot.state?.keys).map((key) => [String(key.token), key])
           );
-          const sequential = record(target._local_sequential);
-          // The engine's image slots, one of them taken by an image-mode
-          // continuity reference; over-budget groups are gridded rather than
-          // dropped.
+          // Fal's native opener is separate from the numbered references.
           const imageSlotBudget = referenceImageSlotBudget(
             sequential,
             !!record(target._local_storyboard),
-            isFalRender ? FAL_SHOT_IMAGE_SLOTS : undefined
+            isFalRender
           );
+          let openingFrame: PreparedFalShot["opening_frame"];
+          const openingSettings = openingPin
+            ? (resolveFalGenerationSettings(
+                FAL_SHOT_ENGINE,
+                input.videoSettings?.provider_settings
+              ) as PreparedFalShot["settings"])
+            : null;
+          const rawReferencePrompt = openingPin
+            ? [target.video_prompt, sequential?.prompt_appendix]
+                .map((value) => textValue(value, ""))
+                .join(" ")
+            : textValue(target.video_prompt, "");
+          if (
+            openingPin &&
+            target._local_prompt_rewrite === "raw" &&
+            hasUnboundImageNumber(
+              rawReferencePrompt,
+              Math.min(referenceItems.length, imageSlotBudget)
+            )
+          )
+            throw new Error(
+              "The pinned opening frame is not a numbered image; remove its Image number or choose Cut or Loose reference"
+            );
           if (
             isFalRender &&
             !savedJob &&
             target._local_prompt_rewrite === "raw" &&
             hasRawNumberedReferenceOverflow(
-              textValue(target.video_prompt, ""),
+              rawReferencePrompt,
               referenceItems.length,
               imageSlotBudget
             )
@@ -3251,7 +3631,7 @@ export class LocalScriptProjectService {
                 input.projectId,
                 await createReferenceGrid(
                   await Promise.all(slot.map(resolveReferencePath)),
-                  control.abortController.signal
+                  control.signal
                 ),
                 "png"
               );
@@ -3342,13 +3722,12 @@ export class LocalScriptProjectService {
           }
 
           if (
-            isFalRender &&
-            sequential &&
-            sequential.mode === "last_frame" &&
-            sequential.opening_frame === "pin"
+            openingPin &&
+            record(record(record(target._local_render_spec)?.spec)?.sequential)
+              ?.opening_frame_preparation !== FAL_OPENING_FRAME_POLICY
           )
             throw new Error(
-              "H3 Max (fal) pinned opening frames are not yet supported"
+              "This pinned opening-frame plan predates native-frame preparation; create a new plan"
             );
           if (
             isFalRender &&
@@ -3394,7 +3773,28 @@ export class LocalScriptProjectService {
               throw new Error(
                 "The saved sequential frame provenance is unavailable"
               );
-            if (sequential.mode === "last_chunk") {
+            if (openingPin) {
+              openingFrame = falOpeningFrameSchema.parse(
+                savedFrame?.opening_frame
+              );
+              if (
+                openingFrame.asset_id !== referenceId ||
+                openingFrame.predecessor_timeline_id !== previousTimelineId ||
+                openingFrame.predecessor_asset_id !== expectedOpeningSource ||
+                continuesFrom?.asset_id !== expectedOpeningSource ||
+                openingFrame.aspect_ratio !== openingSettings?.aspect_ratio ||
+                !openingFrameMatchesAspect(
+                  openingFrame.width,
+                  openingFrame.height,
+                  openingFrame.aspect_ratio
+                ) ||
+                fingerprint(record(savedFrame?.selection) ?? {}) !==
+                  fingerprint(sequential)
+              )
+                throw new Error(
+                  "The saved opening frame does not match its frozen predecessor or aspect"
+                );
+            } else if (sequential.mode === "last_chunk") {
               tailProvenance = videoTailProvenanceSchema.parse(
                 continuesFrom?.tail_provenance
               );
@@ -3441,17 +3841,19 @@ export class LocalScriptProjectService {
             }
           } else if (sequential) {
             const previousId = String(target._local_previous_timeline_id);
-            const latest = await this.requireSnapshot(input.projectId);
-            const previousCut = records(latest.cut?.shots).find(
+            // Native openers never consult the live cut for a fallback version.
+            const latest = openingPin
+              ? null
+              : await this.requireSnapshot(input.projectId);
+            const previousCut = records(latest?.cut?.shots).find(
               (shot) => shot.timeline_id === previousId
             );
-            // Out-of-run pins are frozen at planning time. Same-run continuation
-            // uses that plan's actual output, even if the user changes its pin.
             const previousRender = record(
               this.findStep(plan, "poll_video_render", previousId)?.result
             );
-            const previousAssetId =
-              target._local_previous_in_run === true
+            const previousAssetId = openingPin
+              ? textValue(expectedOpeningSource, "")
+              : target._local_previous_in_run === true
                 ? textValue(previousRender?.render_asset_id, "")
                 : textValue(target._local_previous_asset_id, "") ||
                   textValue(previousCut?.asset_id, "");
@@ -3480,7 +3882,7 @@ export class LocalScriptProjectService {
               const tail = await prepareVideoTail(
                 previousPath,
                 Number(sequential.chunk_seconds),
-                control.abortController.signal
+                control.signal
               );
               this.throwIfCancelled(control);
               const prepared = await this.snapshots.storeGeneratedMedia(
@@ -3521,7 +3923,7 @@ export class LocalScriptProjectService {
               );
             } else if (sequential.mode === "last_chunk") {
               activeStep = this.findStep(plan, "shot_video_source", timelineId);
-              const previousStateShot = records(latest.state?.shots).find(
+              const previousStateShot = records(latest?.state?.shots).find(
                 (shot) => shot.timeline_id === previousId
               );
               const previousDuration =
@@ -3616,10 +4018,7 @@ export class LocalScriptProjectService {
               // Sample the predecessor's decoded frame count/rate, not the new
               // shot's requested length (which can be entirely different).
               const source = isGrid
-                ? await probeRenderedVideoMetadata(
-                    previousPath,
-                    control.abortController.signal
-                  )
+                ? await probeRenderedVideoMetadata(previousPath, control.signal)
                 : null;
               this.throwIfCancelled(control);
               if (isGrid && (!source || !source.fps))
@@ -3633,28 +4032,59 @@ export class LocalScriptProjectService {
                     typeof sequential.num_select === "number"
                       ? sequential.num_select
                       : 1,
-                    control.abortController.signal,
+                    control.signal,
                     source!.fps!
                   )
-                : await extractLastFrame(
-                    previousPath,
-                    control.abortController.signal
-                  );
+                : await extractLastFrame(previousPath, control.signal);
               this.throwIfCancelled(control);
+              const dimensions = openingSettings
+                ? decodedPngDimensions(frame)
+                : null;
+              if (openingSettings) {
+                if (!dimensions)
+                  throw new Error(
+                    "Could not read the decoded opening frame dimensions"
+                  );
+                if (
+                  !openingFrameMatchesAspect(
+                    dimensions.width,
+                    dimensions.height,
+                    openingSettings.aspect_ratio
+                  )
+                )
+                  throw new Error(
+                    openingFrameMismatch(
+                      dimensions.width,
+                      dimensions.height,
+                      openingSettings.aspect_ratio
+                    )
+                  );
+              }
               const continuity = await this.snapshots.storeGeneratedMedia(
                 input.projectId,
                 frame,
                 "png"
               );
-              referencePaths.push(continuity.path);
-              numberedImageIds.push(continuity.id);
-              const continuation = sequentialContinuation(sequential);
-              continuityImage = {
-                id: continuity.id,
-                description: appendix,
-                continuation
-              };
-              if (continuation === "pin") openingFramePath = continuity.path;
+              if (dimensions && openingSettings) {
+                openingFrame = {
+                  asset_id: continuity.id,
+                  predecessor_timeline_id: previousId,
+                  predecessor_asset_id: previousAssetId,
+                  ...dimensions,
+                  aspect_ratio: openingSettings.aspect_ratio,
+                  canvas_policy: FAL_OPENING_FRAME_POLICY
+                };
+              } else {
+                referencePaths.push(continuity.path);
+                numberedImageIds.push(continuity.id);
+                const continuation = sequentialContinuation(sequential);
+                continuityImage = {
+                  id: continuity.id,
+                  description: appendix,
+                  continuation
+                };
+                if (continuation === "pin") openingFramePath = continuity.path;
+              }
               continuesFrom = {
                 timeline_id: previousId,
                 asset_id: previousAssetId,
@@ -3673,6 +4103,7 @@ export class LocalScriptProjectService {
                   selection: structuredClone(sequential),
                   source_frame_count: source?.frameCount ?? null,
                   source_fps: source?.fps ?? null,
+                  ...(openingFrame ? { opening_frame: openingFrame } : {}),
                   continues_from: continuesFrom
                 }
               );
@@ -3744,6 +4175,9 @@ export class LocalScriptProjectService {
               imageAssetIds: referenceIds,
               continuityImage,
               continuityVideo,
+              openingFrameDescription: openingFrame
+                ? textValue(sequential?.prompt_appendix, "")
+                : undefined,
               durationSeconds,
               outputSize: isFalRender
                 ? textValue(
@@ -3761,7 +4195,10 @@ export class LocalScriptProjectService {
                 ""
               )
             });
-            const generateExternal = await this.getExternalTextGenerator?.();
+            const generateExternal = await this.ownedInference(
+              control,
+              async () => this.getExternalTextGenerator?.(control.signal)
+            );
             this.throwIfCancelled(control);
             if (isFalRender && !generateExternal)
               throw new Error(
@@ -3769,10 +4206,13 @@ export class LocalScriptProjectService {
               );
             const cloud = generateExternal
               ? null
-              : await this.runCloudTextModel(
-                  "video-prompt",
-                  { ...body, prompt_version: "minimax_h3_ref" },
-                  () => control.cancelled
+              : await this.ownedInference(control, () =>
+                  this.runCloudTextModel(
+                    "video-prompt",
+                    { ...body, prompt_version: "minimax_h3_ref" },
+                    () => control.cancelled,
+                    ...(control.profile ? ([control.signal] as const) : [])
+                  )
                 );
             const textModelRoute = generateExternal
               ? "external"
@@ -3780,9 +4220,12 @@ export class LocalScriptProjectService {
                 ? "cloud"
                 : "local";
             if (!generateExternal && !cloud && !legacyPromptClient) {
-              const scriptTextModel = await this.getScriptTextModel();
-              legacyPromptClient = new ComfyScriptProjectClient(
+              const scriptTextModel = await this.ownedInference(control, () =>
+                this.getScriptTextModel()
+              );
+              legacyPromptClient = this.comfyClient(
                 endpoint!,
+                control.profile,
                 scriptTextModel
               );
               legacyPromptModel =
@@ -3796,13 +4239,15 @@ export class LocalScriptProjectService {
                 createQwenVideoPromptCall(async (prompt) => {
                   this.throwIfCancelled(control);
                   if (generateExternal) {
-                    const result = await generateExternal({
-                      systemPrompt: "Return one valid JSON object only.",
-                      userPrompt: prompt,
-                      maxTokens: 8000,
-                      temperature: 0.1,
-                      signal: control.abortController.signal
-                    });
+                    const result = await this.ownedInference(control, () =>
+                      generateExternal({
+                        systemPrompt: "Return one valid JSON object only.",
+                        userPrompt: prompt,
+                        maxTokens: 8000,
+                        temperature: 0.1,
+                        signal: control.signal
+                      })
+                    );
                     model = result.model;
                     return result.text;
                   }
@@ -3862,6 +4307,9 @@ export class LocalScriptProjectService {
                     sequential: {
                       ...record(plannedSpec.sequential),
                       prev_asset_id: continuesFrom.asset_id,
+                      ...(openingFrame
+                        ? { prepared_opening_frame: openingFrame }
+                        : {}),
                       ...(tailProvenance
                         ? {
                             prepared_video: {
@@ -3883,6 +4331,7 @@ export class LocalScriptProjectService {
               prompt: adaptedPrompt,
               duration: durationSeconds,
               settings: effectiveSettings,
+              ...(openingFrame ? { opening_frame: openingFrame } : {}),
               image_ids: numberedImageIds,
               video_inputs: numberedVideoIds.map((asset_id) => ({
                 asset_id,
@@ -4042,8 +4491,24 @@ export class LocalScriptProjectService {
         let falJob:
           | Awaited<ReturnType<typeof renderFalShot>>["job"]
           | undefined;
-        if (client) {
-          await startPolling();
+        if (endpoint) {
+          const renderEndpoint = textValue(savedComfy?.endpoint, endpoint);
+          const client = this.comfyClient(renderEndpoint, control.profile);
+          const submission = this.comfySubmission(
+            control,
+            submitRender,
+            savedComfy,
+            {
+              endpoint: client.endpoint,
+              duration_s: durationSeconds,
+              image_ids: numberedImageIds,
+              video_ids: numberedVideoIds,
+              continues_from: continuesFrom,
+              prompt: adaptedPrompt
+            },
+            startPolling
+          );
+          if (savedComfy) await startPolling();
           // Deduped by asset, first position kept, as the composer numbered
           // them: a repeated image would shift every later <Picture n>.
           const renderedPaths = referencePaths.filter(
@@ -4062,7 +4527,8 @@ export class LocalScriptProjectService {
             textEncoder: localH3TextEncoder,
             videoModel: localH3Model,
             openingFramePath,
-            isCancelled: () => control.cancelled
+            isCancelled: () => control.cancelled,
+            submission
           });
           this.throwIfCancelled(control);
           media = await this.snapshots.storeGeneratedMedia(
@@ -4082,7 +4548,8 @@ export class LocalScriptProjectService {
                 projectId: input.projectId,
                 timelineId,
                 recovering: control.recovering,
-                signal: control.abortController.signal,
+                signal: control.signal,
+                profile: control.profile,
                 onSubmitted: startPolling
               })
             : await renderFalShot(this.externalRenderJobs!, {
@@ -4100,7 +4567,8 @@ export class LocalScriptProjectService {
                   provenance: tailProvenance!
                 })),
                 recovering: control.recovering,
-                signal: control.abortController.signal,
+                signal: control.signal,
+                profile: control.profile,
                 onSubmitted: startPolling
               });
           falJob = result.job;
@@ -4118,10 +4586,7 @@ export class LocalScriptProjectService {
             throw new Error("The saved fal video is unavailable");
           media = { ...asset, path: sourcePath };
         }
-        const posterBytes = await extractFirstFrame(
-          media.path,
-          control.abortController.signal
-        );
+        const posterBytes = await extractFirstFrame(media.path, control.signal);
         this.throwIfCancelled(control);
         const poster = await this.snapshots.storeGeneratedMedia(
           input.projectId,
@@ -4169,6 +4634,7 @@ export class LocalScriptProjectService {
                   }
                 }
               : plannedSpec;
+          const frameDimensions = decodedPngDimensions(posterBytes);
           const version = {
             layer_id: layerId,
             asset_id: media.id,
@@ -4181,6 +4647,9 @@ export class LocalScriptProjectService {
             sent_prompt: adaptedPrompt ?? null,
             url: media.url,
             poster_url: poster.url,
+            ...(frameDimensions
+              ? { decoded_frame_dimensions: frameDimensions }
+              : {}),
             created_at: nowIso(),
             upscale_of: null,
             continues_from: continuesFrom,
@@ -4229,7 +4698,9 @@ export class LocalScriptProjectService {
                         }
                       : {}),
                     resolution: falJob.requestJson.resolution,
-                    aspect_ratio: falJob.requestJson.aspect_ratio,
+                    aspect_ratio:
+                      preparedShot?.settings.aspect_ratio ??
+                      falJob.requestJson.aspect_ratio,
                     measured_duration_s:
                       media.duration == null ? null : media.duration / 1000,
                     seed: falJob.outputJson?.seed,
@@ -4282,8 +4753,11 @@ export class LocalScriptProjectService {
           this.evaluateShotVideo &&
           !record(target._local_storyboard)
         ) {
-          void this.getRenderMetrics(media.id).catch((error: unknown) =>
-            console.warn("Could not start local shot evaluation", error)
+          void this.getRenderMetrics(media.id, control.signal).catch(
+            (error: unknown) => {
+              if (!control.signal.aborted)
+                console.warn("Could not start local shot evaluation", error);
+            }
           );
         }
         plan = await this.setStep(
@@ -4308,6 +4782,7 @@ export class LocalScriptProjectService {
         planAt(plan, "COMPLETED")
       );
     } catch (error) {
+      control.profile?.throwIfAborted();
       if (control.cancelled || descriptionSignal.aborted) return;
       const message =
         error instanceof Error ? error.message : "Local shot rendering failed";
@@ -4414,23 +4889,28 @@ export class LocalScriptProjectService {
         activeStep = poll;
         plan = await this.setStep(input.projectId, planId, poll, "RUNNING");
         const options = resolveCastOptions(input);
-        const generateExternal = await this.getExternalTextGenerator?.();
+        const generateExternal = await this.ownedInference(control, async () =>
+          this.getExternalTextGenerator?.(control.signal)
+        );
         this.throwIfCancelled(control);
         const cloud = generateExternal
           ? null
-          : await this.runCloudTextModel(
-              "casting",
-              {
-                script: input.script,
-                shot_limit: options.maxShots,
-                atomic_shots: options.isAtomicShotsRequested,
-                sequence_mode: options.isRenderSequencesRequested,
-                include_dialogue: true,
-                split_alts: !!options.isCharacterDesignVersionsRequested,
-                separate_style: options.isSeparateStyleRequested ?? true,
-                separate_camera: !!options.isSeparateCameraRequested
-              },
-              () => control.cancelled
+          : await this.ownedInference(control, () =>
+              this.runCloudTextModel(
+                "casting",
+                {
+                  script: input.script,
+                  shot_limit: options.maxShots,
+                  atomic_shots: options.isAtomicShotsRequested,
+                  sequence_mode: options.isRenderSequencesRequested,
+                  include_dialogue: true,
+                  split_alts: !!options.isCharacterDesignVersionsRequested,
+                  separate_style: options.isSeparateStyleRequested ?? true,
+                  separate_camera: !!options.isSeparateCameraRequested
+                },
+                () => control.cancelled,
+                ...(control.profile ? ([control.signal] as const) : [])
+              )
             );
         const textModelRoute = generateExternal
           ? "external"
@@ -4440,7 +4920,9 @@ export class LocalScriptProjectService {
         const scriptTextModel =
           generateExternal || cloud
             ? undefined
-            : await this.getScriptTextModel();
+            : await this.ownedInference(control, () =>
+                this.getScriptTextModel()
+              );
         let scriptTextModelFile = scriptTextModel
           ? LOCAL_SCRIPT_TEXT_MODEL_FILES[scriptTextModel]
           : "";
@@ -4452,18 +4934,21 @@ export class LocalScriptProjectService {
               createQwenStructuredCall(async (prompt) => {
                 this.throwIfCancelled(control);
                 if (generateExternal) {
-                  const result = await generateExternal({
-                    systemPrompt: "Return one valid JSON object only.",
-                    userPrompt: prompt,
-                    maxTokens: 16_000,
-                    temperature: 0.1,
-                    signal: control.abortController.signal
-                  });
+                  const result = await this.ownedInference(control, () =>
+                    generateExternal({
+                      systemPrompt: "Return one valid JSON object only.",
+                      userPrompt: prompt,
+                      maxTokens: 16_000,
+                      temperature: 0.1,
+                      signal: control.signal
+                    })
+                  );
                   scriptTextModelFile = result.model;
                   return result.text;
                 }
-                return new ComfyScriptProjectClient(
-                  await this.getComfyEndpoint(),
+                return this.comfyClient(
+                  await this.comfyEndpoint(control.signal, control.profile),
+                  control.profile,
                   scriptTextModel
                 ).runCasting(prompt, () => control.cancelled);
               }),
@@ -4528,6 +5013,7 @@ export class LocalScriptProjectService {
         planAt(plan, "COMPLETED")
       );
     } catch (error) {
+      control.profile?.throwIfAborted();
       if (control.cancelled) return;
       const message =
         error instanceof Error ? error.message : "Local casting failed";
@@ -4776,11 +5262,20 @@ export class LocalScriptProjectService {
     return plan;
   }
 
+  private runCloudSheetCommit<T>(
+    profile: AbortSignal | undefined,
+    commit: () => Promise<T>
+  ): Promise<T> {
+    profile?.throwIfAborted();
+    return this.profileIo?.run(profile, commit) ?? commit();
+  }
+
   /** Persist uncertainty before allowing a credit-bearing POST. A lost response
    * cannot safely be distinguished from acceptance. */
   private async beginCloudSheetSubmission(
     projectId: string,
-    payload: JsonRecord
+    payload: JsonRecord,
+    profile?: AbortSignal
   ): Promise<JsonRecord> {
     return this.withProjectStateWrite(projectId, async () => {
       const planId = textValue(payload.planId, "");
@@ -4804,10 +5299,18 @@ export class LocalScriptProjectService {
         throw new Error(
           "Mago Cloud sheet submission is already recorded or may have been accepted"
         );
-      const recorded = await this.setStep(projectId, planId, step, "RUNNING", {
-        token,
-        cloud_submission_pending: true
-      });
+      profile?.throwIfAborted();
+      const recorded = await this.setStep(
+        projectId,
+        planId,
+        step,
+        "RUNNING",
+        { token, cloud_submission_pending: true },
+        undefined,
+        profile
+      );
+      // Do not authorize the POST after retirement, even if the marker committed.
+      profile?.throwIfAborted();
       if (recorded.status === "CANCELLED")
         throw new Error("Local plan cancelled");
       return recorded;
@@ -4860,7 +5363,8 @@ export class LocalScriptProjectService {
   /** One key's cloud render landed: keep it as a local version of the key. */
   private async addCloudSheetRender(
     projectId: string,
-    payload: JsonRecord
+    payload: JsonRecord,
+    profile?: AbortSignal
   ): Promise<JsonRecord> {
     const planId = textValue(payload.planId, "");
     const token = textValue(payload.token, "");
@@ -4872,15 +5376,24 @@ export class LocalScriptProjectService {
     const outputUrl = textValue(payload.outputUrl, "");
     if (!outputUrl.startsWith("https://"))
       throw new Error("Cloud sheet output must use HTTPS");
-    const media = await this.snapshots.storeRemoteMedia(projectId, outputUrl);
+    profile?.throwIfAborted();
+    const media = await this.snapshots.storeRemoteMedia(
+      projectId,
+      outputUrl,
+      profile
+    );
+    profile?.throwIfAborted();
     if (!media.isImage) throw new Error("Cloud sheet output is not an image");
     const target = records(plan.local_targets).find(
       (candidate) => candidate.token === token
     );
     const spec = record(payload.renderSpec) ?? record(target?._local_spec);
-    const key = await this.withProjectStateWrite(projectId, async () => {
-      const snapshot = await this.requireSnapshot(projectId);
-      const state = structuredClone(snapshot.state!);
+    return this.withProjectStateWrite(projectId, async () => {
+      profile?.throwIfAborted();
+      // This read must not migrate settings before the commit is admitted.
+      const snapshot = await this.snapshots.get(projectId);
+      if (!snapshot?.state) throw new Error("Cast the script before rendering");
+      const state = structuredClone(snapshot.state);
       const key = records(state.keys).find(
         (candidate) => candidate.token === token
       );
@@ -4926,36 +5439,40 @@ export class LocalScriptProjectService {
           ? key.selected_asset_id
           : media.id;
       key.effective_source = "render";
-      await this.snapshots.put({
-        projectId,
-        state: this.refreshReferences(state)
+      // Once admitted, finish the local commit before account retirement can
+      // finish. Do not schedule more downloads or interrupt the checkpoint tail.
+      return this.runCloudSheetCommit(profile, async () => {
+        await this.snapshots.put({
+          projectId,
+          state: this.refreshReferences(state),
+          metadataOnly: true
+        });
+        const completed = await this.setStep(
+          projectId,
+          planId,
+          this.findStep(plan, "poll_img2img_batch", undefined, token),
+          "COMPLETED",
+          {
+            token,
+            asset_ids: [media.id],
+            output_url: media.url,
+            cloud_asset_id: textValue(payload.cloudAssetId, "") || null
+          }
+        );
+        const isComplete = records(completed.steps)
+          .filter((step) => step.tool_name === "poll_img2img_batch")
+          .every((step) => completedStep(step));
+        if (isComplete) {
+          await this.snapshots.putPlan(
+            projectId,
+            planId,
+            planAt(completed, "COMPLETED")
+          );
+          this.releaseRenderer(planId);
+        }
+        return key;
       });
-      return key;
     });
-    const completed = await this.setStep(
-      projectId,
-      planId,
-      this.findStep(plan, "poll_img2img_batch", undefined, token),
-      "COMPLETED",
-      {
-        token,
-        asset_ids: [media.id],
-        output_url: media.url,
-        cloud_asset_id: textValue(payload.cloudAssetId, "") || null
-      }
-    );
-    const isComplete = records(completed.steps)
-      .filter((step) => step.tool_name === "poll_img2img_batch")
-      .every((step) => completedStep(step));
-    if (isComplete) {
-      await this.snapshots.putPlan(
-        projectId,
-        planId,
-        planAt(completed, "COMPLETED")
-      );
-      this.releaseRenderer(planId);
-    }
-    return key;
   }
 
   /** A key's cloud render failed: pause the plan so it can be resumed, as a
@@ -5111,13 +5628,52 @@ export class LocalScriptProjectService {
     );
   }
 
+  private comfySubmission(
+    control: RunControl,
+    step: JsonRecord | undefined,
+    saved: JsonRecord | null,
+    metadata: JsonRecord,
+    startPolling: () => Promise<void>
+  ): ScriptComfySubmission {
+    if (!step)
+      throw new Error("Local plan has no saved ComfyUI submission step");
+    const checkpoint = async (promptId?: string) => {
+      this.throwIfCancelled(control);
+      const current = await this.requirePlan(control.planId);
+      this.throwIfCancelled(control);
+      await this.snapshots.putPlan(control.projectId, control.planId, {
+        ...current,
+        steps: records(current.steps).map((candidate) =>
+          candidate.id === step.id
+            ? {
+                ...candidate,
+                local_comfy_submission: {
+                  ...metadata,
+                  prompt_id: promptId ?? null
+                }
+              }
+            : candidate
+        )
+      });
+    };
+    return {
+      promptId: saved ? String(saved.prompt_id) : undefined,
+      beforeSubmit: () => checkpoint(),
+      onSubmitted: async (promptId) => {
+        await checkpoint(promptId);
+        await startPolling();
+      }
+    };
+  }
+
   private async setStep(
     projectId: string,
     planId: string,
     selected: JsonRecord | undefined,
     status: "RUNNING" | "COMPLETED" | "FAILED" | "SKIPPED",
     result?: JsonRecord,
-    error?: string
+    error?: string,
+    profile?: AbortSignal
   ): Promise<JsonRecord> {
     if (!selected) throw new Error("Local plan step is missing");
     const current = await this.requirePlan(planId);
@@ -5140,7 +5696,13 @@ export class LocalScriptProjectService {
         : step
     );
     const updated = planAt({ ...current, steps }, "RUNNING");
-    await this.snapshots.putPlan(projectId, planId, updated);
+    if (profile) {
+      await this.runCloudSheetCommit(profile, () =>
+        this.snapshots.putPlan(projectId, planId, updated, profile)
+      );
+    } else {
+      await this.snapshots.putPlan(projectId, planId, updated);
+    }
     return updated;
   }
 
@@ -5166,6 +5728,7 @@ export class LocalScriptProjectService {
 
   private throwIfCancelled(control: RunControl): void {
     this.planWork.capture();
+    control.profile?.throwIfAborted();
     if (control.cancelled) throw new Error("Local plan cancelled");
   }
 
@@ -5200,14 +5763,20 @@ export class LocalScriptProjectService {
   private startRun(
     projectId: string,
     planId: string,
-    task: (control: RunControl) => Promise<void>
+    task: (control: RunControl) => Promise<void>,
+    profile?: AbortSignal
   ): void {
     const lifetime = this.planWork.capture();
+    const abortController = new AbortController();
     const control: RunControl = {
       planId,
       projectId,
       cancelled: false,
-      abortController: new AbortController()
+      abortController,
+      signal: profile
+        ? AbortSignal.any([abortController.signal, profile])
+        : abortController.signal,
+      profile
     };
     const stop = () => {
       control.cancelled = true;
@@ -5216,7 +5785,30 @@ export class LocalScriptProjectService {
     lifetime.addEventListener("abort", stop, { once: true });
     const promise = this.planWork.run(async () => {
       try {
-        await task(control);
+        await this.inferenceOrigin.run(profile, async () => {
+          profile?.throwIfAborted();
+          await task(control);
+        });
+      } catch (error) {
+        if (!profile?.aborted) throw error;
+        if (!lifetime.aborted && !control.cancelled) {
+          await this.inferenceOrigin.run(undefined, async () => {
+            const plan = await this.requirePlan(planId);
+            if (
+              !control.cancelled &&
+              ["PENDING", "RUNNING"].includes(String(plan.status))
+            )
+              await this.snapshots.putPlan(
+                projectId,
+                planId,
+                planAt(
+                  plan,
+                  "PAUSED",
+                  "The inference profile changed; resume to continue"
+                )
+              );
+          });
+        }
       } finally {
         lifetime.removeEventListener("abort", stop);
         if (this.projectRuns.get(projectId)?.control === control) {
@@ -5234,16 +5826,17 @@ export class LocalScriptProjectService {
   private startOrQueueRun(
     projectId: string,
     planId: string,
-    task: (control: RunControl) => Promise<void>
+    task: (control: RunControl) => Promise<void>,
+    profile?: AbortSignal
   ): void {
     this.planWork.capture();
     if (!this.projectRuns.has(projectId)) {
-      this.startRun(projectId, planId, task);
+      this.startRun(projectId, planId, task, profile);
       return;
     }
     this.queuedRuns.set(projectId, [
       ...(this.queuedRuns.get(projectId) ?? []),
-      { planId, task }
+      { planId, task, profile }
     ]);
   }
 
@@ -5252,7 +5845,7 @@ export class LocalScriptProjectService {
     const [next, ...rest] = this.queuedRuns.get(projectId) ?? [];
     if (rest.length) this.queuedRuns.set(projectId, rest);
     else this.queuedRuns.delete(projectId);
-    if (next) this.startRun(projectId, next.planId, next.task);
+    if (next) this.startRun(projectId, next.planId, next.task, next.profile);
   }
 
   private isRunQueued(projectId: string, planId: string): boolean {

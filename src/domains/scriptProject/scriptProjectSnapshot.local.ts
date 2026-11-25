@@ -1,4 +1,5 @@
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { captureRendererCloudAccountScope } from "@/platform/rendererCloudAccountScope";
 import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 import type {
@@ -48,6 +49,7 @@ export const writeScriptProjectSnapshot = async (
   await work.ready();
   work.check();
   const desktop = getLocalDesktopApi();
+  const account = captureRendererCloudAccountScope();
   const snapshots = desktop.scriptProjects;
   if (!snapshots) return;
   // A read already in flight belongs to the pre-write state.
@@ -55,7 +57,7 @@ export const writeScriptProjectSnapshot = async (
   try {
     await work.boundary(() =>
       snapshots.put(
-        desktop.account.mode === "cloud"
+        input.intent === "cloud-import" || desktop.account.mode === "cloud"
           ? { ...input, metadataOnly: true }
           : input
       )
@@ -64,18 +66,27 @@ export const writeScriptProjectSnapshot = async (
     if (!work.signal.aborted)
       pendingReads.get(snapshots)?.delete(input.projectId);
   }
-  if (desktop.account.mode !== "cloud") return;
+  if (desktop.account.mode !== "cloud" || !account.isActive()) return;
   // Read through the disk index before scheduling: cached files need neither
   // another transfer nor another completion event/refetch cycle.
-  const cached = await work.boundary(() => snapshots.get(input.projectId));
-  if (!cached) return;
+  const cached = await work.boundary(async () => {
+    if (!account.isActive()) return;
+    try {
+      return await snapshots.get(input.projectId);
+    } catch (error) {
+      // An optional hydration lookup must not turn a saved edit into an
+      // account error. Library retirement still rejects through the boundary.
+      if (account.isActive()) throw error;
+    }
+  });
+  if (!cached || !account.isActive()) return;
   void hydrateScriptMedia(
     input.projectId,
     [cached.state, cached.scriptVersions, cached.planDetails, cached.cut],
     work.signal,
     work
   ).catch((error) => {
-    if (!work.signal.aborted)
+    if (!work.signal.aborted && account.isActive())
       console.warn("Failed to schedule script snapshot media", error);
   });
 };

@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { normalizeSourceVideoTrim } from "../../shared/normalizeSourceVideoTrim";
 import { LibraryWorkSession } from "../libraryWorkSession";
+import type { ProfileIoDrain } from "../providers/profileIoDrain";
 
 import {
   cloudImageCachePath,
@@ -42,7 +43,10 @@ export class UploadService {
     byteUploads: new WeakMap<object, Map<string, Set<ByteUpload>>>()
   }));
 
-  constructor(private readonly getLibraryRoot: () => Promise<string | null>) {}
+  constructor(
+    private readonly getLibraryRoot: () => Promise<string | null>,
+    private readonly profileIo?: ProfileIoDrain
+  ) {}
 
   /** Encodes to the shape that makes cloud ingestion a stream copy. */
   async prepare(input: {
@@ -51,16 +55,18 @@ export class UploadService {
     trimStartSeconds?: number;
     trimEndSeconds?: number;
     force?: boolean;
+    profile?: AbortSignal;
   }): Promise<PreparedUpload> {
     const work = this.libraryWork;
     return work.run(async () => {
-      const signal = work.capture();
+      input.profile?.throwIfAborted();
       const root = await work.boundary(this.getLibraryRoot);
+      input.profile?.throwIfAborted();
       if (!root) throw new Error("Choose a Mago library folder first");
       const trim = normalizeSourceVideoTrim(input);
       const relativePath = uploadCachePath({ assetId: input.assetId, ...trim });
       const filePath = path.join(root, relativePath);
-      return this.prepareInOrder(filePath, async () => {
+      return this.prepareInOrder(filePath, input.profile, async (signal) => {
         if (!input.force) {
           const sizeBytes = await readFreshUploadSize(
             filePath,
@@ -80,7 +86,7 @@ export class UploadService {
             }),
           signal,
           message: "Unable to prepare the video for upload",
-          // Large videos may legitimately take over a minute. Library teardown
+          // Large videos may legitimately take over a minute. Teardown
           // still kills and drains the local child.
           timeoutMs: null
         });
@@ -93,25 +99,36 @@ export class UploadService {
     });
   }
 
-  async prepareImage(input: CloudImageInput): Promise<CloudImageFile> {
-    return this.libraryWork.run(() => {
-      const signal = this.libraryWork.capture();
-      return this.prepareInOrder(cloudImageCachePath(input), () =>
+  async prepareImage(
+    input: CloudImageInput & { profile?: AbortSignal }
+  ): Promise<CloudImageFile> {
+    return this.libraryWork.run(() =>
+      this.prepareInOrder(cloudImageCachePath(input), input.profile, (signal) =>
         prepareCloudImageFile(input, signal)
-      );
-    });
+      )
+    );
   }
 
   /** Serialize writers of one cache path without sharing force decisions or
-   * keeping an unstarted task in the library drain. */
+   * keeping an unstarted task in either drain. */
   private async prepareInOrder<Result>(
     filePath: string,
-    prepare: () => Promise<Result>
+    profile: AbortSignal | undefined,
+    prepare: (signal: AbortSignal) => Promise<Result>
   ): Promise<Result> {
+    profile?.throwIfAborted();
     const work = this.libraryWork;
     const { preparations } = work.state;
-    const result = (preparations.get(filePath) ?? Promise.resolve()).then(() =>
-      work.boundary(prepare)
+    const result = (preparations.get(filePath) ?? Promise.resolve()).then(
+      async () => {
+        const library = work.capture();
+        const signal = profile ? AbortSignal.any([library, profile]) : library;
+        signal.throwIfAborted();
+        const issue = () => work.boundary(() => prepare(signal));
+        const prepared = await (this.profileIo?.run(profile, issue) ?? issue());
+        signal.throwIfAborted();
+        return prepared;
+      }
     );
     const settled = result.then(
       () => {},
@@ -131,16 +148,24 @@ export class UploadService {
     contentType?: string;
     onProgress?: Progress;
     assertAccess?: () => Promise<void>;
+    profile?: AbortSignal;
   }): Promise<void> {
     return this.libraryWork.run(() => {
-      const signal = this.libraryWork.capture();
-      return this.transfer(signal, input.onProgress, (onProgress) =>
-        uploadFileToPresignedUrl({
-          ...input,
-          contentType: input.contentType ?? UPLOAD_CONTENT_TYPE,
-          signal,
-          onProgress
-        })
+      const library = this.libraryWork.capture();
+      const signal = input.profile
+        ? AbortSignal.any([library, input.profile])
+        : library;
+      return this.transfer(
+        signal,
+        input.profile,
+        input.onProgress,
+        (onProgress) =>
+          uploadFileToPresignedUrl({
+            ...input,
+            contentType: input.contentType ?? UPLOAD_CONTENT_TYPE,
+            signal,
+            onProgress
+          })
       );
     });
   }
@@ -154,6 +179,7 @@ export class UploadService {
       contentType: string;
       onProgress?: Progress;
       assertAccess: () => Promise<void>;
+      profile?: AbortSignal;
     }
   ): Promise<void> {
     const work = this.libraryWork;
@@ -165,7 +191,11 @@ export class UploadService {
       const attempts = uploads.get(input.uploadId) ?? new Set<ByteUpload>();
       uploads.set(input.uploadId, attempts);
       const entry: ByteUpload = { controller: new AbortController() };
-      const signal = AbortSignal.any([work.signal, entry.controller.signal]);
+      const signal = AbortSignal.any([
+        work.signal,
+        entry.controller.signal,
+        ...(input.profile ? [input.profile] : [])
+      ]);
       // Register before the permission wait so immediate cancellation cannot
       // miss this attempt. Pending permission isn't issued media work.
       attempts.add(entry);
@@ -176,8 +206,12 @@ export class UploadService {
           if (older === entry) break;
           older.controller.abort();
         }
-        entry.transfer = this.transfer(signal, input.onProgress, (onProgress) =>
-          uploadBytesToPresignedUrl({ ...input, signal, onProgress })
+        entry.transfer = this.transfer(
+          signal,
+          input.profile,
+          input.onProgress,
+          (onProgress) =>
+            uploadBytesToPresignedUrl({ ...input, signal, onProgress })
         );
         await entry.transfer;
       } finally {
@@ -206,17 +240,22 @@ export class UploadService {
 
   private async transfer(
     signal: AbortSignal,
+    profile: AbortSignal | undefined,
     listener: Progress | undefined,
     issue: (progress: Progress) => Promise<void>
   ): Promise<void> {
     let active = true;
     try {
       signal.throwIfAborted();
-      await this.libraryWork.boundary(() =>
-        issue((fraction) => {
-          if (active && !signal.aborted) listener?.(fraction);
-        })
-      );
+      const transfer = () =>
+        this.libraryWork.boundary(() =>
+          issue((fraction) => {
+            if (active && !signal.aborted) listener?.(fraction);
+          })
+        );
+      await (this.profileIo
+        ? this.profileIo.run(profile, transfer)
+        : transfer());
       signal.throwIfAborted();
     } finally {
       active = false;

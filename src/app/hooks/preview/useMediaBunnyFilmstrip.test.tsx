@@ -9,6 +9,11 @@ const generateFilmstrip = vi.fn();
 const cacheVideoUrl = vi.fn();
 const useVideoAsset = vi.fn();
 
+const releaseObjectUrl = vi.hoisted(() => vi.fn());
+vi.mock("@/platform/rendererObjectUrl", () => ({
+  releaseRendererObjectUrl: releaseObjectUrl
+}));
+
 vi.mock("@app/services/mediaBunny", () => ({
   generateFilmstrip: (...args: unknown[]) => generateFilmstrip(...args)
 }));
@@ -37,7 +42,6 @@ describe("useMediaBunnyFilmstrip with a caller-supplied video url", () => {
     useVideoAsset.mockReturnValue({ data: undefined, isLoading: false });
     cacheVideoUrl.mockResolvedValue({ urlToUse: "blob:video", isCached: true });
     generateFilmstrip.mockResolvedValue("data:filmstrip");
-    URL.revokeObjectURL = vi.fn();
   });
 
   it("skips the asset lookup and builds the filmstrip from the cached download", async () => {
@@ -60,12 +64,14 @@ describe("useMediaBunnyFilmstrip with a caller-supplied video url", () => {
     );
     expect(cacheVideoUrl).toHaveBeenCalledWith(
       "https://s3/render.mp4",
-      "asset"
+      "asset",
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
     expect(generateFilmstrip).toHaveBeenCalledWith(
       "blob:video",
-      expect.objectContaining({ width: 300, fps: 24 })
+      expect.objectContaining({ width: 300, fps: 24 }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:video");
+    expect(releaseObjectUrl).toHaveBeenCalledWith("blob:video");
   });
 });

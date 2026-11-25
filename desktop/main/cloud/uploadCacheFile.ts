@@ -51,7 +51,7 @@ export const encodeUploadCacheFile = async (input: {
     const { size } = await stat(temporary);
     signal?.throwIfAborted();
     if (!size) throw new Error("The prepared upload was empty");
-    await publishFile(temporary, destination);
+    await publishFile(temporary, destination, signal);
     return size;
   } finally {
     // Never expose a partial as a valid cache hit and never unlink before the

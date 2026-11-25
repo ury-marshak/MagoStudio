@@ -16,6 +16,14 @@ import {
   resolveProviderStartupMode
 } from "./externalProviderSettings";
 
+const deferred = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
+
 let directory: string;
 const config = {
   baseUrl: "https://inference.invalid/api/v1",
@@ -248,5 +256,106 @@ describe("external inference omission boundary", () => {
     ).rejects.toThrow();
     expect(getForInference).not.toHaveBeenCalled();
     expect(readKey).not.toHaveBeenCalled();
+  });
+});
+
+describe("external inference profile lifetime", () => {
+  it("does not resume an old credential lookup after A → B → A", async () => {
+    const store = settings();
+    const route = createExternalInferenceRouting(
+      store,
+      legacyVision,
+      probeLegacy,
+      readKey
+    );
+    await store.save("text", config);
+    const keyStarted = deferred<void>();
+    const key = deferred<string>();
+    readKey.mockImplementationOnce(() => {
+      keyStarted.resolve();
+      return key.promise;
+    });
+    const rejected = expect(
+      route.generateEnhancement(request)
+    ).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await keyStarted.promise;
+    await store.save("text", { ...config, model: "new-model" });
+    await store.save("text", config);
+    await rejected;
+    key.resolve("fixture-not-a-credential");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(transport).not.toHaveBeenCalled();
+    expect(legacyVision).not.toHaveBeenCalled();
+  });
+
+  it.each(["text", "vision", "readiness"] as const)(
+    "aborts issued %s, drops its late response, and does not retry",
+    async (kind) => {
+      const capability = kind === "text" ? "text" : "vision";
+      const store = settings();
+      const route = createExternalInferenceRouting(
+        store,
+        legacyVision,
+        probeLegacy,
+        readKey
+      );
+      await store.save(capability, config);
+      const requestStarted = deferred<AbortSignal | null | undefined>();
+      const response = deferred<Response>();
+      transport.mockImplementationOnce((_url, init) => {
+        requestStarted.resolve(init?.signal);
+        return response.promise;
+      });
+      const result =
+        kind === "readiness"
+          ? route.probeVision()
+          : kind === "text"
+            ? route.generateEnhancement(request)
+            : route.generateVision(request);
+      const rejected = expect(result).rejects.toMatchObject({
+        name: "AbortError"
+      });
+      const signal = await requestStarted.promise;
+      await store.save(capability, { ...config, model: "next-model" });
+      expect(signal?.aborted).toBe(true);
+      await rejected;
+
+      const cancel = vi.fn();
+      response.resolve(new Response(new ReadableStream({ cancel })));
+      await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
+      expect(transport).toHaveBeenCalledTimes(1);
+      expect(legacyVision).not.toHaveBeenCalled();
+      expect(probeLegacy).not.toHaveBeenCalled();
+    }
+  );
+
+  it("retires a held text generator on last-provider removal and allows only new work to use legacy", async () => {
+    const store = settings();
+    const route = createExternalInferenceRouting(
+      store,
+      legacyVision,
+      probeLegacy,
+      readKey
+    );
+    await store.save("text", config);
+    const generate = await route.getGenerator("text");
+    expect(generate).not.toBeNull();
+
+    const removal = store.save("text", null);
+    await expect(route.generateEnhancement(request)).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await removal;
+    await expect(generate!(request)).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await expect(route.getGenerator("text")).resolves.toBeNull();
+    await expect(route.generateEnhancement(request)).resolves.toMatchObject({
+      model: "legacy"
+    });
+    expect(transport).not.toHaveBeenCalled();
+    expect(legacyVision).toHaveBeenCalledTimes(1);
   });
 });

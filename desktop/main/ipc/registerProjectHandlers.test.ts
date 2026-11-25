@@ -22,6 +22,9 @@ import type { CloudProjectMirrorRepository } from "../database/cloudProjectMirro
 import type { DatabaseManager } from "../database/databaseManager";
 import type { ProjectRepository } from "../database/projectRepository";
 import type { LibrarySettings } from "../librarySettings";
+import { LibraryWorkSession } from "../libraryWorkSession";
+import { ProfileIoDrain } from "../providers/profileIoDrain";
+import { ProfileLifetime } from "../providers/profileLifetime";
 
 import { registerProjectHandlers } from "./registerProjectHandlers";
 
@@ -111,4 +114,109 @@ describe("tracks:update rating validation", () => {
       expect(updateTrack).not.toHaveBeenCalled();
     }
   );
+});
+
+const deferred = <T = void>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => {
+    resolve = yes;
+  });
+  return { promise, resolve };
+};
+
+const cloudFixture = () => {
+  const profiles = new ProfileLifetime();
+  const io = new ProfileIoDrain();
+  const capture = vi.fn(() => profiles.capture());
+  const getLibraryRoot = vi.fn(async () => "/library");
+  const open = vi
+    .fn<(root: string) => Promise<void>>()
+    .mockResolvedValue(undefined);
+  const put = vi.fn();
+  const cacheAsset = vi.fn();
+  const list = vi.fn(async () => []);
+  registerProjectHandlers(
+    { list } as unknown as ProjectRepository,
+    {
+      libraryWork: new LibraryWorkSession(() => undefined),
+      put,
+      cacheAsset
+    } as unknown as CloudProjectMirrorRepository,
+    { isOpen: () => false, open } as unknown as DatabaseManager,
+    {
+      getLibraryRoot,
+      getAppMode: async () => "cloud"
+    } as unknown as LibrarySettings,
+    undefined,
+    undefined,
+    undefined,
+    capture,
+    undefined,
+    io
+  );
+  return { profiles, io, capture, getLibraryRoot, open, put, cacheAsset, list };
+};
+
+it.each([
+  IPC_CHANNELS.projectsMirrorCloud,
+  IPC_CHANNELS.projectsCacheCloudAsset
+])(
+  "%s cannot open the DB when the account retires during library lookup",
+  async (channel) => {
+    const f = cloudFixture();
+    const lookingUp = deferred();
+    const root = deferred<string>();
+    f.getLibraryRoot.mockImplementationOnce(() => {
+      lookingUp.resolve();
+      return root.promise;
+    });
+    const stale = expect(handlers.get(channel)!({}, {})).rejects.toThrow();
+    await lookingUp.promise;
+    f.profiles.suspend();
+    await f.io.drainRetired();
+    f.profiles.resume();
+    root.resolve("/old-library");
+    await stale;
+    expect(f.open).not.toHaveBeenCalled();
+    expect(f.put).not.toHaveBeenCalled();
+    expect(f.cacheAsset).not.toHaveBeenCalled();
+    expect(f.capture).toHaveBeenCalledOnce();
+  }
+);
+
+it("drains an issued Cloud DB open before retiring the account", async () => {
+  const f = cloudFixture();
+  const opening = deferred();
+  const finishOpen = deferred();
+  f.open.mockImplementationOnce(() => {
+    opening.resolve();
+    return finishOpen.promise;
+  });
+  const stale = expect(
+    handlers.get(IPC_CHANNELS.projectsMirrorCloud)!(
+      {},
+      { project: { id: "old" } }
+    )
+  ).rejects.toThrow();
+  await opening.promise;
+  f.profiles.suspend();
+  const drained = vi.fn();
+  const drain = f.io.drainRetired().then(drained);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(drained).not.toHaveBeenCalled();
+  finishOpen.resolve();
+  await drain;
+  await stale;
+  expect(f.put).not.toHaveBeenCalled();
+});
+
+it("can open and list the local DB while account capture is suspended", async () => {
+  const f = cloudFixture();
+  f.profiles.suspend();
+  expect(await handlers.get(IPC_CHANNELS.projectsList)!({}, undefined)).toEqual(
+    []
+  );
+  expect(f.open).toHaveBeenCalledWith("/library");
+  expect(f.list).toHaveBeenCalledOnce();
+  expect(f.capture).not.toHaveBeenCalled();
 });

@@ -44,6 +44,7 @@ import { readVideoMemoryBytesOnce } from "./readVideoMemoryBytesOnce";
 import { resolveNodePackBackupsFolder } from "./resolveNodePackBackupsFolder";
 import { resolveStarterEnginePaths } from "./resolveStarterEnginePaths";
 import { resumableDownload } from "./resumableDownload";
+import { SetupAttempt } from "./setupAttempt";
 import { swapInNodePack } from "./swapInNodePack";
 
 const NODE_PACK_ARCHIVE_SHA256_PREFIX_LENGTH = 12;
@@ -127,8 +128,8 @@ export class StarterInstaller {
     error: null
   };
   private starting: Promise<StarterInstallStatus> | null = null;
-  private controller: AbortController | null = null;
-  private running: Promise<void> | null = null;
+  private attempt: SetupAttempt | undefined;
+  private readonly draining = new Set<SetupAttempt>();
   private lastRequestedModelGroupIds: LocalModelGroupId[] = [];
   private readonly dependencies: StarterInstallerDependencies;
   constructor(
@@ -147,26 +148,89 @@ export class StarterInstaller {
     return structuredClone(this.state);
   }
   async pause(): Promise<void> {
-    await this.starting;
-    this.controller?.abort();
-    await this.running;
+    const attempt = this.attempt;
+    attempt?.pause();
+    await attempt?.drain();
   }
-  start(request?: StarterInstallRequest): Promise<StarterInstallStatus> {
-    if (this.starting) return this.starting;
-    this.starting = this.startInternal(request).finally(() => {
-      this.starting = null;
-    });
-    return this.starting;
+  async drainRetired(): Promise<void> {
+    await Promise.all(
+      [...this.draining]
+        .filter(({ signal }) => signal.aborted)
+        .map((attempt) => attempt.drain())
+    );
   }
-  private async startInternal(
-    request: StarterInstallRequest | undefined
+  start(
+    request?: StarterInstallRequest,
+    profile?: AbortSignal
   ): Promise<StarterInstallStatus> {
-    if (this.controller) return this.status();
+    profile?.throwIfAborted();
+    const previous = this.attempt;
+    if (previous && !previous.signal.aborted)
+      return this.starting ?? Promise.resolve(this.status());
+    const attempt = new SetupAttempt(profile);
+    const { signal } = attempt;
+    this.attempt = attempt;
+    this.draining.add(attempt);
+    const priorCleanup = previous && attempt.track(previous.drain());
+    const onAbort = () => this.publishInterruption(attempt);
+    signal.addEventListener("abort", onAbort, { once: true });
+    const release = async () => {
+      await attempt.drain();
+      signal.removeEventListener("abort", onAbort);
+      this.draining.delete(attempt);
+      if (this.attempt === attempt) this.attempt = undefined;
+    };
+    const starting = attempt
+      .run(async () => {
+        await priorCleanup;
+        signal.throwIfAborted();
+        return this.prepare(request, attempt);
+      })
+      .then((install) => {
+        signal.throwIfAborted();
+        void attempt
+          .run(install)
+          .catch((error) => {
+            this.publishInterruption(attempt, error);
+          })
+          .finally(release);
+        return this.status();
+      })
+      .catch(async (error) => {
+        await release();
+        if (signal.aborted) return this.status();
+        throw error;
+      })
+      .finally(() => {
+        if (this.starting === starting) this.starting = null;
+      });
+    this.starting = starting;
+    return starting;
+  }
+  private publishInterruption(attempt: SetupAttempt, error?: unknown): void {
+    if (this.attempt !== attempt) return;
+    const paused = attempt.signal.aborted;
+    this.state.phase = paused ? "paused" : "error";
+    this.state.error = paused
+      ? null
+      : error instanceof Error
+        ? error.message
+        : "Installation failed";
+    for (const file of this.state.files)
+      if (file.state === "downloading" || file.state === "verifying")
+        file.state = paused ? "waiting" : "error";
+  }
+  private async prepare(
+    request: StarterInstallRequest | undefined,
+    attempt: SetupAttempt
+  ): Promise<() => Promise<void>> {
+    const { signal } = attempt;
     if (process.platform !== "win32")
       throw new Error(
         "The bundled ComfyUI installer currently supports Windows only. Use your own ComfyUI on this platform."
       );
     const selected = await this.settings.getLocalModelsRoot();
+    signal.throwIfAborted();
     if (!selected) throw new Error("Choose a storage location first.");
     const urls = COMFY_STARTER_BUNDLE.partUrls;
     if (
@@ -181,16 +245,20 @@ export class StarterInstaller {
       request,
       Object.keys(await this.settings.getInstalledModelGroups())
     );
+    signal.throwIfAborted();
     const installInspection = await inspectLocalModelGroupsForInstall(
       this.settings,
-      this.dependencies.readVideoMemoryBytes
+      this.dependencies.readVideoMemoryBytes,
+      attempt
     );
+    signal.throwIfAborted();
     const hardwareVariantGroupIdsToSave =
       installInspection.hardwareVariantGroupIdsPickedForInstall.filter(
         (groupId) => modelGroupIds.includes(groupId)
       );
     const groupsBeforeInstall = installInspection.groups;
     const needsEngine = !(await isStarterEngineInstalled(paths));
+    signal.throwIfAborted();
     const pendingItems = this.collectPendingItems(
       groupsBeforeInstall,
       modelGroupIds,
@@ -212,6 +280,7 @@ export class StarterInstaller {
       (this.state.phase === "paused" || this.state.phase === "error") &&
       isSameModelGroupsAsLastRun;
     const space = await statfs(selected);
+    signal.throwIfAborted();
     if (
       Number(space.bavail) * Number(space.bsize) < requiredBytes &&
       !isResumingInterruptedInstall
@@ -223,15 +292,21 @@ export class StarterInstaller {
       const pickedVariantId =
         installInspection.selectedModelGroupVariantsForInstall[groupId];
       if (pickedVariantId)
-        await this.settings.setSelectedModelGroupVariant(
-          groupId,
-          pickedVariantId
+        await attempt.issue(() =>
+          this.settings.setSelectedModelGroupVariant(
+            groupId,
+            pickedVariantId,
+            signal
+          )
         );
     }
-    const isFirstCompletedSetup =
-      !(await this.settings.hasCompletedLocalSetup());
+    signal.throwIfAborted();
+    const isFirstCompletedSetup = !(await this.settings.hasCompletedLocalSetup({
+      signal
+    }));
+    await attempt.issue(() => mkdir(paths.cache, { recursive: true }));
+    signal.throwIfAborted();
     this.lastRequestedModelGroupIds = modelGroupIds;
-    await mkdir(paths.cache, { recursive: true });
     const engineFiles = needsEngine
       ? urls.map((url, index) => ({
           name:
@@ -259,32 +334,14 @@ export class StarterInstaller {
       directory: paths.engine,
       error: null
     };
-    const controller = new AbortController();
-    this.controller = controller;
-    this.running = this.install(
-      paths,
-      modelGroupIds,
-      needsEngine ? null : groupsBeforeInstall,
-      isFirstCompletedSetup,
-      controller.signal
-    )
-      .catch((error) => {
-        this.state.phase = controller.signal.aborted ? "paused" : "error";
-        this.state.error = controller.signal.aborted
-          ? null
-          : error instanceof Error
-            ? error.message
-            : "Installation failed";
-        const current = this.state.files.find(
-          (file) => file.state === "downloading" || file.state === "verifying"
-        );
-        if (current)
-          current.state = controller.signal.aborted ? "waiting" : "error";
-      })
-      .finally(() => {
-        this.controller = null;
-      });
-    return this.status();
+    return () =>
+      this.install(
+        paths,
+        modelGroupIds,
+        needsEngine ? null : groupsBeforeInstall,
+        isFirstCompletedSetup,
+        attempt
+      );
   }
   private collectPendingItems(
     groups: InspectedModelGroup[],
@@ -313,42 +370,53 @@ export class StarterInstaller {
     modelGroupIds: LocalModelGroupId[],
     groupsInspectedWithEngine: InspectedModelGroup[] | null,
     isFirstCompletedSetup: boolean,
-    signal: AbortSignal
+    attempt: SetupAttempt
   ): Promise<void> {
-    if (!groupsInspectedWithEngine) await this.installEngine(paths, signal);
+    const { signal } = attempt;
+    if (!groupsInspectedWithEngine)
+      await attempt.issue(() => this.installEngine(paths, signal));
+    signal.throwIfAborted();
     const groups =
       groupsInspectedWithEngine ??
-      (await inspectLocalModelGroups(this.settings)).groups;
+      (await inspectLocalModelGroups(this.settings, undefined, attempt)).groups;
+    signal.throwIfAborted();
     const completedPaths = new Set<string>();
     const modelsToCopy: Extract<ModelGroupItem, { kind: "model-file" }>[] = [];
     let hasInstalledNodePack = false;
     for (const group of groups) {
       if (!modelGroupIds.includes(group.groupId)) continue;
       for (const item of group.missingItems) {
+        signal.throwIfAborted();
         if (completedPaths.has(item.absolutePath)) continue;
         const fileIndex = this.fileIndexFor(item, paths);
         if (item.kind === "node-pack") {
-          await this.installNodePack(item, fileIndex, paths, signal);
+          await attempt.issue(() =>
+            this.installNodePack(item, fileIndex, paths, signal)
+          );
           hasInstalledNodePack = true;
         } else {
-          await this.download(fileIndex, signal, item.sha256);
+          await attempt.issue(() =>
+            this.download(fileIndex, signal, item.sha256)
+          );
           modelsToCopy.push(item);
         }
         completedPaths.add(item.absolutePath);
       }
-      await this.settings.recordInstalledModelGroup(
-        group.groupId,
-        // Only files in the selected installation belong in its install record.
-        // Some items may have been supplied by another running ComfyUI.
-        (
-          await Promise.all(
-            group.items.map(async (item) => {
-              return (await isModelGroupItemOnDisk(item)) ? item.sha256 : null;
-            })
+      signal.throwIfAborted();
+      // Record only files in the selected installation, not those supplied by
+      // another running ComfyUI.
+      const hashes = (
+        await Promise.all(
+          group.items.map(async (item) =>
+            (await isModelGroupItemOnDisk(item)) ? item.sha256 : null
           )
-        ).filter((hash): hash is string => hash !== null)
+        )
+      ).filter((hash): hash is string => hash !== null);
+      await attempt.issue(() =>
+        this.settings.recordInstalledModelGroup(group.groupId, hashes, signal)
       );
     }
+    signal.throwIfAborted();
     if (this.settings.getComfyEndpoint && modelsToCopy.length > 0) {
       this.state.phase = "verifying";
       await confirmAndCopyInstallerModels({
@@ -356,10 +424,12 @@ export class StarterInstaller {
         managedComfyDirectory: paths.comfyDirectory,
         items: modelsToCopy,
         signal,
+        attempt,
         confirmCopy: this.dependencies.confirmModelCopy,
         showCopyError: this.dependencies.showModelCopyError
       });
     }
+    signal.throwIfAborted();
     for (const file of this.state.files)
       if (file.state === "waiting") {
         file.state = "done";
@@ -367,8 +437,11 @@ export class StarterInstaller {
       }
     this.state.isComfyRestartNeeded = hasInstalledNodePack;
     if (isFirstCompletedSetup)
-      await this.settings.setVlmBackend("qwen3-vl-4b-heretic-int8");
-    await this.settings.markLocalSetupCompleted();
+      await attempt.issue(() =>
+        this.settings.setVlmBackend("qwen3-vl-4b-heretic-int8", signal)
+      );
+    await attempt.issue(() => this.settings.markLocalSetupCompleted(signal));
+    signal.throwIfAborted();
     this.state.phase = "done";
   }
   private async installEngine(
@@ -379,9 +452,11 @@ export class StarterInstaller {
       throw new Error(
         "The engine folder already exists but was not installed by this wizard. Choose a different storage folder."
       );
+    signal.throwIfAborted();
     const engineFileCount = COMFY_STARTER_BUNDLE.partBytes.length;
     for (let index = 0; index < engineFileCount; index++)
       await this.download(index, signal);
+    signal.throwIfAborted();
     this.state.phase = "verifying";
     const archive = path.join(paths.cache, "comfy.zip");
     const archiveFiles = this.state.files.slice(0, engineFileCount);
@@ -390,12 +465,23 @@ export class StarterInstaller {
       const joined = await open(archive, "w");
       try {
         for (const file of archiveFiles) {
-          for await (const chunk of createReadStream(file.destination)) {
-            signal.throwIfAborted();
-            let offset = 0;
-            const buffer = Buffer.from(chunk);
-            while (offset < buffer.length)
-              offset += (await joined.write(buffer, offset)).bytesWritten;
+          signal.throwIfAborted();
+          const part = createReadStream(file.destination, { signal });
+          const closed = new Promise<void>((resolve) =>
+            part.once("close", resolve)
+          );
+          try {
+            for await (const chunk of part) {
+              let offset = 0;
+              const buffer = Buffer.from(chunk);
+              while (offset < buffer.length) {
+                signal.throwIfAborted();
+                offset += (await joined.write(buffer, offset)).bytesWritten;
+              }
+            }
+          } finally {
+            part.destroy();
+            await closed;
           }
         }
       } finally {
@@ -404,6 +490,7 @@ export class StarterInstaller {
     }
     if ((await hashFile(archive, signal)) !== COMFY_STARTER_BUNDLE.sha256) {
       for (const file of archiveFiles) {
+        signal.throwIfAborted();
         file.state = "error";
         await rename(
           file.destination,
@@ -414,6 +501,7 @@ export class StarterInstaller {
         "ComfyUI bundle SHA-256 check failed. Retry to download the bundle again."
       );
     }
+    signal.throwIfAborted();
     this.state.phase = "extracting";
     for (const file of archiveFiles) file.state = "done";
     const staging = await mkdtemp(path.join(paths.cache, "extract-"));
@@ -428,6 +516,8 @@ export class StarterInstaller {
           "python.exe"
         )
       );
+      signal.throwIfAborted();
+      // Finish the engine/marker commit once the rename is issued.
       await rename(
         path.join(staging, "ComfyUI_windows_portable"),
         paths.engine
@@ -449,6 +539,7 @@ export class StarterInstaller {
     signal.throwIfAborted();
     const file = this.state.files[fileIndex];
     await mkdir(path.dirname(file.destination), { recursive: true });
+    signal.throwIfAborted();
     file.state = "downloading";
     this.state.phase = "downloading";
     await resumableDownload(
@@ -460,6 +551,7 @@ export class StarterInstaller {
       },
       item.sha256
     );
+    signal.throwIfAborted();
     file.state = "verifying";
     this.state.phase = "verifying";
     const stagedNodePack = path.join(
@@ -472,8 +564,10 @@ export class StarterInstaller {
       await extractNodePack(
         file.destination,
         stagedNodePack,
-        item.archiveStripRoot
+        item.archiveStripRoot,
+        signal
       );
+      signal.throwIfAborted();
       this.state.phase = "installing-dependencies";
       await this.dependencies.installRequirements({
         python: paths.embeddedPython,
@@ -491,11 +585,13 @@ export class StarterInstaller {
         replacedNodePack: path.join(
           resolveNodePackBackupsFolder(paths.customNodesDirectory),
           `${item.name}-${Date.now()}`
-        )
+        ),
+        signal
       });
     } finally {
       await rm(stagedNodePack, { recursive: true, force: true });
     }
+    signal.throwIfAborted();
     file.bytes = file.downloadedBytes;
     file.state = "done";
   }
@@ -508,6 +604,7 @@ export class StarterInstaller {
     const file = this.state.files[index];
     await mkdir(path.dirname(file.destination), { recursive: true });
     const existing = await stat(file.destination).catch(() => null);
+    signal.throwIfAborted();
     if (existing) {
       file.state = "verifying";
       this.state.phase = "verifying";
@@ -515,16 +612,19 @@ export class StarterInstaller {
         existing.size !== file.bytes ||
         (sha256 && (await hashFile(file.destination, signal)) !== sha256)
       ) {
+        signal.throwIfAborted();
         await rename(
           file.destination,
           file.destination + `.invalid-${Date.now()}`
         );
       } else {
+        signal.throwIfAborted();
         file.downloadedBytes = file.bytes;
         file.state = "done";
         return;
       }
     }
+    signal.throwIfAborted();
     file.state = "downloading";
     this.state.phase = "downloading";
     await resumableDownload(
@@ -542,6 +642,7 @@ export class StarterInstaller {
     );
     if ((await stat(file.destination)).size !== file.bytes)
       throw new Error(`Unexpected size for ${file.name}. Retry to repair.`);
+    signal.throwIfAborted();
     file.downloadedBytes = file.bytes;
     file.state = "done";
   }

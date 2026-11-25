@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -29,11 +30,14 @@ type DownloadRenderOutputInput = {
   onProgress?: (fraction: number) => void;
   cloudStorage?: CloudStorageAccess;
   signal?: AbortSignal;
+  // A stable generation identifies coalescing even when signals are composed per caller.
+  origin?: AbortSignal;
 };
 
 // Development remounts and multiple renderer windows can observe the same
-// finished cloud job at once. They must share one download: two writers using
-// the same `.partial` path race when the first one renames it into place.
+// finished cloud job at once. Calls within the same lifetime share one download.
+// Each issued transfer has its own temporary path so retired and replacement
+// epochs can safely overlap while the retired transfer closes.
 const downloadsInFlight = new Map<string, Promise<DownloadResult>>();
 const sessionDownloads = new WeakMap<
   AbortSignal,
@@ -58,7 +62,7 @@ const performDownload = async (
   const cloudStorage = input.cloudStorage ?? {
     allowedHosts: resolveCloudConfig().cloudStorageHosts
   };
-  const temporary = `${destination}.partial`;
+  const temporary = `${destination}.${randomUUID()}.partial`;
 
   input.signal?.throwIfAborted();
   const download = await openCloudStorageDownload({
@@ -75,8 +79,6 @@ const performDownload = async (
   try {
     input.signal?.throwIfAborted();
     await mkdir(path.dirname(destination), { recursive: true });
-    input.signal?.throwIfAborted();
-    await unlink(temporary).catch(() => {});
     input.signal?.throwIfAborted();
     const expected = Number(download.headers.get("content-length") ?? 0);
     let received = 0;
@@ -96,7 +98,7 @@ const performDownload = async (
       throw new Error(
         `The render output download was incomplete (${size} of ${expected} bytes)`
       );
-    await publishFile(temporary, destination);
+    await publishFile(temporary, destination, input.signal);
     input.signal?.throwIfAborted();
     return { relativePath, sizeBytes: size };
   } catch (error) {
@@ -114,9 +116,10 @@ export const downloadRenderOutput = async (
 ): Promise<DownloadResult> => {
   input.signal?.throwIfAborted();
   let downloads = downloadsInFlight;
-  if (input.signal) {
-    downloads = sessionDownloads.get(input.signal) ?? new Map();
-    sessionDownloads.set(input.signal, downloads);
+  const origin = input.origin ?? input.signal;
+  if (origin) {
+    downloads = sessionDownloads.get(origin) ?? new Map();
+    sessionDownloads.set(origin, downloads);
   }
   const relativePath = renderOutputPath(input.jobId, input.extension);
   const destination = path.join(input.libraryRoot, relativePath);

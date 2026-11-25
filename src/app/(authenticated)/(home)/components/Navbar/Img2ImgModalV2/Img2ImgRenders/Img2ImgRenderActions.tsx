@@ -27,6 +27,7 @@ type Props = {
   sourceFrame: number | undefined;
   filename: string;
   isFirstSuccessfulRender?: boolean;
+  directFal?: boolean;
   imageCrop?: SourceImageCrop;
 };
 
@@ -39,6 +40,7 @@ export const Img2ImgRenderActions: React.FC<Props> = ({
   sourceFrame,
   filename,
   isFirstSuccessfulRender = false,
+  directFal = false,
   imageCrop
 }) => {
   const { t } = useTranslation();
@@ -120,7 +122,7 @@ export const Img2ImgRenderActions: React.FC<Props> = ({
       {!isOnboardingActive && (
         <>
           <IterateButton assetId={assetId ?? ""} sourceFrame={sourceFrame} />
-          <TweakButton clipId={clipId ?? ""} />
+          {!directFal && <TweakButton clipId={clipId ?? ""} />}
           <GhostButton
             aria-label={t("actions.download.label")}
             onPress={handleImageDownload}

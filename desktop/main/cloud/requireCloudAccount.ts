@@ -14,9 +14,11 @@ export class CloudAccountRequiredError extends Error {
  * Recheck at dispatch after asynchronous preparation and on every redirect.
  */
 export const requireCloudAccount = async (
-  settings: Pick<LibrarySettings, "getAppMode">
+  settings: Pick<LibrarySettings, "getAppMode">,
+  profile?: AbortSignal
 ): Promise<void> => {
-  if ((await settings.getAppMode()) !== "cloud") {
-    throw new CloudAccountRequiredError();
-  }
+  profile?.throwIfAborted();
+  const mode = await settings.getAppMode();
+  profile?.throwIfAborted();
+  if (mode !== "cloud") throw new CloudAccountRequiredError();
 };

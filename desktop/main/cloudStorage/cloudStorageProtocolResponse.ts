@@ -78,6 +78,10 @@ export const cloudStorageProtocolResponse = async (
     });
   }
 
+  if (request.signal.aborted || request.method === "HEAD") {
+    await upstream.body?.cancel(request.signal.reason).catch(() => {});
+    request.signal.throwIfAborted();
+  }
   return new Response(request.method === "HEAD" ? null : upstream.body, {
     status: upstream.status,
     headers: buildForwardedHeaders(upstream)

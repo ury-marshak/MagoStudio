@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { readProviderJson } from "./providerResponseBody";
+
 const queueOrigin = "https://queue.fal.run";
 const endpointPattern =
   /^[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*)+$/;
@@ -130,6 +132,7 @@ export class FalQueueClient {
     const signal = callerSignal
       ? AbortSignal.any([callerSignal, timeout])
       : timeout;
+    signal.throwIfAborted();
     let response: Response;
     try {
       response = await fetch(url, {
@@ -146,12 +149,16 @@ export class FalQueueClient {
       if (timeout.aborted) throw new Error("fal queue request timed out");
       throw new Error("Could not reach fal queue");
     }
+    if (signal.aborted) {
+      await response.body?.cancel(signal.reason).catch(() => {});
+      signal.throwIfAborted();
+    }
     if (!response.ok && !acceptedErrors.includes(response.status)) {
       await response.body?.cancel().catch(() => {});
       throw new FalQueueHttpError(response.status);
     }
     try {
-      return await response.json();
+      return await readProviderJson(response, signal);
     } catch {
       if (callerSignal?.aborted) throw new Error("fal queue request cancelled");
       if (timeout.aborted) throw new Error("fal queue request timed out");

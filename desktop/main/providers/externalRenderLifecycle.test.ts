@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ExternalRenderJob } from "./externalRenderJobRepository";
 import { ExternalRenderJobService } from "./externalRenderJobService";
 import type { MediaRenderProvider } from "./mediaRenderProvider";
+import { ProfileIoDrain } from "./profileIoDrain";
 import { waitForExternalRender } from "./waitForExternalRender";
 
 const deferred = <T>() => {
@@ -24,7 +25,7 @@ const input = {
   requestJson: { prompt: "frozen" },
   inputAssetIds: []
 };
-const setup = () => {
+const setup = (io?: ProfileIoDrain) => {
   let row: Record<string, unknown> = {
     ...input,
     status: "SUBMITTED",
@@ -70,7 +71,8 @@ const setup = () => {
   const service = new ExternalRenderJobService(
     jobs as never,
     new Map([["mock", provider as unknown as MediaRenderProvider]]),
-    assets as never
+    assets as never,
+    io
   );
   return {
     service,
@@ -92,6 +94,95 @@ const setup = () => {
 };
 
 describe("external job library lifetime", () => {
+  it("drains issued fal output and suppresses late ingestion on profile retirement", async () => {
+    const io = new ProfileIoDrain();
+    const test = setup(io);
+    test.replace("OUTPUT_READY");
+    test.row().outputJson = { urls: ["https://mock/old.mp4"] };
+    const closing = deferred<never[]>();
+    const profile = new AbortController();
+    test.assets.download.mockReturnValueOnce(closing.promise);
+    const old = test.service.ingest(input.id, profile.signal);
+    const outcome = expect(old).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(test.assets.download).toHaveBeenCalledOnce());
+    profile.abort();
+    const done = vi.fn();
+    const drained = io.drainRetired().then(done);
+    await flush();
+    expect(done).not.toHaveBeenCalled();
+    closing.resolve([]);
+    await Promise.all([drained, outcome]);
+    expect(test.jobs.finishIngestion).not.toHaveBeenCalled();
+    expect(test.provider.cancel).not.toHaveBeenCalled();
+  });
+
+  it("detaches an abort-ignoring Director poll on profile retirement without cancelling", async () => {
+    const test = setup();
+    const profile = new AbortController();
+    const response =
+      deferred<Awaited<ReturnType<MediaRenderProvider["refresh"]>>>();
+    test.provider.refresh.mockReturnValueOnce(response.promise);
+    const old = waitForExternalRender(
+      test.service,
+      test.row() as unknown as ExternalRenderJob,
+      profile.signal,
+      async () => {},
+      profile.signal
+    );
+    const outcome = expect(old).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() =>
+      expect(test.provider.refresh).toHaveBeenCalledOnce()
+    );
+    profile.abort();
+    await outcome;
+    response.resolve({ status: "FAILED", error: "late result" });
+    await flush();
+    expect(test.provider.cancel).not.toHaveBeenCalled();
+    expect(test.jobs.settleRemoteJob).not.toHaveBeenCalled();
+    expect(test.row()).toMatchObject({
+      status: "SUBMITTED",
+      requestId: "accepted-id"
+    });
+  });
+
+  it("does not persist a remote cancel acknowledgement returned after profile retirement", async () => {
+    const test = setup(new ProfileIoDrain());
+    const profile = new AbortController();
+    const response = deferred<"CANCELLED">();
+    test.provider.cancel.mockReturnValueOnce(response.promise);
+    const old = test.service.cancel(input.id, profile.signal);
+    const outcome = expect(old).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(test.provider.cancel).toHaveBeenCalledOnce());
+    profile.abort();
+    response.resolve("CANCELLED");
+    await outcome;
+    expect(test.jobs.settleRemoteJob).not.toHaveBeenCalled();
+    expect(test.row().requestId).toBe("accepted-id");
+  });
+
+  it("detaches from a held paid acknowledgement and never publishes its late ID", async () => {
+    const io = new ProfileIoDrain();
+    const test = setup(io);
+    const profile = new AbortController();
+    const response = deferred<string>();
+    test.submit.mockReturnValueOnce(response.promise);
+    const result = test.service.submit(input, profile.signal);
+    const rejected = expect(result).rejects.toThrow(/may have accepted/);
+    try {
+      await vi.waitFor(() => expect(test.submit).toHaveBeenCalledOnce());
+      profile.abort();
+      await io.drainRetired();
+      await rejected;
+      expect(test.row()).toMatchObject({ status: "SUBMISSION_UNKNOWN" });
+    } finally {
+      response.resolve("late-request-id");
+    }
+    await flush();
+    expect(test.jobs.settleSubmission).toHaveBeenCalledOnce();
+    expect(test.row().requestId).toBeUndefined();
+    expect(test.provider.cancel).not.toHaveBeenCalled();
+  });
+
   it.each(["accept", "reject"])(
     "does not settle an old submission into replacement IDs after a late %s",
     async (outcome) => {

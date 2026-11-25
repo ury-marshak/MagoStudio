@@ -1,4 +1,11 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -62,6 +69,7 @@ import {
 } from "../database/schema";
 import { clearLibraryIssues, listLibraryIssues } from "../libraryHealth";
 import { runLibraryFfmpeg } from "../media/runLibraryFfmpeg";
+import { ProfileLifetime } from "../providers/profileLifetime";
 import { atomicWriteFile } from "../storage/atomicFile";
 
 import { ComfyQwenClient } from "./comfyQwenClient";
@@ -92,6 +100,7 @@ afterEach(async () => {
   await Promise.all(owners.splice(0).map((owner) => owner.suspend()));
   managers.splice(0).forEach((manager) => manager.close());
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))
   );
@@ -123,7 +132,7 @@ const imageRegistration = {
   cloudAssetId: "cloud",
   cloudClipId: "cloud-clip"
 };
-const fixture = async () => {
+const fixture = async (captureProfile?: () => AbortSignal) => {
   const pair = await Promise.all(
     [0, 1].map(async () => {
       const root = await mkdtemp(path.join(tmpdir(), "mago-legacy-owner-"));
@@ -227,7 +236,9 @@ const fixture = async () => {
     getRoot,
     async () => "http://fixture.invalid",
     available,
-    policy
+    policy,
+    undefined,
+    captureProfile
   );
   const cloud = new CloudRenderSubmitService(manager, getRoot, available);
   owners.push(local, cloud.libraryWork);
@@ -683,3 +694,213 @@ it.each(["trim", "filter"] as const)(
     await f.assertReplacement();
   }
 );
+
+describe("same-library Comfy profile rotation", () => {
+  it("releases an old policy wait and never admits its queued kick under the replacement", async () => {
+    const profile = new ProfileLifetime();
+    const f = await fixture(() => profile.capture());
+    const gate = deferred();
+    f.policy.mockImplementationOnce(() => gate.promise);
+    const poll = vi.mocked(ComfyQwenClient.prototype.poll);
+    const originalLibrary = f.local.libraryWork.signal;
+    const old = f.local.kick();
+    const rejected = expect(old).rejects.toMatchObject({ name: "AbortError" });
+    // A second kick is coalesced into the old generation, not into B.
+    await f.local.kick();
+    profile.rotate();
+    await f.local.kick();
+    await rejected;
+    profile.rotate();
+    gate.resolve();
+    await flush();
+    expect(poll).toHaveBeenCalledExactlyOnceWith("accepted");
+    expect(f.local.libraryWork.signal).toBe(originalLibrary);
+    expect(await readFile(path.join(f.pair[0]!, "saved.png"), "utf8")).toBe(
+      "historical cached output"
+    );
+    expect(listLibraryIssues()).toEqual([]);
+  });
+
+  it("does not hash or upload a pending render queued behind an old in-flight poll", async () => {
+    const profile = new ProfileLifetime();
+    const f = await fixture(() => profile.capture());
+    const [job] = await f.manager.get().select().from(imageRenderJobs);
+    const unsent = JSON.stringify({
+      ...request,
+      comfySubmissionStarted: false
+    });
+    await f.manager
+      .get()
+      .insert(imageRenderJobs)
+      .values({
+        ...job!,
+        id: "pending",
+        status: "PENDING",
+        providerRequestId: null,
+        requestJson: unsent
+      });
+    const gate = deferred<Awaited<ReturnType<ComfyQwenClient["poll"]>>>();
+    const poll = vi
+      .mocked(ComfyQwenClient.prototype.poll)
+      .mockImplementationOnce(() => gate.promise);
+    const fetcher = vi.fn(() => {
+      throw new Error("retired job must not dispatch");
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const old = f.local.kick();
+    const rejected = expect(old).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(poll).toHaveBeenCalledOnce());
+    profile.rotate();
+    await f.local.kick();
+    await rejected;
+    gate.resolve({ state: "running" });
+    await flush();
+    expect(poll).toHaveBeenCalledTimes(2);
+    expect(fetcher).not.toHaveBeenCalled();
+    const [saved] = await f.manager
+      .get()
+      .select()
+      .from(imageRenderJobs)
+      .where(eq(imageRenderJobs.id, "pending"));
+    expect(saved).toMatchObject({
+      status: "PENDING",
+      requestJson: unsent
+    });
+    expect(listLibraryIssues()).toEqual([]);
+  });
+
+  it("does not retry a historical PENDING row without proof it was never submitted", async () => {
+    const profile = new ProfileLifetime();
+    const f = await fixture(() => profile.capture());
+    await f.manager.get().update(imageRenderJobs).set({
+      status: "PENDING",
+      providerRequestId: null
+    });
+    const fetcher = vi.fn(() => {
+      throw new Error("ambiguous legacy job must not dispatch");
+    });
+    vi.stubGlobal("fetch", fetcher);
+    await f.local.kick();
+    profile.rotate();
+    await f.local.kick();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect((await f.local.listQueue())[0]).toMatchObject({
+      active: false,
+      error: { error_type: "submission_unknown" }
+    });
+  });
+
+  it("persists an ambiguous POST before dispatch and never uploads, submits or cancels it again", async () => {
+    const profile = new ProfileLifetime();
+    const f = await fixture(() => profile.capture());
+    await f.manager
+      .get()
+      .update(imageRenderJobs)
+      .set({
+        status: "PENDING",
+        providerRequestId: null,
+        requestJson: JSON.stringify({
+          ...request,
+          comfySubmissionStarted: false
+        })
+      });
+    const late = deferred<Response>();
+    const lateCancel = vi.fn();
+    const fetcher = vi.fn((url: string, _init: RequestInit) => {
+      if (url.endsWith("/upload/image"))
+        return Promise.resolve(Response.json({ name: "uploaded.png" }));
+      if (url.endsWith("/prompt")) return late.promise;
+      throw new Error(`Unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const origin = profile.capture();
+    const old = f.local.kick();
+    const rejected = expect(old).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+    const [before] = await f.manager.get().select().from(imageRenderJobs);
+    expect(JSON.parse(before!.requestJson)).toMatchObject({
+      comfySubmissionStarted: true,
+      comfyEndpoint: "http://fixture.invalid"
+    });
+    profile.rotate();
+    await f.local.drainInferenceProfile(origin);
+    await f.local.kick();
+    profile.rotate();
+    await f.local.kick();
+    await rejected;
+    late.resolve(new Response(new ReadableStream({ cancel: lateCancel })));
+    await vi.waitFor(() => expect(lateCancel).toHaveBeenCalledOnce());
+    expect(fetcher.mock.calls.map(([url, init]) => [url, init.method])).toEqual(
+      [
+        ["http://fixture.invalid/upload/image", "POST"],
+        ["http://fixture.invalid/prompt", "POST"]
+      ]
+    );
+    const [saved] = await f.manager.get().select().from(imageRenderJobs);
+    expect(saved).toEqual(before);
+    expect((await f.local.listQueue())[0]).toMatchObject({
+      active: false,
+      error: { error_type: "submission_unknown" }
+    });
+    expect(listLibraryIssues()).toEqual([]);
+  });
+
+  it("polls a saved ID at its saved endpoint and keeps local output under the new profile", async () => {
+    const profile = new ProfileLifetime();
+    const f = await fixture(() => profile.capture());
+    await mkdir(path.join(f.pair[0]!, "renders/images/j"), { recursive: true });
+    vi.mocked(ComfyQwenClient.prototype.poll).mockRestore();
+    const late = deferred<Response>();
+    const oldBodyCancel = vi.fn();
+    const fetcher = vi
+      .fn((url: string, _init: RequestInit) => {
+        if (url.endsWith("/history/accepted"))
+          return Promise.resolve(
+            Response.json({
+              accepted: {
+                status: { completed: true },
+                outputs: {
+                  "9": { images: [{ filename: "render.png" }] },
+                  "37": { images: [{ filename: "render.png" }] }
+                }
+              }
+            })
+          );
+        if (url.startsWith("http://fixture.invalid/view?"))
+          return Promise.resolve(new Response("rendered"));
+        throw new Error(`Unexpected request ${url}`);
+      })
+      .mockImplementationOnce(() => late.promise);
+    vi.stubGlobal("fetch", fetcher);
+    const old = f.local.kick();
+    const rejected = expect(old).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    profile.rotate();
+    await f.local.kick();
+    await rejected;
+    late.resolve(new Response(new ReadableStream({ cancel: oldBodyCancel })));
+    await vi.waitFor(() => expect(oldBodyCancel).toHaveBeenCalledOnce());
+    expect(
+      fetcher.mock.calls.map(([url, init]) => [
+        new URL(url).pathname,
+        init.method
+      ])
+    ).toEqual([
+      ["/history/accepted", "GET"],
+      ["/history/accepted", "GET"],
+      ["/view", "GET"]
+    ]);
+    const [saved] = await f.manager.get().select().from(imageRenderJobs);
+    expect(saved).toMatchObject({
+      providerRequestId: "accepted",
+      status: "FINISHED"
+    });
+    expect(
+      await readFile(
+        path.join(f.pair[0]!, "renders/images/j/output.png"),
+        "utf8"
+      )
+    ).toBe("png");
+    expect(listLibraryIssues()).toEqual([]);
+  });
+});

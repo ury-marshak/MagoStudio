@@ -3,6 +3,10 @@ import { Project } from "@schemas/project";
 import { type InfiniteData, useQueryClient } from "@tanstack/react-query";
 
 import {
+  isCurrentLibraryQueryKey,
+  libraryQueryKey
+} from "@/platform/rendererLibraryQuery";
+import {
   runRendererLibraryRequest,
   type RendererLibraryWork
 } from "@/platform/rendererLibraryWork";
@@ -37,27 +41,39 @@ export const useDeleteProject = (props?: { noInvalidation?: boolean }) => {
     mutationFn: deleteProject,
     onSuccess: (_, params) => {
       if (props?.noInvalidation) return;
-      queryClient.setQueryData(queryKeys.projects.all, (old: Project[]) => {
-        return old?.filter((project) => project.id !== params.projectId);
-      });
+      queryClient.setQueryData(
+        libraryQueryKey(queryKeys.projects.all),
+        (old: Project[]) => {
+          return old?.filter((project) => project.id !== params.projectId);
+        }
+      );
 
       queryClient.setQueriesData<
         InfiniteData<PaginatedResponse<ProjectListItem>>
-      >({ queryKey: queryKeys.projectList.all }, (old) => {
-        if (!old) return old;
-        const newTotal = Math.max((old.pages[0]?.pagination.total ?? 1) - 1, 0);
-        return {
-          ...old,
-          pages: old.pages.map((page) => ({
-            ...page,
-            items: page.items.filter((item) => item.id !== params.projectId),
-            pagination: {
-              ...page.pagination,
-              total: newTotal
-            }
-          }))
-        };
-      });
+      >(
+        {
+          queryKey: queryKeys.projectList.all,
+          predicate: (query) => isCurrentLibraryQueryKey(query.queryKey)
+        },
+        (old) => {
+          if (!old) return old;
+          const newTotal = Math.max(
+            (old.pages[0]?.pagination.total ?? 1) - 1,
+            0
+          );
+          return {
+            ...old,
+            pages: old.pages.map((page) => ({
+              ...page,
+              items: page.items.filter((item) => item.id !== params.projectId),
+              pagination: {
+                ...page.pagination,
+                total: newTotal
+              }
+            }))
+          };
+        }
+      );
 
       void queryClient.invalidateQueries({
         queryKey: queryKeys.projectList.all

@@ -11,6 +11,10 @@ import { Layer, LayerType } from "@schemas/layer";
 
 import { isCloudAccountActive } from "@/platform/cloudAccount";
 import { isLocalApp } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 import { readableDesktopStorageUrl } from "@/platform/rendererMediaAccess";
 
 import { downloadLayerVideo } from "./downloadFiles";
@@ -105,173 +109,146 @@ export const isVideoDownloadable = (track: Layer) => {
   return isFinished && multipleFrames;
 };
 
-export const handleDownloadFrames = async ({
-  track,
-  trigger,
-  setIsDownloading,
-  onError
-}: {
+type TrackDownload = {
   track: Layer;
-  trigger: "track_download_icon" | "track_three_dots_dropdown";
   setIsDownloading: (value: boolean) => void;
   onError?: (error: unknown) => void;
-}) => {
-  if (isRenderLayer(track) && hasFrames(track)) {
-    try {
-      setIsDownloading(true);
-      await saveLayerDownloadToDisk({
-        layerId: track.id,
-        kind: "frames",
-        suggestedName: `${sanitizeDownloadFilename(track.name)}_frames.zip`
-      });
-    } catch (error) {
-      console.error("Error downloading frames:", error);
+};
+
+type TrackDownloadTrigger = "track_download_icon" | "track_three_dots_dropdown";
+
+const runTrackDownload = async (
+  { track, setIsDownloading, onError }: TrackDownload,
+  trigger: TrackDownloadTrigger,
+  exportType: "frames" | "frames_and_video" | "video" | "exr",
+  download: (work: RendererLibraryWork) => Promise<unknown>
+) => {
+  const work = rendererLibrary.capture();
+  if (work.signal.aborted) return;
+  const stop = () => setIsDownloading(false);
+  work.signal.addEventListener("abort", stop, { once: true });
+  try {
+    setIsDownloading(true);
+    await work.ready();
+    work.check();
+    await download(work);
+  } catch (error) {
+    if (!work.signal.aborted) {
+      console.error(`Error downloading ${exportType}:`, error);
       onError?.(error);
-    } finally {
+    }
+  } finally {
+    work.signal.removeEventListener("abort", stop);
+    if (!work.signal.aborted) {
       trackingUtils.exportActions.exportMedias({
         trackId: track.id,
         assetId: getTrackAssetId(track) ?? "",
         trackOrder: track.layer_order,
         trigger,
-        exportType: "frames"
+        exportType
       });
-
-      setIsDownloading(false);
+      stop();
     }
   }
 };
 
-export const handleDownloadVideoAndFramesZip = async ({
-  track,
-  setIsDownloading,
-  onError
-}: {
-  track: Layer;
-  setIsDownloading: (value: boolean) => void;
-  onError?: (error: unknown) => void;
-}) => {
-  if (!isVideoDownloadable(track)) {
-    return;
-  }
-
-  try {
-    setIsDownloading(true);
-    await saveLayerDownloadToDisk({
-      layerId: track.id,
-      kind: "assets",
-      suggestedName: `${sanitizeDownloadFilename(track.name)}_video.zip`
-    });
-  } catch (error) {
-    console.error("Error downloading video:", error);
-    onError?.(error);
-  } finally {
-    trackingUtils.exportActions.exportMedias({
-      trackId: track.id,
-      assetId: getTrackAssetId(track) ?? "",
-      trackOrder: track.layer_order,
-      trigger: "track_three_dots_dropdown",
-      exportType: "frames_and_video"
-    });
-
-    setIsDownloading(false);
-  }
+export const handleDownloadFrames = async (
+  input: TrackDownload & { trigger: TrackDownloadTrigger }
+) => {
+  const { track, trigger } = input;
+  if (!isRenderLayer(track) || !hasFrames(track)) return;
+  await runTrackDownload(input, trigger, "frames", (work) =>
+    saveLayerDownloadToDisk(
+      {
+        layerId: track.id,
+        kind: "frames",
+        suggestedName: `${sanitizeDownloadFilename(track.name)}_frames.zip`
+      },
+      work
+    )
+  );
 };
 
-export const handleDownloadVideo = async ({
-  projectName,
-  track,
-  trigger,
-  setIsDownloading,
-  onError
-}: {
-  projectName: string;
-  track: Layer;
-  trigger: "track_download_icon" | "track_three_dots_dropdown";
-  setIsDownloading: (value: boolean) => void;
-  onError?: (error: unknown) => void;
-}) => {
-  if (!isVideoDownloadable(track)) {
-    return;
-  }
+export const handleDownloadVideoAndFramesZip = async (input: TrackDownload) => {
+  const { track } = input;
+  if (!isVideoDownloadable(track)) return;
+  await runTrackDownload(
+    input,
+    "track_three_dots_dropdown",
+    "frames_and_video",
+    (work) =>
+      saveLayerDownloadToDisk(
+        {
+          layerId: track.id,
+          kind: "assets",
+          suggestedName: `${sanitizeDownloadFilename(track.name)}_video.zip`
+        },
+        work
+      )
+  );
+};
 
-  try {
-    setIsDownloading(true);
+export const handleDownloadVideo = async (
+  input: TrackDownload & { projectName: string; trigger: TrackDownloadTrigger }
+) => {
+  const { track, trigger, projectName } = input;
+  if (!isVideoDownloadable(track)) return;
+  await runTrackDownload(input, trigger, "video", async (work) => {
     const fileName = `${sanitizeDownloadFilename(projectName)}_${sanitizeDownloadFilename(track.name)}.mp4`;
     if (isLocalApp) {
-      await saveTrackVideoToDisk({ track, fileName });
+      await saveTrackVideoToDisk({ track, fileName }, work);
     } else {
       const blob = await downloadLayerVideo({ layerId: track.id });
+      work.check();
       triggerBlobDownload(blob, fileName);
     }
-  } catch (error) {
-    console.error("Error downloading video:", error);
-    onError?.(error);
-  } finally {
-    trackingUtils.exportActions.exportMedias({
-      trackId: track.id,
-      assetId: getTrackAssetId(track) ?? "",
-      trackOrder: track.layer_order,
-      trigger,
-      exportType: "video"
-    });
-
-    setIsDownloading(false);
-  }
+  });
 };
 
-export const handleDownloadEXR = async ({
-  track,
-  setIsDownloading,
-  onError
-}: {
-  track: Layer;
-  setIsDownloading: (value: boolean) => void;
-  onError?: (error: unknown) => void;
-}) => {
-  if (!isEXRDownloadable(track)) {
-    return;
-  }
-
-  try {
-    setIsDownloading(true);
-    await saveLayerDownloadToDisk({
-      layerId: track.id,
-      kind: "exr",
-      suggestedName: `${sanitizeDownloadFilename(track.name)}_exr.zip`
-    });
-  } catch (error) {
-    console.error("Error downloading EXR:", error);
-    onError?.(error);
-  } finally {
-    trackingUtils.exportActions.exportMedias({
-      trackId: track.id,
-      assetId: getTrackAssetId(track) ?? "",
-      trackOrder: track.layer_order,
-      trigger: "track_three_dots_dropdown",
-      exportType: "exr"
-    });
-
-    setIsDownloading(false);
-  }
+export const handleDownloadEXR = async (input: TrackDownload) => {
+  const { track } = input;
+  if (!isEXRDownloadable(track)) return;
+  await runTrackDownload(input, "track_three_dots_dropdown", "exr", (work) =>
+    saveLayerDownloadToDisk(
+      {
+        layerId: track.id,
+        kind: "exr",
+        suggestedName: `${sanitizeDownloadFilename(track.name)}_exr.zip`
+      },
+      work
+    )
+  );
 };
 
 export const downloadFile = async (url: string, filename: string) => {
+  const work = rendererLibrary.capture();
+  try {
+    await work.ready();
+  } catch (error) {
+    if (work.signal.aborted) return;
+    throw error;
+  }
   const readableUrl = readableDesktopStorageUrl(url);
   try {
-    const response = await fetchFileBypassingPlaybackCache(readableUrl);
+    const response = await fetchFileBypassingPlaybackCache(
+      readableUrl,
+      work.signal
+    );
+    work.check();
     if (!response.ok) {
       throw new Error(`Failed to fetch image: ${response.statusText}`);
     }
     const blob = await response.blob();
-
+    work.check();
     triggerBlobDownload(
       blob,
       withImageExtensionMatchingContentType(filename, blob.type)
     );
   } catch (error) {
+    if (work.signal.aborted) return;
     console.error("Error downloading file:", error);
     const link = document.createElement("a");
-    link.href = readableUrl;
+    link.href = readableDesktopStorageUrl(url);
     link.download = filename;
     document.body.appendChild(link);
     link.click();

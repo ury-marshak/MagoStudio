@@ -24,7 +24,9 @@ export const getAssetPrompt = async (
     throw new Error("Asset ID is required");
   }
 
-  if (await isAssetPromptGeneratedInCloud(assetId)) {
+  const isCloud = await isAssetPromptGeneratedInCloud(assetId);
+  signal?.throwIfAborted();
+  if (isCloud) {
     return getCloudAssetPrompt(assetId, signal);
   }
 

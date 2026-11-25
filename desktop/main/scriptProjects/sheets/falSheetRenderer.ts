@@ -108,6 +108,7 @@ export const renderFalSheet = async (
     frame: unknown[];
     sourceIds: string[];
     signal: AbortSignal;
+    profile?: AbortSignal;
     onSubmitted: () => Promise<void>;
   }
 ) => {
@@ -160,5 +161,11 @@ export const renderFalSheet = async (
       signal
     );
   }
-  return waitForExternalRender(jobs, job, signal, input.onSubmitted);
+  return waitForExternalRender(
+    jobs,
+    job,
+    signal,
+    input.onSubmitted,
+    input.profile
+  );
 };

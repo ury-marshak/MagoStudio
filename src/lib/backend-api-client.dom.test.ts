@@ -124,3 +124,75 @@ it("rechecks the account after a delayed token before transport dispatch", async
   await refused;
   expect(transport).not.toHaveBeenCalled();
 });
+
+const retireableAccount = () => {
+  let retire: (() => void) | undefined;
+  const account = {
+    mode: "cloud",
+    isCurrent: vi.fn(() => true),
+    onRetired: (callback: () => void) => {
+      retire = callback;
+      return () => {
+        retire = undefined;
+      };
+    }
+  };
+  Object.defineProperty(window, "mago", {
+    configurable: true,
+    value: { account }
+  });
+  return () => retire?.();
+};
+
+it("retires an issued backend request without delivering its late unauthorized result", async () => {
+  vi.resetModules();
+  const retire = retireableAccount();
+  const { backendApiClient, registerUnauthorizedHandler } =
+    await import("./backend-api-client");
+  const { AxiosError } = await import("axios");
+  const unauthorized = vi.fn();
+  registerUnauthorizedHandler(unauthorized);
+  let finish!: () => void;
+  const transport = vi.fn<AxiosAdapter>(
+    (config) =>
+      new Promise((_resolve, reject) => {
+        finish = () =>
+          reject(
+            new AxiosError("fixture error", undefined, config, undefined, {
+              config,
+              data: null,
+              status: 401,
+              statusText: "Unauthorized",
+              headers: {}
+            })
+          );
+      })
+  );
+  const pending = expect(
+    backendApiClient.get("/projects", { adapter: transport })
+  ).rejects.toMatchObject({ code: "ERR_CANCELED" });
+  await vi.waitFor(() => expect(transport).toHaveBeenCalledOnce());
+  const signal = transport.mock.calls[0][0].signal;
+  retire();
+  expect(signal?.aborted).toBe(true);
+  finish();
+  await pending;
+  expect(unauthorized).not.toHaveBeenCalled();
+});
+
+it("ends a credential wait on retirement even when the SDK never settles", async () => {
+  vi.resetModules();
+  const retire = retireableAccount();
+  const { backendApiClient, initializeBackendApiClient } =
+    await import("./backend-api-client");
+  const token = vi.fn(() => new Promise<string>(() => {}));
+  initializeBackendApiClient(token);
+  const transport = adapter();
+  const pending = expect(
+    backendApiClient.get("/projects", { adapter: transport })
+  ).rejects.toMatchObject({ code: "ERR_CANCELED" });
+  await vi.waitFor(() => expect(token).toHaveBeenCalledOnce());
+  retire();
+  await pending;
+  expect(transport).not.toHaveBeenCalled();
+});

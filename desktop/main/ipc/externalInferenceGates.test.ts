@@ -33,6 +33,8 @@ vi.mock("electron", () => ({
 vi.mock("../comfy/ComfyLauncher", () => ({
   ComfyLauncher: class {
     launch = mocks.launch;
+    getLaunchPath = async () => null;
+    getLaunchedProcess = () => null;
   }
 }));
 vi.mock("../imageRenders/comfyQwenClient", () => ({
@@ -85,10 +87,14 @@ const settings = {
   getVlmBackend: vi.fn(async () => "qwen3-vl-2b-gguf"),
   getScriptTextModel: vi.fn(async () => "qwen38-27b-q5"),
   getTextModelProvider: vi.fn(async () => "local"),
-  hasCompletedLocalSetup: vi.fn(async () => false)
+  hasCompletedLocalSetup: vi.fn(async () => false),
+  setInferredComfyInstall: vi.fn(async () => {}),
+  markLocalSetupCompleted: vi.fn(async () => {}),
+  saveComfyConfiguration: vi.fn(async () => {})
 };
 const trusted = {
-  senderFrame: { url: `https://${resolveCloudConfig().rendererHost}/` }
+  senderFrame: { url: `https://${resolveCloudConfig().rendererHost}/` },
+  sender: {}
 };
 const invoke = (channel: string, ...args: unknown[]) =>
   mocks.handlers.get(channel)!(trusted, ...args);
@@ -205,8 +211,170 @@ it("retains explicit legacy probes without external configuration", async () => 
   expect(mocks.modelStatus).toHaveBeenCalledExactlyOnceWith(
     "http://localhost:8188",
     "wan_vace_2_1",
-    {}
+    {},
+    expect.any(AbortSignal)
   );
   await invoke(IPC_CHANNELS.localSetupModelGroupsStatus);
   expect(mocks.modelGroups).toHaveBeenCalledOnce();
+});
+
+const deferred = <T>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
+
+const registerOwnedComfy = (
+  assertInferenceAvailable: () => Promise<void>,
+  captureInferenceProfile: NonNullable<
+    NonNullable<
+      Parameters<typeof registerComfyHandlers>[2]
+    >["captureInferenceProfile"]
+  >
+) =>
+  registerComfyHandlers(
+    settings as unknown as LibrarySettings,
+    assertInferenceAvailable,
+    { captureInferenceProfile }
+  );
+
+it("captures before policy and refuses launch from a retired profile across an ABA round trip", async () => {
+  const policy = deferred<void>();
+  const assertInferenceAvailable = vi
+    .fn(async () => {})
+    .mockReturnValueOnce(policy.promise);
+  let current = new AbortController();
+  const capture = vi.fn(() => current.signal);
+  registerOwnedComfy(assertInferenceAvailable, capture);
+  const stale = invoke(IPC_CHANNELS.comfyLaunch);
+  const rejected = expect(stale).rejects.toHaveProperty("name", "AbortError");
+  expect(capture).toHaveBeenCalledExactlyOnceWith(trusted.sender);
+  current.abort();
+  current = new AbortController();
+  current.abort();
+  current = new AbortController();
+  await invoke(IPC_CHANNELS.comfyLaunch);
+  policy.resolve();
+  await rejected;
+  expect(settings.getComfyEndpoint).toHaveBeenCalledOnce();
+  expect(mocks.launch).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      endpoint: "http://localhost:8188",
+      signal: expect.any(AbortSignal)
+    })
+  );
+});
+
+it("drops a late launch response and a late inferred installation instead of publishing readiness", async () => {
+  const launch = deferred<void>();
+  const setup = deferred<{ comfyRoot: string }>();
+  mocks.launch.mockReturnValueOnce(launch.promise);
+  mocks.scriptSetup.mockReturnValueOnce(setup.promise);
+  const controller = new AbortController();
+  registerOwnedComfy(
+    async () => {},
+    () => controller.signal
+  );
+  const launches = expect(
+    invoke(IPC_CHANNELS.comfyLaunch)
+  ).rejects.toHaveProperty("name", "AbortError");
+  const probes = expect(
+    invoke(IPC_CHANNELS.comfyScriptSetupStatus)
+  ).rejects.toHaveProperty("name", "AbortError");
+  await vi.waitFor(() => {
+    expect(mocks.launch).toHaveBeenCalledOnce();
+    expect(mocks.scriptSetup).toHaveBeenCalledOnce();
+  });
+  controller.abort();
+  launch.resolve();
+  setup.resolve({ comfyRoot: "/app/ComfyUI" });
+  await Promise.all([launches, probes]);
+  expect(settings.setInferredComfyInstall).not.toHaveBeenCalled();
+});
+
+it("does not probe or publish setup completion after a save's post-commit profile retires", async () => {
+  const controller = new AbortController();
+  const validation = deferred<void>();
+  const staleCheck = deferred<void>();
+  mocks.validate
+    .mockReturnValueOnce(staleCheck.promise)
+    .mockReturnValueOnce(validation.promise);
+  registerOwnedComfy(
+    async () => {},
+    () => controller.signal
+  );
+  const stale = expect(
+    invoke(IPC_CHANNELS.comfyCheck, "http://localhost:8188")
+  ).rejects.toHaveProperty("name", "AbortError");
+  await vi.waitFor(() => expect(mocks.validate).toHaveBeenCalledOnce());
+  const save = expect(
+    invoke(
+      IPC_CHANNELS.comfySave,
+      {
+        endpoint: "http://localhost:8188",
+        vlmBackend: "qwen3-vl-2b-gguf",
+        scriptTextModel: "qwen38-27b-q3"
+      },
+      { completeSetupOnConnection: true }
+    )
+  ).rejects.toHaveProperty("name", "AbortError");
+  await vi.waitFor(() => expect(mocks.validate).toHaveBeenCalledTimes(2));
+  expect(settings.saveComfyConfiguration).toHaveBeenCalledOnce();
+  staleCheck.resolve();
+  await stale;
+  controller.abort();
+  validation.resolve();
+  await save;
+  expect(settings.markLocalSetupCompleted).not.toHaveBeenCalled();
+});
+
+it("does not retire a pending launch when saving unchanged Comfy settings", async () => {
+  const controller = new AbortController();
+  const launch = deferred<void>();
+  mocks.launch.mockReturnValueOnce(launch.promise);
+  const commitComfyConfiguration = vi.fn(() => {
+    throw new Error("Unexpected configuration commit");
+  });
+  registerComfyHandlers(
+    settings as unknown as LibrarySettings,
+    async () => {},
+    {
+      captureInferenceProfile: () => controller.signal,
+      commitComfyConfiguration
+    }
+  );
+  const pending = invoke(IPC_CHANNELS.comfyLaunch);
+  await vi.waitFor(() => expect(mocks.launch).toHaveBeenCalledOnce());
+  await expect(
+    invoke(IPC_CHANNELS.comfySave, {
+      endpoint: "http://localhost:8188",
+      vlmBackend: "qwen3-vl-2b-gguf",
+      scriptTextModel: "qwen38-27b-q5"
+    })
+  ).resolves.toMatchObject({ available: true });
+  launch.resolve();
+  await expect(pending).resolves.toBeUndefined();
+  expect(commitComfyConfiguration).not.toHaveBeenCalled();
+  expect(settings.saveComfyConfiguration).not.toHaveBeenCalled();
+});
+
+it("keeps Comfy metadata available when the sender has no active account profile", async () => {
+  const policy = vi.fn(async () => {});
+  const capture = vi.fn(() => {
+    throw new Error("Sender retired");
+  });
+  registerOwnedComfy(policy, capture);
+  await expect(invoke(IPC_CHANNELS.comfyGet)).resolves.toMatchObject({
+    endpoint: "http://localhost:8188"
+  });
+  expect(capture).not.toHaveBeenCalled();
+  await expect(invoke(IPC_CHANNELS.comfyCheck)).rejects.toThrow(
+    "Sender retired"
+  );
+  expect(policy).not.toHaveBeenCalled();
+  expect(transport).not.toHaveBeenCalled();
 });

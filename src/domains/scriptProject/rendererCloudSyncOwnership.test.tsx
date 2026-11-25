@@ -109,6 +109,20 @@ const documents = [
 ];
 const aborts = (promise: Promise<unknown>) =>
   expect(promise).rejects.toMatchObject({ name: "AbortError" });
+const installAccount = () => {
+  const lifetime = new AbortController();
+  vi.stubGlobal("mago", {
+    account: {
+      mode: "cloud",
+      isCurrent: () => !lifetime.signal.aborted,
+      onRetired: (listener: () => void) => {
+        lifetime.signal.addEventListener("abort", listener, { once: true });
+        return () => lifetime.signal.removeEventListener("abort", listener);
+      }
+    }
+  });
+  return () => lifetime.abort();
+};
 const replace = async () => {
   await fixture.stop!();
   fixture.root = "b";
@@ -146,6 +160,7 @@ afterEach(async () => {
     rendererLibrary.reset();
   });
   vi.useRealTimers();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
@@ -304,11 +319,9 @@ describe("desktop cloud-sync producer ownership", () => {
     await second;
   });
 
-  it("keeps scheduler origin explicit and drains cache and cancellation acknowledgements without publishing old assets", async () => {
+  it("keeps scheduler origin explicit without waiting for main-owned script cache work or publishing old assets", async () => {
     const cached = deferred<void>();
-    const cancelled = deferred<void>();
     fixture.cache.mockReturnValueOnce(cached.promise);
-    fixture.cancel.mockReturnValueOnce(cancelled.promise);
     const enqueue = vi.spyOn(mediaDownloads, "enqueue");
     const work = rendererLibrary.capture();
     const listener = vi.fn();
@@ -327,12 +340,10 @@ describe("desktop cloud-sync producer ownership", () => {
       stopped = true;
     });
     await flush();
-    expect(fixture.cancel).toHaveBeenCalledWith("reused", documents[0].url);
-    cached.resolve();
-    await flush();
-    expect(stopped).toBe(false);
-    cancelled.resolve();
+    expect(fixture.cancel).not.toHaveBeenCalled();
+    expect(stopped).toBe(true);
     await stop;
+    cached.resolve();
     fixture.reset!();
     await hydration;
     expect(listener).not.toHaveBeenCalled();
@@ -534,11 +545,10 @@ it("refuses a late asset URL before cache IPC and keeps scheduler state scoped",
   expect(mediaDownloads.getAssetState("reused-asset")).toBeUndefined();
 });
 
-it("drains a video-cache IPC and its local cancellation response without old asset-ready events", async () => {
+it("retires a main-owned video-cache IPC without waiting before acknowledgement or publishing asset-ready", async () => {
+  const retire = installAccount();
   const cached = deferred<boolean>();
-  const cancelled = deferred<void>();
   fixture.cacheAsset.mockReturnValueOnce(cached.promise);
-  fixture.cancelAsset.mockReturnValueOnce(cancelled.promise);
   fixture.get.mockResolvedValueOnce({ data: project("timeline") });
   fixture.read.mockResolvedValue({
     timelines: [
@@ -557,17 +567,16 @@ it("drains a video-cache IPC and its local cancellation response without old ass
   const sync = syncCloudProject("reused");
   await flush();
   expect(fixture.cacheAsset).toHaveBeenCalledOnce();
+  retire();
   let stopped = false;
   const stop = fixture.stop!().then(() => {
     stopped = true;
   });
   await flush();
-  expect(fixture.cancelAsset).toHaveBeenCalledWith("reused", "reused-asset");
-  cached.resolve(true);
-  await flush();
-  expect(stopped).toBe(false);
-  cancelled.resolve();
+  expect(fixture.cancelAsset).not.toHaveBeenCalled();
+  expect(stopped).toBe(true);
   await stop;
+  cached.resolve(true);
   fixture.reset!();
   await sync;
   expect(listener).not.toHaveBeenCalled();
@@ -618,4 +627,96 @@ it("suppresses a cached snapshot's late post-write read before hydration", async
   fixture.reset!();
   await rejected;
   expect(fixture.cache).not.toHaveBeenCalled();
+});
+
+it("clears catalog progress and pending writes on account retirement without changing boot mode", async () => {
+  vi.useFakeTimers();
+  const retire = installAccount();
+  fixture.get.mockResolvedValueOnce({ data: { items: [project()] } });
+  const metadata = vi.fn();
+  subscribeCloudProjectMetadata(metadata);
+  const sync = syncCloudScriptProjects();
+  await flush();
+  expect(getCloudProjectCatalogSyncProgress()).toEqual({
+    completed: 0,
+    total: 1
+  });
+  expect(vi.getTimerCount()).toBe(1);
+  retire();
+  expect(getCloudProjectCatalogSyncProgress()).toBeNull();
+  expect(getCloudProjectSyncStatus()).toBe(false);
+  expect(vi.getTimerCount()).toBe(0);
+  await sync;
+  await vi.runAllTimersAsync();
+  expect(fixture.mirror).not.toHaveBeenCalled();
+  expect(metadata).not.toHaveBeenCalled();
+});
+
+it("drops late catalog failure and clears a deferred catalog retry on retirement", async () => {
+  vi.useFakeTimers();
+  const retire = installAccount();
+  const response = deferred<{ data: unknown }>();
+  fixture.get.mockReturnValueOnce(response.promise);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const sync = syncCloudScriptProjects();
+  await flush();
+  const signal = fixture.get.mock.calls[0][1].signal as AbortSignal;
+  deferCloudProjectCatalogSync();
+  expect(vi.getTimerCount()).toBe(1);
+  retire();
+  expect(signal.aborted).toBe(true);
+  expect(vi.getTimerCount()).toBe(0);
+  response.reject(new Error("stale transport"));
+  await sync;
+  await vi.runAllTimersAsync();
+  expect(warn).not.toHaveBeenCalled();
+  warn.mockRestore();
+  expect(fixture.get).toHaveBeenCalledOnce();
+});
+
+it("drains the post-save snapshot read but ignores its stale error and preserves the save", async () => {
+  const retire = installAccount();
+  const read = deferred<never>();
+  fixture.read.mockReturnValueOnce(read.promise);
+  const write = writeScriptProjectSnapshot({ projectId: "reused" });
+  await flush();
+  expect(fixture.put).toHaveBeenCalledWith({
+    projectId: "reused",
+    metadataOnly: true
+  });
+  expect(fixture.read).toHaveBeenCalledOnce();
+  retire();
+  // The write stays successful when only the optional lookup fails.
+  read.reject(new Error("stale hydration read"));
+  await expect(write).resolves.toBeUndefined();
+  expect(fixture.cache).not.toHaveBeenCalled();
+  await expect(readScriptProjectSnapshot("reused")).resolves.toBeNull();
+});
+
+it("clears mounted catalog invalidation timers on retirement without waiting for unmount", async () => {
+  vi.useFakeTimers();
+  const retire = installAccount();
+  fixture.get.mockResolvedValueOnce({
+    data: { items: [project("timeline"), project()] }
+  });
+  const client = new QueryClient();
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  const { result } = renderHook(() => useCloudProjectSync(), { wrapper });
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(75);
+  });
+  expect(fixture.mirror).toHaveBeenCalledOnce();
+  expect(result.current.isSyncing).toBe(true);
+  expect(vi.getTimerCount()).toBe(2);
+  act(retire);
+  expect(result.current.isSyncing).toBe(false);
+  expect(vi.getTimerCount()).toBe(0);
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(3000);
+  });
+  expect(fixture.mirror).toHaveBeenCalledOnce();
+  expect(invalidate).not.toHaveBeenCalled();
 });

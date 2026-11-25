@@ -4,6 +4,7 @@ import type { LocalModelGroupsStatus } from "../../shared/contracts";
 
 import type { InspectedModelGroup } from "./inspectLocalModelGroups";
 import { inspectLocalModelGroupsForInstall } from "./inspectLocalModelGroupsForInstall";
+import type { SetupAttempt } from "./setupAttempt";
 
 const missingBytesOf = (group: InspectedModelGroup) =>
   group.missingItems.reduce(
@@ -13,10 +14,15 @@ const missingBytesOf = (group: InspectedModelGroup) =>
 
 export const readLocalModelGroupsStatus = async (
   settings: Parameters<typeof inspectLocalModelGroupsForInstall>[0],
-  readVideoMemoryBytes: () => Promise<number | null>
+  readVideoMemoryBytes: () => Promise<number | null>,
+  attempt?: SetupAttempt
 ): Promise<LocalModelGroupsStatus> => {
   const { isGetStartedInstall, localModelsRoot, groups } =
-    await inspectLocalModelGroupsForInstall(settings, readVideoMemoryBytes);
+    await inspectLocalModelGroupsForInstall(
+      settings,
+      readVideoMemoryBytes,
+      attempt
+    );
   const installRootFreeBytes = localModelsRoot
     ? await statfs(localModelsRoot)
         .then((space) => Number(space.bavail) * Number(space.bsize))

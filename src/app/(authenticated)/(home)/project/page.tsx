@@ -57,6 +57,9 @@ import { useHotkeys } from "react-hotkeys-hook";
 import { useTranslation } from "react-i18next";
 
 import { isLocalApp } from "@/platform/localDesktop";
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 const HelpButton = dynamic(
@@ -72,6 +75,7 @@ const HelpButton = dynamic(
 const Project = () => {
   const selectedProjectId = useSelectedProjectId();
   const { selectedShotId } = useSelectedShotId();
+  const { work } = useRendererLibraryWork();
   const queryClient = useQueryClient();
   const activeScope = useAtomValue(activeHotkeyAtom);
   const isLocalSetupPillShown = useAtomValue(isLocalSetupPillShownAtom);
@@ -106,13 +110,16 @@ const Project = () => {
   const [isAllProjectsModalOpen, setIsAllProjectsModalOpen] = useAtom(
     isAllProjectsModalOpenAtom
   );
-  const [projectModalId, setProjectModalId] = useState<string | undefined>(
-    undefined
-  );
+  const [newProjectModal, setNewProjectModal] = useState<{
+    id: string;
+    work: RendererLibraryWork;
+  }>();
+  const projectModalId = newProjectModal?.work.signal.aborted
+    ? undefined
+    : newProjectModal?.id;
   useEffect(() => {
     setIsAllProjectsModalOpen(false);
   }, [setIsAllProjectsModalOpen]);
-  const [isNewlyCreatedProject, setIsNewlyCreatedProject] = useState(false);
 
   const { handleTabChange } = useProjectModeNavigation();
 
@@ -122,14 +129,18 @@ const Project = () => {
   const { open: handleCreateNewProject, dialog: createProjectTypeDialog } =
     useCreateProjectTypeDialog({
       onVideoProjectCreated: (newProject) => {
-        setIsNewlyCreatedProject(true);
-        setProjectModalId(newProject.id);
+        if (work.signal.aborted) return;
+        setNewProjectModal({ id: newProject.id, work });
       }
     });
   const handleProjectModalClose = () => {
-    if (isNewlyCreatedProject && projectModalId) {
+    if (
+      newProjectModal &&
+      !newProjectModal.work.signal.aborted &&
+      projectModalId
+    ) {
       const project = queryClient.getQueryData<Project>(
-        queryKeys.project.byId(projectModalId)
+        libraryQueryKey(queryKeys.project.byId(projectModalId))
       );
       const hasContent =
         !project ||
@@ -141,13 +152,15 @@ const Project = () => {
         void queryClient.cancelQueries({
           queryKey: queryKeys.homepage.all
         });
-        deleteProject({
-          projectId: projectModalId
-        });
+        deleteProject(
+          {
+            projectId: projectModalId
+          },
+          newProjectModal.work
+        );
       }
     }
-    setProjectModalId(undefined);
-    setIsNewlyCreatedProject(false);
+    setNewProjectModal(undefined);
   };
   const isProjectEditableInTimelineUi =
     selectedProject?.type !== SCRIPT_TO_SHOTS_PROJECT_TYPE;

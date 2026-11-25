@@ -1,4 +1,12 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -8,10 +16,13 @@ const mocks = vi.hoisted(() => ({
   userData: "",
   appListeners: new Map<string, () => void>(),
   handlers: new Map<string, unknown>(),
+  events: new Map<string, (event: unknown, ...args: unknown[]) => void>(),
+  nextLoad: undefined as (() => Promise<void>) | undefined,
   protocols: new Map<string, unknown>(),
   windows: [] as Array<{
     options: { webPreferences: { additionalArguments: string[] } };
     loadURL: ReturnType<typeof vi.fn>;
+    webContents: { mainFrame: { url: string }; send: ReturnType<typeof vi.fn> };
   }>,
   key: vi.fn(),
   netFetch: vi.fn(),
@@ -20,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   exit: vi.fn(),
   quit: vi.fn(),
   dialog: vi.fn(),
+  save: vi.fn(),
   choose: vi.fn()
 }));
 vi.mock("electron", () => {
@@ -29,17 +41,36 @@ vi.mock("electron", () => {
     unhandle: vi.fn(),
     registerSchemesAsPrivileged: vi.fn()
   };
-  const session = { defaultSession: { protocol } };
+  const session = {
+    defaultSession: { protocol, setCertificateVerifyProc: vi.fn() }
+  };
   class BrowserWindow {
     static getAllWindows = () => mocks.windows;
     static fromWebContents = () => mocks.windows[0];
     options;
-    loadURL = vi.fn(async () => {});
-    webContents = {
+    private destroyed = false;
+    loadURL = vi.fn(async (url: string) => {
+      this.webContents.mainFrame.url = url;
+      const nextLoad = mocks.nextLoad;
+      mocks.nextLoad = undefined;
+      await nextLoad?.();
+    });
+    webContents = Object.assign(new EventEmitter(), {
       setWindowOpenHandler: vi.fn(),
-      on: vi.fn(),
+      isDestroyed: () => this.destroyed,
+      mainFrame: { url: "" },
+      send: vi.fn(),
       session: session.defaultSession
-    };
+    });
+    isDestroyed() {
+      return this.destroyed;
+    }
+    destroy() {
+      this.destroyed = true;
+      this.webContents.emit("destroyed");
+      const index = mocks.windows.indexOf(this);
+      if (index >= 0) mocks.windows.splice(index, 1);
+    }
     on = vi.fn();
     once = vi.fn();
     constructor(options: {
@@ -68,7 +99,10 @@ vi.mock("electron", () => {
     ipcMain: {
       handle: (name: string, handler: unknown) =>
         mocks.handlers.set(name, handler),
-      on: vi.fn(),
+      on: (
+        name: string,
+        handler: (event: unknown, ...args: unknown[]) => void
+      ) => mocks.events.set(name, handler),
       removeHandler: vi.fn()
     },
     session,
@@ -78,6 +112,7 @@ vi.mock("electron", () => {
     dialog: {
       showMessageBox: mocks.dialog,
       showMessageBoxSync: mocks.dialog,
+      showSaveDialog: mocks.save,
       showOpenDialog: mocks.choose
     },
     shell: { openExternal: vi.fn(), showItemInFolder: vi.fn() }
@@ -117,6 +152,8 @@ it.each(["fal", "text", "vision"])(
     vi.clearAllMocks();
     mocks.appListeners.clear();
     mocks.handlers.clear();
+    mocks.events.clear();
+    mocks.nextLoad = undefined;
     mocks.protocols.clear();
     mocks.windows.length = 0;
     root = await mkdtemp(path.join(tmpdir(), "mago-main-network-audit-"));
@@ -280,8 +317,8 @@ it.each(["fal", "text", "vision"])(
         ) => Promise<unknown>
       )(
         {
-          senderFrame: { url: `https://${config.rendererHost}/` },
-          sender: { isDestroyed: () => false, send: vi.fn() }
+          senderFrame: mocks.windows[0].webContents.mainFrame,
+          sender: mocks.windows[0].webContents
         },
         ...args
       );
@@ -569,6 +606,563 @@ it.each(["fal", "text", "vision"])(
           cutJson: JSON.stringify({ versions: [{ id: "historical-output" }] })
         }
       ]);
+    } finally {
+      seed.close();
+    }
+  }
+);
+
+it("retires issued Cloud media, drains an active Save As, and rejects old IPC after same-library account ABA", async () => {
+  vi.resetModules();
+  vi.clearAllMocks();
+  mocks.appListeners.clear();
+  mocks.handlers.clear();
+  mocks.events.clear();
+  mocks.protocols.clear();
+  mocks.windows.length = 0;
+  root = await mkdtemp(path.join(tmpdir(), "mago-account-transition-"));
+  mocks.userData = path.join(root, "profile");
+  const library = path.join(root, "library");
+  await mkdir(mocks.userData);
+  const settingsPath = path.join(mocks.userData, "settings.json");
+  await writeFile(
+    settingsPath,
+    JSON.stringify({ libraryRoot: library, appMode: "cloud" })
+  );
+  vi.stubEnv("MAGO_PACKAGED_SMOKE", "1");
+  vi.stubEnv("MAGO_RENDERER_PORT", "47235");
+  vi.stubEnv("MAGO_RENDERER_URL", "");
+  vi.stubEnv(
+    "MAGO_MIGRATIONS_PATH",
+    path.join(process.cwd(), "desktop/main/database/migrations")
+  );
+  vi.stubGlobal("fetch", transport);
+  vi.stubGlobal("WebSocket", socket);
+  transport.mockRejectedValue(new Error("Unexpected Node fetch"));
+  const { IPC_CHANNELS } = await import("../shared/contracts.js");
+  const { resolveCloudConfig } = await import("../shared/cloudConfig.js");
+  const { DatabaseManager } = await import("./database/databaseManager.js");
+  const open = vi.spyOn(DatabaseManager.prototype, "open");
+  const { ImageRenderService } =
+    await import("./imageRenders/imageRenderService.js");
+  const start = vi
+    .spyOn(ImageRenderService.prototype, "startWithRecovery")
+    .mockImplementation(() => undefined);
+  await import("./application.js");
+  await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
+  const historical =
+    "https://" + resolveCloudConfig().cloudStorageHosts[0] + "/historical.mp4";
+  const cloudUrl =
+    "mago-media://cloud-storage/?url=" + encodeURIComponent(historical);
+  const media = mocks.protocols.get("mago-media") as (
+    request: Request
+  ) => Promise<Response>;
+  let deliver!: (response: Response) => void;
+  const upstream = new Promise<Response>((resolve) => {
+    deliver = resolve;
+  });
+  transport.mockReturnValueOnce(upstream);
+  const pending = media(new Request(cloudUrl));
+  await vi.waitFor(() => expect(transport).toHaveBeenCalledOnce());
+  let closeStreaming!: () => void;
+  const streamingClosed = new Promise<void>((resolve) => {
+    closeStreaming = resolve;
+  });
+  const streamingCanceled = vi.fn(() => streamingClosed);
+  transport.mockResolvedValueOnce(
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([7]));
+        },
+        cancel: streamingCanceled
+      })
+    )
+  );
+  const streaming = (await media(new Request(cloudUrl))).body!.getReader();
+  await expect(streaming.read()).resolves.toMatchObject({
+    value: new Uint8Array([7]),
+    done: false
+  });
+  const old = mocks.windows[0].webContents;
+  const invoke = (sender: typeof old, channel: string, ...args: unknown[]) =>
+    (
+      mocks.handlers.get(channel) as (
+        event: unknown,
+        ...args: unknown[]
+      ) => Promise<unknown>
+    )({ sender, senderFrame: sender.mainFrame }, ...args);
+  const destination = path.join(root, "export.mp4");
+  await writeFile(destination, "previous export");
+  mocks.save.mockResolvedValueOnce({ canceled: false, filePath: destination });
+  let closeSave!: () => void;
+  const closeSaveBody = new Promise<void>((resolve) => {
+    closeSave = resolve;
+  });
+  const saveBodyCanceled = vi.fn(() => closeSaveBody);
+  transport.mockResolvedValueOnce(
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+        },
+        cancel: saveBodyCanceled
+      })
+    )
+  );
+  const save = expect(
+    invoke(old, IPC_CHANNELS.filesSaveCloudStorageObjectAs, { url: historical })
+  ).rejects.toMatchObject({ name: "AbortError" });
+  await vi.waitFor(async () =>
+    expect(
+      (await readdir(root)).some((entry) => entry.endsWith(".partial"))
+    ).toBe(true)
+  );
+  const acknowledge = (sender: typeof old) =>
+    mocks.events.get(IPC_CHANNELS.accountRetiredAck)?.({
+      sender,
+      senderFrame: sender.mainFrame
+    });
+  const choose = (sender: typeof old, mode: string) =>
+    invoke(sender, IPC_CHANNELS.accountChooseMode, mode);
+  let finishLoad!: () => void;
+  mocks.nextLoad = () =>
+    new Promise<void>((resolve) => {
+      finishLoad = resolve;
+    });
+  const offline = choose(old, "offline");
+  await vi.waitFor(() =>
+    expect(old.send).toHaveBeenCalledWith(IPC_CHANNELS.accountRetired)
+  );
+  acknowledge(old);
+  try {
+    await vi.waitFor(() => expect(saveBodyCanceled).toHaveBeenCalledOnce());
+    expect(finishLoad).toBeUndefined();
+    expect(JSON.parse(await readFile(settingsPath, "utf8"))).toMatchObject({
+      appMode: "cloud"
+    });
+  } finally {
+    closeSave();
+  }
+  let finishProtocolCancel!: () => void;
+  const protocolClosed = new Promise<void>((resolve) => {
+    finishProtocolCancel = resolve;
+  });
+  const canceled = vi.fn(() => protocolClosed);
+  try {
+    await save;
+    expect(await readFile(destination, "utf8")).toBe("previous export");
+    expect(
+      (await readdir(root)).some((entry) => entry.endsWith(".partial"))
+    ).toBe(false);
+    deliver(new Response(new ReadableStream({ cancel: canceled })));
+    await vi.waitFor(() => expect(canceled).toHaveBeenCalledOnce());
+    expect(finishLoad).toBeUndefined();
+    expect(JSON.parse(await readFile(settingsPath, "utf8"))).toMatchObject({
+      appMode: "cloud"
+    });
+  } finally {
+    finishProtocolCancel();
+  }
+  try {
+    expect((await pending).status).toBe(404);
+    await vi.waitFor(() => expect(streamingCanceled).toHaveBeenCalledOnce());
+    await expect(streaming.read()).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    expect(finishLoad).toBeUndefined();
+    expect(JSON.parse(await readFile(settingsPath, "utf8"))).toMatchObject({
+      appMode: "cloud"
+    });
+  } finally {
+    closeStreaming();
+  }
+  await vi.waitFor(() => expect(finishLoad).toBeTypeOf("function"));
+  expect(JSON.parse(await readFile(settingsPath, "utf8"))).toMatchObject({
+    appMode: "offline",
+    libraryRoot: library
+  });
+  await expect(
+    invoke(old, IPC_CHANNELS.cloudPrepareUpload, { assetId: "old" })
+  ).rejects.toMatchObject({ name: "AbortError" });
+  await expect(
+    invoke(old, IPC_CHANNELS.cloudAssetInfo, "missing")
+  ).resolves.toBeNull();
+  finishLoad();
+  await offline;
+  const replacement = mocks.windows[0].webContents;
+  const cloud = choose(replacement, "cloud");
+  await vi.waitFor(() =>
+    expect(replacement.send).toHaveBeenCalledWith(IPC_CHANNELS.accountRetired)
+  );
+  acknowledge(replacement);
+  await cloud;
+  await expect(
+    invoke(old, IPC_CHANNELS.projectsMirrorCloud, { project: { id: "stale" } })
+  ).rejects.toThrow();
+  await expect(
+    invoke(mocks.windows[0].webContents, IPC_CHANNELS.cloudAssetInfo, "missing")
+  ).resolves.toBeNull();
+  expect(open).toHaveBeenCalledOnce();
+  expect(transport).toHaveBeenCalledTimes(3);
+});
+
+it.each([
+  ["account choose", "late-output"],
+  ["fal save", "late-output"],
+  ["account choose", "partial-output"],
+  ["fal save", "partial-output"],
+  ["account choose", "partial-storage-initiation"],
+  ["fal save", "partial-storage-initiation"]
+] as const)(
+  "blocks same-library %s until ordinary fal %s cleanup",
+  async (action, delivery) => {
+    const isUpload = delivery === "partial-storage-initiation";
+    vi.resetModules();
+    vi.clearAllMocks();
+    mocks.appListeners.clear();
+    mocks.handlers.clear();
+    mocks.events.clear();
+    mocks.protocols.clear();
+    mocks.windows.length = 0;
+    root = await mkdtemp(path.join(tmpdir(), "mago-ordinary-fal-drain-"));
+    mocks.userData = path.join(root, "profile");
+    const library = path.join(root, "library");
+    await mkdir(mocks.userData);
+    const settingsPath = path.join(mocks.userData, "settings.json");
+    const providersPath = path.join(mocks.userData, "external-providers.json");
+    const oldSettings = { libraryRoot: library, appMode: "cloud" };
+    const oldFal = { keychainAccount: "synthetic-fal-before" };
+    const newFal = { keychainAccount: "synthetic-fal-after" };
+    await writeFile(settingsPath, JSON.stringify(oldSettings));
+    await writeFile(providersPath, JSON.stringify({ fal: oldFal }));
+    vi.stubEnv("MAGO_PACKAGED_SMOKE", "1");
+    vi.stubEnv("MAGO_RENDERER_PORT", "47235");
+    vi.stubEnv("MAGO_RENDERER_URL", "");
+    vi.stubEnv(
+      "MAGO_MIGRATIONS_PATH",
+      path.join(process.cwd(), "desktop/main/database/migrations")
+    );
+    vi.stubGlobal("WebSocket", socket);
+    for (const forbidden of [
+      mocks.key,
+      mocks.httpRequest,
+      mocks.httpsRequest,
+      mocks.netFetch
+    ]) {
+      forbidden.mockImplementation(() => {
+        throw new Error(
+          "Unexpected process, credential lookup, or network request"
+        );
+      });
+    }
+    const outputUrl = "https://ordinary-fal-output.invalid/audit-output.png";
+    const storageUrl =
+      "https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3";
+    let deliver!: (response: Response) => void;
+    const headers = new Promise<Response>((resolve) => {
+      deliver = resolve;
+    });
+    let finishCleanup!: () => void;
+    const cleanup = new Promise<void>((resolve) => {
+      finishCleanup = resolve;
+    });
+    let partialBody: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const canceled = vi.fn(() => {
+      partialBody = undefined;
+      return cleanup;
+    });
+    const bytes = Uint8Array.of(7, 8, 9);
+    const partialJson = new TextEncoder().encode('{"file_url":"https://');
+    const pull = vi.fn();
+    const response = new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            if (delivery !== "late-output") {
+              partialBody = controller;
+              controller.enqueue(isUpload ? partialJson : bytes);
+            }
+          },
+          pull,
+          cancel: canceled
+        },
+        { highWaterMark: 0 }
+      ),
+      isUpload ? { headers: { "Content-Type": "application/json" } } : undefined
+    );
+    const fetchFixture = vi.fn((url: string, init?: RequestInit) => {
+      if (
+        url !== (isUpload ? storageUrl : outputUrl) ||
+        (init?.method ?? "GET") !== (isUpload ? "POST" : "GET")
+      ) {
+        throw new Error(`Unexpected fetch: ${init?.method ?? "GET"} ${url}`);
+      }
+      return isUpload ? Promise.resolve(response) : headers;
+    });
+    vi.stubGlobal("fetch", fetchFixture);
+    const { IPC_CHANNELS } = await import("../shared/contracts.js");
+    const { FAL_SHEET_MODEL } = await import("../shared/falSheetModel.js");
+    const { DatabaseManager } = await import("./database/databaseManager.js");
+    const {
+      assets,
+      externalRenderJobs,
+      ordinaryFalJobs,
+      projectAssets,
+      projects,
+      shots
+    } = await import("./database/schema.js");
+    const { ExternalRenderAssets } =
+      await import("./providers/externalRenderAssets.js");
+    const { ExternalRenderJobService } =
+      await import("./providers/externalRenderJobService.js");
+    const providerSettings =
+      await import("./providers/externalProviderSettings.js");
+    const readKey = vi.spyOn(providerSettings, "readExternalProviderKey");
+    if (isUpload) readKey.mockResolvedValue("synthetic-fal-key");
+    const jobId = "ordinary-fal-audit-output";
+    const requestId = "accepted-fal-audit-request";
+    const seed = new DatabaseManager();
+    await seed.open(library);
+    try {
+      const db = seed.get();
+      await db.insert(projects).values({ id: "project", name: "Fixture" });
+      if (isUpload) {
+        const sourcePath = path.join(library, "base.png");
+        await writeFile(sourcePath, bytes);
+        await db
+          .insert(shots)
+          .values({ id: "shot", projectId: "project", name: "Fixture" });
+        await db
+          .insert(assets)
+          .values({ id: "base", name: "base", type: "image", sourcePath });
+        await db
+          .insert(projectAssets)
+          .values({ projectId: "project", assetId: "base" });
+      } else {
+        await db.insert(ordinaryFalJobs).values({
+          jobId,
+          projectId: "project",
+          shotId: "shot",
+          model: FAL_SHEET_MODEL,
+          kind: "image-edit",
+          keychainAccount: oldFal.keychainAccount,
+          inputDigest: "synthetic-input-digest",
+          destination: {
+            kind: "image-edit",
+            frame: 0,
+            canvas: { width: 2, height: 2 }
+          },
+          effectiveSettings: {}
+        });
+        await db.insert(externalRenderJobs).values({
+          id: jobId,
+          projectId: "project",
+          provider: "fal",
+          endpoint: "fal-ai/nano-banana-2/edit",
+          kind: "image",
+          keychainAccount: oldFal.keychainAccount,
+          status: "OUTPUT_READY",
+          requestId,
+          requestJson: {},
+          inputAssetIds: [],
+          outputJson: { urls: [outputUrl] }
+        });
+      }
+    } finally {
+      seed.close();
+    }
+    const open = vi.spyOn(DatabaseManager.prototype, "open");
+    const download = vi.spyOn(ExternalRenderAssets.prototype, "download");
+    const submit = vi.spyOn(ExternalRenderJobService.prototype, "submit");
+    const cancel = vi.spyOn(ExternalRenderJobService.prototype, "cancel");
+    let transition: Promise<unknown> | undefined;
+    let submission: Promise<unknown> | undefined;
+    let acknowledge: (() => void) | undefined;
+    try {
+      await import("./application.js");
+      await vi.waitFor(() =>
+        expect(mocks.windows[0]?.webContents.mainFrame.url).toBeTruthy()
+      );
+      const sender = mocks.windows[0].webContents;
+      const event = { sender, senderFrame: sender.mainFrame };
+      const invoke = (channel: string, ...args: unknown[]) =>
+        (
+          mocks.handlers.get(channel) as (
+            event: unknown,
+            ...args: unknown[]
+          ) => Promise<unknown>
+        )(event, ...args);
+      if (isUpload) {
+        const expectedFal = await invoke(
+          IPC_CHANNELS.externalProvidersGet,
+          "fal"
+        );
+        submission = invoke(IPC_CHANNELS.ordinaryFalSubmit, {
+          expectedFal,
+          request: {
+            id: "3a7ac26a-292e-4def-8cd8-842802d354b1",
+            projectId: "project",
+            shotId: "shot",
+            kind: "image-edit",
+            model: FAL_SHEET_MODEL,
+            prompt: "Synthetic audit fixture",
+            baseAssetId: "base",
+            frame: 0,
+            canvas: { width: 2, height: 2 }
+          }
+        });
+        void submission.catch(() => {});
+        // With zero read-ahead, pull can only run once the initial bytes
+        // have been read and the parser has asked for more.
+        await vi.waitFor(() => expect(pull).toHaveBeenCalled());
+        expect(response.bodyUsed).toBe(true);
+        expect(response.body?.locked).toBe(true);
+        expect(readKey).toHaveBeenCalledExactlyOnceWith(
+          oldFal.keychainAccount,
+          expect.any(AbortSignal)
+        );
+      }
+      await vi.waitFor(() => expect(fetchFixture).toHaveBeenCalledOnce());
+      const signal = fetchFixture.mock.calls[0][1]!.signal!;
+      expect(signal.aborted).toBe(false);
+      let jobOutput: string | undefined;
+      if (!isUpload) {
+        const outputDir = path.join(library, "renders", "external");
+        const jobs = await readdir(outputDir);
+        expect(jobs).toHaveLength(1);
+        const directory = path.join(outputDir, jobs[0]);
+        jobOutput = directory;
+        if (delivery === "partial-output") {
+          deliver(response);
+          await vi.waitFor(async () => {
+            const files = await readdir(directory);
+            expect(files).toEqual([
+              expect.stringMatching(
+                /^\.output-1\.mago-[a-f0-9-]{36}\.tmp\.png$/
+              )
+            ]);
+            expect(await readFile(path.join(directory, files[0]))).toEqual(
+              Buffer.from(bytes)
+            );
+          });
+        } else {
+          expect(await readdir(directory)).toEqual([]);
+        }
+      }
+      expect(canceled).not.toHaveBeenCalled();
+      transition =
+        action === "account choose"
+          ? invoke(IPC_CHANNELS.accountChooseMode, "offline")
+          : invoke(IPC_CHANNELS.externalProvidersSave, "fal", newFal);
+      // Attach both handlers immediately, including on a failing assertion.
+      const settled = transition.then(
+        () => "settled",
+        () => "rejected"
+      );
+      if (action === "account choose") {
+        acknowledge = () =>
+          mocks.events.get(IPC_CHANNELS.accountRetiredAck)?.(event);
+        await vi.waitFor(() =>
+          expect(sender.send).toHaveBeenCalledWith(IPC_CHANNELS.accountRetired)
+        );
+        acknowledge();
+      }
+      await vi.waitFor(() => expect(signal.aborted).toBe(true));
+      if (delivery === "late-output") {
+        expect(canceled).not.toHaveBeenCalled();
+        // Deliver headers after abort, then hold the body's cancel promise.
+        deliver(response);
+      }
+      await vi.waitFor(
+        () =>
+          expect(
+            canceled,
+            "reader cancel after profile abort"
+          ).toHaveBeenCalledOnce(),
+        { timeout: 1000 }
+      );
+      const progress = await Promise.race([
+        settled,
+        new Promise<string>((resolve) =>
+          setTimeout(() => resolve("blocked"), 100)
+        )
+      ]);
+      expect(JSON.parse(await readFile(settingsPath, "utf8"))).toEqual(
+        oldSettings
+      );
+      expect(JSON.parse(await readFile(providersPath, "utf8"))).toEqual({
+        fal: oldFal
+      });
+      expect(progress).toBe("blocked");
+      expect(mocks.windows[0].webContents).toBe(sender);
+      finishCleanup();
+      await transition;
+      expect(JSON.parse(await readFile(settingsPath, "utf8"))).toEqual({
+        ...oldSettings,
+        appMode: action === "account choose" ? "offline" : "cloud"
+      });
+      expect(JSON.parse(await readFile(providersPath, "utf8"))).toEqual({
+        fal: action === "fal save" ? newFal : oldFal
+      });
+      expect(open).toHaveBeenCalledExactlyOnceWith(library);
+      if (isUpload) {
+        await expect(submission).rejects.toThrow();
+        // The only request is the free storage-initiation POST: no upload
+        // PUT, paid queue POST, or remote cancel may cross the retirement.
+        expect(
+          fetchFixture.mock.calls.map(([url, init]) => [init?.method, url])
+        ).toEqual([["POST", storageUrl]]);
+      } else {
+        expect(await readdir(jobOutput!)).toEqual([]);
+        expect(submit).not.toHaveBeenCalled();
+        expect(fetchFixture).toHaveBeenCalledExactlyOnceWith(outputUrl, {
+          redirect: "error",
+          signal
+        });
+      }
+      expect(cancel).not.toHaveBeenCalled();
+      for (const forbidden of [
+        mocks.key,
+        mocks.httpRequest,
+        mocks.httpsRequest,
+        mocks.netFetch,
+        socket
+      ]) {
+        expect(forbidden).not.toHaveBeenCalled();
+      }
+    } finally {
+      acknowledge?.();
+      deliver(response);
+      partialBody?.close();
+      finishCleanup();
+      await Promise.allSettled([
+        transition,
+        submission,
+        ...submit.mock.results.map(({ value }) => value),
+        ...download.mock.results.map(({ value }) => value)
+      ]);
+    }
+    mocks.appListeners.get("before-quit")?.();
+    mocks.appListeners.delete("before-quit");
+    await seed.open(library);
+    try {
+      if (isUpload) {
+        expect(await seed.get().select().from(externalRenderJobs)).toEqual([]);
+        return;
+      }
+      expect(await seed.get().select().from(externalRenderJobs)).toMatchObject([
+        {
+          id: jobId,
+          requestId,
+          status: "OUTPUT_READY",
+          outputJson: { urls: [outputUrl] }
+        }
+      ]);
+      expect(await seed.get().select().from(ordinaryFalJobs)).toMatchObject([
+        { jobId, placement: "PENDING", clipId: null }
+      ]);
+      expect(await seed.get().select().from(assets)).toEqual([]);
     } finally {
       seed.close();
     }

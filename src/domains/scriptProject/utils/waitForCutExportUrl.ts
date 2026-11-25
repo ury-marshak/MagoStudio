@@ -1,7 +1,26 @@
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+
 import { getProjectCut } from "../api/getProjectCut";
 
 const POLL_INTERVAL_MS = 3000;
 const MAX_POLL_ATTEMPTS = 100;
+
+const pollDelay = (durationMs: number, signal: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    signal.throwIfAborted();
+    const timeout = setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, durationMs);
+    const abort = () => {
+      clearTimeout(timeout);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+  });
 
 /** The exported MP4's URL, once the worker has uploaded it.
  *
@@ -12,17 +31,21 @@ const MAX_POLL_ATTEMPTS = 100;
 export const waitForCutExportUrl = async ({
   projectId,
   planId,
-  sleep = (durationMs: number) =>
-    new Promise<void>((resolve) => setTimeout(resolve, durationMs))
+  work = rendererLibrary.capture(),
+  sleep = pollDelay
 }: {
   projectId: string;
   planId: string;
-  sleep?: (durationMs: number) => Promise<void>;
+  work?: RendererLibraryWork;
+  sleep?: (durationMs: number, signal: AbortSignal) => Promise<void>;
 }): Promise<string | null> => {
   for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt += 1) {
-    await sleep(POLL_INTERVAL_MS);
+    work.check();
+    await sleep(POLL_INTERVAL_MS, work.signal);
+    work.check();
 
-    const cut = await getProjectCut(projectId);
+    const cut = await getProjectCut(projectId, { preferCache: false }, work);
+    work.check();
     const isThisExport = cut.export?.plan_id === planId;
 
     if (isThisExport && cut.export?.url) return cut.export.url;

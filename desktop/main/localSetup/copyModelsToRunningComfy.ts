@@ -6,9 +6,8 @@ import { atomicProduceFile } from "../storage/atomicFile";
 
 import { hashFile } from "./hashFile";
 import type { ModelGroupItem } from "./listModelGroupItems";
+import { readSetupInventory } from "./readSetupInventory";
 import { inferSetupFolders } from "./setupDestinations";
-
-const REQUEST_TIMEOUT_MS = 5_000;
 type ModelFileItem = Extract<ModelGroupItem, { kind: "model-file" }>;
 export type CopyModelToRunningComfy = ((
   item: ModelFileItem,
@@ -16,7 +15,8 @@ export type CopyModelToRunningComfy = ((
 ) => Promise<void>) & { comfyRoot: string };
 
 export const copyModelsToRunningComfy = async (
-  endpoint: string
+  endpoint: string,
+  signal?: AbortSignal
 ): Promise<CopyModelToRunningComfy | null> => {
   let folders: ReturnType<typeof inferSetupFolders>;
   try {
@@ -27,13 +27,8 @@ export const copyModelsToRunningComfy = async (
       )
     )
       return null;
-    const read = async (route: string) => {
-      const response = await fetch(`${normalized}${route}`, {
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-      });
-      if (!response.ok) throw new Error("ComfyUI folder inventory unavailable");
-      return response.json();
-    };
+    const read = (route: string) =>
+      readSetupInventory(normalized + route, signal);
     const [stats, inventory] = await Promise.all([
       read("/system_stats"),
       read("/experiment/models")
@@ -48,8 +43,10 @@ export const copyModelsToRunningComfy = async (
     )
       return null;
   } catch {
+    signal?.throwIfAborted();
     return null;
   }
+  signal?.throwIfAborted();
   const copy: CopyModelToRunningComfy = Object.assign(
     async (item: ModelFileItem, signal: AbortSignal) => {
       signal.throwIfAborted();
@@ -86,13 +83,17 @@ export const copyModelsToRunningComfy = async (
             "A different file already exists at the active ComfyUI destination"
           );
         }
+        signal.throwIfAborted();
         await mkdir(folder, { recursive: true });
-        await atomicProduceFile(destination, async (temporary) => {
-          await copyFile(item.absolutePath, temporary);
-          signal.throwIfAborted();
-          if ((await hashFile(temporary, signal)) !== item.sha256)
-            throw new Error("Copied model failed SHA-256 verification");
-        });
+        await atomicProduceFile(
+          destination,
+          async (temporary) => {
+            await copyFile(item.absolutePath, temporary);
+            if ((await hashFile(temporary, signal)) !== item.sha256)
+              throw new Error("Copied model failed SHA-256 verification");
+          },
+          signal
+        );
       } catch (error) {
         if (signal.aborted) throw error;
         throw new Error(

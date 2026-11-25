@@ -3,6 +3,7 @@ import { Layer } from "@schemas/layer";
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
 import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
@@ -19,7 +20,7 @@ export const usePostRender = ({
   const queryClient = useQueryClient();
   const onSuccess = (updatedLayer: Layer) => {
     queryClient.setQueryData<Project>(
-      queryKeys.project.byId(selectedProjectId),
+      libraryQueryKey(queryKeys.project.byId(selectedProjectId)),
       (project) =>
         buildUpdatedProjectAfterRender(project, selectedShotId, updatedLayer)
     );

@@ -8,6 +8,7 @@ import { useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 
 import { prepareLocalVideoImport } from "@/platform/prepareLocalVideoImport";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { useCloudBulkUpload } from "./useCloudBulkUpload";
@@ -16,6 +17,7 @@ const COMPLETE = 100;
 
 const useLocalBulkUpload = (projectId: string | undefined) => {
   const queryClient = useQueryClient();
+  const { work } = useRendererLibraryWork();
   const [bulkUploadState, setBulkUploadState] = useAtom(bulkUploadAtom);
   const { showToast } = useToast();
   const { t } = useTranslation();
@@ -42,7 +44,8 @@ const useLocalBulkUpload = (projectId: string | undefined) => {
       existingProjectId: string,
       targetFolderId: string
     ) => {
-      if (activeRef.current || files.length === 0) return;
+      if (work.signal.aborted || activeRef.current || files.length === 0)
+        return;
       activeRef.current = true;
       cancelAllRef.current = false;
       cancelledIds.current.clear();
@@ -61,6 +64,16 @@ const useLocalBulkUpload = (projectId: string | undefined) => {
         isPanelVisible: true
       });
 
+      const retire = () => {
+        activeRef.current = false;
+        setBulkUploadState({
+          isUploadInProgress: false,
+          files: [],
+          targetFolderId: "",
+          isPanelVisible: false
+        });
+      };
+      work.signal.addEventListener("abort", retire, { once: true });
       try {
         const imports = [];
         const activeItems = [];
@@ -69,10 +82,12 @@ const useLocalBulkUpload = (projectId: string | undefined) => {
             continue;
           updateFile(item.id, { status: "validating", progress: 10 });
           try {
-            imports.push(await prepareLocalVideoImport(item.file));
+            imports.push(await prepareLocalVideoImport(item.file, work));
+            work.check();
             activeItems.push(item);
             updateFile(item.id, { status: "uploading", progress: 70 });
           } catch (error) {
+            work.check();
             updateFile(item.id, {
               status: "error",
               progress: COMPLETE,
@@ -83,10 +98,13 @@ const useLocalBulkUpload = (projectId: string | undefined) => {
         }
 
         if (!cancelAllRef.current && imports.length > 0) {
+          await work.ready();
+          work.check();
           const created = await window.mago.projects.importVideos({
             projectId: existingProjectId,
             videos: imports
           });
+          work.check();
           for (const item of activeItems) {
             updateFile(item.id, { status: "completed", progress: COMPLETE });
           }
@@ -102,12 +120,14 @@ const useLocalBulkUpload = (projectId: string | undefined) => {
               queryKey: queryKeys.projectList.all
             })
           ]);
+          work.check();
           if (targetFolderId) {
             await placeShotsInFolder({
               shotIds: created.map((result) => result.shotId),
               targetFolderId
             });
           }
+          work.check();
           showToast({
             message: t("notifications.bulk_upload_complete.description", {
               successCount: activeItems.length,
@@ -116,6 +136,7 @@ const useLocalBulkUpload = (projectId: string | undefined) => {
           });
         }
       } catch (error) {
+        if (work.signal.aborted) return;
         for (const item of fileItems) {
           if (!cancelledIds.current.has(item.id)) {
             updateFile(item.id, {
@@ -127,11 +148,14 @@ const useLocalBulkUpload = (projectId: string | undefined) => {
           }
         }
       } finally {
-        activeRef.current = false;
-        setBulkUploadState((state) => ({
-          ...state,
-          isUploadInProgress: false
-        }));
+        work.signal.removeEventListener("abort", retire);
+        if (!work.signal.aborted) {
+          activeRef.current = false;
+          setBulkUploadState((state) => ({
+            ...state,
+            isUploadInProgress: false
+          }));
+        }
       }
     },
     [
@@ -140,7 +164,8 @@ const useLocalBulkUpload = (projectId: string | undefined) => {
       setBulkUploadState,
       showToast,
       t,
-      updateFile
+      updateFile,
+      work
     ]
   );
 

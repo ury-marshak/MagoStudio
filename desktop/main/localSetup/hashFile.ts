@@ -5,10 +5,19 @@ export const hashFile = async (
   file: string,
   signal?: AbortSignal
 ): Promise<string> => {
+  signal?.throwIfAborted();
   const hash = createHash("sha256");
-  for await (const chunk of createReadStream(file)) {
+  const source = createReadStream(file, { signal });
+  const closed = new Promise<void>((resolve) => source.once("close", resolve));
+  try {
+    for await (const chunk of source) {
+      signal?.throwIfAborted();
+      hash.update(chunk);
+    }
     signal?.throwIfAborted();
-    hash.update(chunk);
+    return hash.digest("hex");
+  } finally {
+    source.destroy();
+    await closed;
   }
-  return hash.digest("hex");
 };

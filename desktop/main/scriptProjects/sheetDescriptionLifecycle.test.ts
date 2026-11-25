@@ -79,6 +79,7 @@ const setup = () => {
         projectId: string;
         cancelled: boolean;
         abortController: AbortController;
+        signal: AbortSignal;
       }
     ) => Promise<void>;
     requestSheetDescription: (
@@ -156,7 +157,8 @@ describe("sheet-plan description cancellation boundary", () => {
         projectId: "project",
         planId: "plan",
         cancelled: false,
-        abortController: controller
+        abortController: controller,
+        signal: controller.signal
       }
     );
 

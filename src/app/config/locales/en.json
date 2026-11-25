@@ -3416,6 +3416,15 @@
     "sequential_opening_frame_pin": {
       "label": "Open on the previous frame (experimental)"
     },
+    "fal_opening_frame_hint": {
+      "label": "For H3 Max (fal), the previous shot’s final frame sets the canvas and must match this shot’s aspect. If both shots render in the same run, this is checked once the previous shot finishes."
+    },
+    "shot_blocked_fal_opening_frame_aspect": {
+      "label": "The previous frame doesn’t match this shot’s H3 Max aspect. Change the aspect or choose Cut or Loose reference."
+    },
+    "shot_blocked_fal_opening_frame_number": {
+      "label": "The opening frame is not numbered. Remove its Image number from the prompt or choose Cut or Loose reference."
+    },
     "sequential_opening_frame_off": {
       "label": "Loose reference only"
     },

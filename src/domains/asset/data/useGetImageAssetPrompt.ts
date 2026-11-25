@@ -2,6 +2,7 @@ import { useImageAsset } from "@domains/asset/useImageAsset";
 import { useVlmStatus } from "@domains/prompt/useVlmStatus";
 import { useQuery } from "@tanstack/react-query";
 
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
 import { queryKeys } from "@/queryKeys";
 
 import { getAssetPrompt } from "../api/getAssetPrompt";
@@ -29,20 +30,26 @@ export const useGetImageAssetPrompt = ({
 
   const assetExistingPrompt = imageAsset?.asset?.data?.prompt;
 
+  const scope = useRendererLibraryQueryScope();
   return useQuery({
-    queryKey: queryKeys.assetPrompt.byId(assetId),
-    queryFn: ({ signal }) => {
-      if (assetExistingPrompt) {
-        return {
-          prompt: assetExistingPrompt
-        };
-      }
-      return getAssetPrompt(assetId, signal);
-    },
+    queryKey: scope.key(queryKeys.assetPrompt.byId(assetId)),
+    queryFn: ({ signal }) =>
+      scope.run(async () => {
+        if (assetExistingPrompt) {
+          return {
+            prompt: assetExistingPrompt
+          };
+        }
+        return getAssetPrompt(
+          assetId,
+          AbortSignal.any([signal, scope.work.signal])
+        );
+      }),
     select: selectPromptWithFormattedText,
     // A cached prompt is a free read; generating one locally is a multi-minute
     // ComfyUI job, so only run when Qwen3-VL is actually reachable.
     enabled:
+      scope.active &&
       !!assetId &&
       enabled &&
       !isImageAssetLoading &&

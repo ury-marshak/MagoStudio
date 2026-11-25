@@ -1,4 +1,4 @@
-import { ipcMain } from "electron";
+import { ipcMain, type WebContents } from "electron";
 
 import {
   IPC_CHANNELS,
@@ -35,7 +35,8 @@ const string = (value: unknown, name: string, allowEmpty = false): string => {
 
 export const registerImageRenderHandlers = (
   service: ImageRenderService,
-  cloudRenderJobs: CloudRenderJobRepository
+  cloudRenderJobs: CloudRenderJobRepository,
+  captureInferenceProfile?: (sender: WebContents) => AbortSignal
 ): void => {
   ipcMain.handle(IPC_CHANNELS.imageRendersSubmit, async (event, value) => {
     requireTrustedSender(event);
@@ -62,31 +63,34 @@ export const registerImageRenderHandlers = (
       input.frame < 0
     )
       throw new Error("frame must be a non-negative integer");
-    return service.submit({
-      projectId: string(input.projectId, "projectId"),
-      shotId: string(input.shotId, "shotId"),
-      sourceAssetId: string(input.sourceAssetId, "sourceAssetId"),
-      frame: input.frame,
-      name: string(input.name, "name"),
-      model,
-      inputImage:
-        input.inputImage === undefined
-          ? undefined
-          : string(input.inputImage, "inputImage", true),
-      inputImageId:
-        input.inputImageId === undefined
-          ? undefined
-          : string(input.inputImageId, "inputImageId"),
-      referenceImageIds: input.referenceImageIds as string[],
-      maskImageIds: input.maskImageIds as string[] | undefined,
-      estimatedCostUsd:
-        typeof input.estimatedCostUsd === "number" &&
-        Number.isFinite(input.estimatedCostUsd) &&
-        input.estimatedCostUsd >= 0
-          ? input.estimatedCostUsd
-          : undefined,
-      settings: record(input.settings)
-    } satisfies LocalImageRenderInput);
+    return service.submit(
+      {
+        projectId: string(input.projectId, "projectId"),
+        shotId: string(input.shotId, "shotId"),
+        sourceAssetId: string(input.sourceAssetId, "sourceAssetId"),
+        frame: input.frame,
+        name: string(input.name, "name"),
+        model,
+        inputImage:
+          input.inputImage === undefined
+            ? undefined
+            : string(input.inputImage, "inputImage", true),
+        inputImageId:
+          input.inputImageId === undefined
+            ? undefined
+            : string(input.inputImageId, "inputImageId"),
+        referenceImageIds: input.referenceImageIds as string[],
+        maskImageIds: input.maskImageIds as string[] | undefined,
+        estimatedCostUsd:
+          typeof input.estimatedCostUsd === "number" &&
+          Number.isFinite(input.estimatedCostUsd) &&
+          input.estimatedCostUsd >= 0
+            ? input.estimatedCostUsd
+            : undefined,
+        settings: record(input.settings)
+      } satisfies LocalImageRenderInput,
+      captureInferenceProfile?.(event.sender)
+    );
   });
   ipcMain.handle(IPC_CHANNELS.imageRendersListQueue, async (event) => {
     requireTrustedSender(event);
@@ -138,16 +142,19 @@ export const registerImageRenderHandlers = (
       input.estimatedCostUsd < 0
     )
       throw new Error("estimatedCostUsd must be non-negative");
-    return service.submitVideo({
-      outputTrackId: string(input.outputTrackId, "outputTrackId"),
-      inputTrackId: string(input.inputTrackId, "inputTrackId"),
-      frameRange: input.frameRange as [number, number],
-      fps: input.fps,
-      model: videoModel,
-      referenceImageIds: input.referenceImageIds as string[],
-      estimatedCostUsd: input.estimatedCostUsd,
-      settings: record(input.settings)
-    } satisfies LocalVideoRenderInput);
+    return service.submitVideo(
+      {
+        outputTrackId: string(input.outputTrackId, "outputTrackId"),
+        inputTrackId: string(input.inputTrackId, "inputTrackId"),
+        frameRange: input.frameRange as [number, number],
+        fps: input.fps,
+        model: videoModel,
+        referenceImageIds: input.referenceImageIds as string[],
+        estimatedCostUsd: input.estimatedCostUsd,
+        settings: record(input.settings)
+      } satisfies LocalVideoRenderInput,
+      captureInferenceProfile?.(event.sender)
+    );
   });
   ipcMain.handle(IPC_CHANNELS.imageRendersCancel, async (event, jobId) => {
     requireTrustedSender(event);
@@ -155,7 +162,10 @@ export const registerImageRenderHandlers = (
     // is context only: library switching must not wait for provider cancellation.
     return cloudRenderJobs.libraryWork.run(async () => {
       const renderJobId = string(jobId, "jobId");
-      await service.cancel(renderJobId);
+      await service.cancel(
+        renderJobId,
+        captureInferenceProfile?.(event.sender)
+      );
       await cloudRenderJobs.cancelActive(renderJobId);
     });
   });

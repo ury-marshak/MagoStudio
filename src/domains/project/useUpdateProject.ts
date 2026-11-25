@@ -1,6 +1,7 @@
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
 import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
 import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
@@ -33,13 +34,13 @@ export const useUpdateProject = <Context = unknown>({
         settings: persistedSettings ?? variables.settings
       };
       queryClient.setQueryData(
-        queryKeys.project.byId(variables.projectId),
+        libraryQueryKey(queryKeys.project.byId(variables.projectId)),
         (oldProject: Project | undefined) =>
           applyProjectUpdateToCache(oldProject, cachedVariables)
       );
 
       queryClient.setQueryData(
-        queryKeys.projects.all,
+        libraryQueryKey(queryKeys.projects.all),
         (old: Project[] | undefined) => {
           if (!old) return old;
           return old.map((project) =>

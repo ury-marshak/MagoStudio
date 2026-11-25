@@ -10,7 +10,10 @@ import {
   stripQwenReasoning
 } from "./localScriptProjectService";
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 it("refreshes version status from this snapshot's plans without scanning other projects", async () => {
   const plans: Record<string, Record<string, unknown>> = {
@@ -1028,6 +1031,10 @@ const createInMemoryScriptProjectStore = (
     localModel?: ConstructorParameters<typeof LocalScriptProjectService>[3];
     cloud?: ConstructorParameters<typeof LocalScriptProjectService>[5];
     external?: ConstructorParameters<typeof LocalScriptProjectService>[7];
+    captureProfile?: () => AbortSignal;
+    endpoint?: () => Promise<string>;
+    describe?: ConstructorParameters<typeof LocalScriptProjectService>[4];
+    jobs?: ConstructorParameters<typeof LocalScriptProjectService>[8];
   } = {}
 ) => {
   const stored: {
@@ -1045,6 +1052,11 @@ const createInMemoryScriptProjectStore = (
       if (input.state) stored.state = input.state;
     },
     resolveMediaPath: async (id: string) => `/mock/${id}.png`,
+    storeGeneratedMedia: async (_projectId: string, bytes: Buffer) => ({
+      id: bytes.toString(),
+      url: "mago-media://script-project/generated",
+      path: "/mock/generated.png"
+    }),
     getPlan: async (id: string) => plans.get(id) ?? null,
     putPlan: async (
       _projectId: string,
@@ -1063,15 +1075,277 @@ const createInMemoryScriptProjectStore = (
       })
     } as never,
     snapshots as never,
-    async () => "http://127.0.0.1:8188",
+    textOptions.endpoint ?? (async () => "http://127.0.0.1:8188"),
     textOptions.localModel,
-    undefined,
+    textOptions.describe,
     textOptions.cloud,
     undefined,
-    textOptions.external
+    textOptions.external,
+    textOptions.jobs,
+    undefined,
+    undefined,
+    textOptions.captureProfile
   );
   return { service, stored, plans };
 };
+
+describe("Director inference profile retirement", () => {
+  const deferred = <T>() => {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  };
+  const input = {
+    projectId: "project-1",
+    tokens: ["room"],
+    isDryRun: false,
+    settings: { render_model: "qwen_image_2512_local" }
+  };
+  const state = () => ({
+    keys: [
+      {
+        token: "room",
+        kind: "location",
+        name: "Room",
+        prompt: "A room",
+        images: []
+      }
+    ],
+    shots: []
+  });
+
+  it.each([false, true])(
+    "never resubmits a retired Comfy sheet (known ID: %s)",
+    async (accepted) => {
+      const original = new AbortController();
+      const replacement = new AbortController();
+      let host = "http://old.invalid:8188";
+      let retired = false;
+      const { service, plans, stored } = createInMemoryScriptProjectStore(
+        state(),
+        {
+          endpoint: async () => host
+        }
+      );
+      const dispatched = deferred<void>();
+      const delayed = deferred<Response>();
+      vi.stubGlobal("WebSocket", undefined);
+      const fetch = vi.fn(async (url: URL | string) => {
+        const request = String(url);
+        if (request.endsWith("/prompt")) {
+          if (accepted) return Response.json({ prompt_id: "accepted-id" });
+          if (!retired) {
+            dispatched.resolve();
+            return delayed.promise;
+          }
+        }
+        if (request.endsWith("/history/accepted-id")) {
+          if (!retired) {
+            dispatched.resolve();
+            return delayed.promise;
+          }
+          return Response.json({
+            "accepted-id": {
+              status: { completed: true },
+              outputs: { "11": { images: [{ filename: "sheet.png" }] } }
+            }
+          });
+        }
+        if (request.includes("/view?")) return new Response("sheet");
+        throw new Error("Unexpected request: " + request);
+      });
+      vi.stubGlobal("fetch", fetch);
+      const planId = String(
+        (await service.generateSheets(input, original.signal)).plan_id
+      );
+      await dispatched.promise;
+      retired = true;
+      original.abort();
+      host = "http://new.invalid:8188";
+      await vi.waitFor(() => expect(plans.get(planId)?.status).toBe("PAUSED"));
+      delayed.resolve(Response.json({ prompt_id: "too-late" }));
+
+      await service.resumePlan(planId, false, replacement.signal);
+      await vi.waitFor(() =>
+        expect(plans.get(planId)?.status).toBe(
+          accepted ? "COMPLETED" : "PAUSED"
+        )
+      );
+      if (accepted) {
+        expect(fetch.mock.calls.map(([url]) => String(url))).toContain(
+          "http://old.invalid:8188/history/accepted-id"
+        );
+        expect(stored.state.keys).toEqual([
+          expect.objectContaining({ effective_asset_id: "sheet" })
+        ]);
+      } else {
+        expect(plans.get(planId)?.error).toEqual({
+          message: expect.stringContaining("may have accepted")
+        });
+        await expect(
+          service.generateSheets(input, replacement.signal)
+        ).rejects.toThrow("may have accepted");
+      }
+      const urls = fetch.mock.calls.map(([url]) => String(url));
+      expect(urls.filter((url) => url.endsWith("/prompt"))).toHaveLength(1);
+      expect(urls.some((url) => /\/(interrupt|queue)$/.test(url))).toBe(false);
+    }
+  );
+
+  it("does not dispatch queued sheets from a retired profile", async () => {
+    const profile = new AbortController();
+    const active = deferred<void>();
+    const renderSheets = vi
+      .spyOn(
+        LocalScriptProjectService.prototype as unknown as {
+          renderSheets: () => Promise<void>;
+        },
+        "renderSheets"
+      )
+      .mockImplementation(() => active.promise);
+    const { service, plans } = createInMemoryScriptProjectStore(state());
+    await service.generateSheets(input, profile.signal);
+    const queued = await service.generateSheets(
+      { ...input, settings: { ...input.settings, prompt: "Queued edit" } },
+      profile.signal
+    );
+    expect(renderSheets).toHaveBeenCalledTimes(1);
+    profile.abort();
+    active.resolve();
+    await vi.waitFor(() =>
+      expect(plans.get(String(queued.plan_id))?.status).toBe("PAUSED")
+    );
+    expect(renderSheets).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not cancel a fal job when the Director polling profile retires", async () => {
+    const profile = new AbortController();
+    const started = deferred<void>();
+    const job = {
+      projectId: "project-1",
+      id: "fal-job",
+      requestId: "accepted",
+      status: "SUBMITTED",
+      inputAssetIds: [],
+      requestJson: { prompt: "The room" }
+    };
+    const cancel = vi.fn();
+    const jobs = {
+      get: vi.fn(async () => job),
+      submit: vi.fn(),
+      cancel,
+      refresh: vi.fn(async (_id, signal: AbortSignal) => {
+        started.resolve();
+        return new Promise((_resolve, reject) =>
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true
+          })
+        );
+      })
+    };
+    const { service, plans } = createInMemoryScriptProjectStore(state(), {
+      jobs: jobs as never
+    });
+    const plan = await service.generateSheets(
+      { ...input, settings: { render_model: "fal_nano_banana_2_1" } },
+      profile.signal
+    );
+    await started.promise;
+    profile.abort();
+    await vi.waitFor(() =>
+      expect(plans.get(String(plan.plan_id))?.status).toBe("PAUSED")
+    );
+    expect(cancel).not.toHaveBeenCalled();
+    expect(jobs.submit).not.toHaveBeenCalled();
+    expect(jobs.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases casting on retirement even if external inference ignores abort", async () => {
+    const original = new AbortController();
+    const replacement = new AbortController();
+    let current = original.signal;
+    const dispatched = deferred<AbortSignal | undefined>();
+    const pending = deferred<{ text: string; model: string }>();
+    const infer = vi.fn(({ signal }: { signal?: AbortSignal }) => {
+      dispatched.resolve(signal);
+      return pending.promise;
+    });
+    const { service, plans } = createInMemoryScriptProjectStore(state(), {
+      external: async () => infer,
+      captureProfile: () => current
+    });
+    const plan = await service.cast({
+      projectId: "project-1",
+      script: "A door opens.",
+      maxShots: 1
+    });
+    const signal = await dispatched.promise;
+    original.abort();
+    current = replacement.signal;
+    expect(signal?.aborted).toBe(true);
+    await vi.waitFor(() =>
+      expect(plans.get(plan.plan_id)?.status).toBe("PAUSED")
+    );
+    pending.resolve({ text: '{"title":"late"}', model: "old" });
+    await waitForProjectRunToSettle();
+    expect(infer).toHaveBeenCalledTimes(1);
+    expect(plans.get(plan.plan_id)?.status).toBe("PAUSED");
+  });
+
+  it("isolates same-image description work by the original profile and ignores a late caption", async () => {
+    const original = new AbortController();
+    const replacement = new AbortController();
+    const started = deferred<void>();
+    const pending = deferred<string>();
+    const describeImage = vi.fn(async (_path, _kind, _signal, profile) => {
+      if (profile !== original.signal) return "Fresh description";
+      started.resolve();
+      return pending.promise;
+    });
+    const { service, stored } = createInMemoryScriptProjectStore(
+      {
+        keys: [
+          {
+            token: "room",
+            kind: "location",
+            effective_asset_id: "asset",
+            images: [{ asset_id: "asset" }]
+          }
+        ]
+      },
+      { describe: describeImage }
+    );
+    const describeInput = {
+      projectId: "project-1",
+      operation: "describe-sheet" as const,
+      payload: { token: "room" }
+    };
+    const old = service.update(
+      describeInput,
+      undefined,
+      undefined,
+      original.signal
+    );
+    const aborted = expect(old).rejects.toMatchObject({ name: "AbortError" });
+    await started.promise;
+    original.abort();
+    await aborted;
+    await expect(
+      service.update(describeInput, undefined, undefined, replacement.signal)
+    ).resolves.toMatchObject({
+      images: [expect.objectContaining({ description: "Fresh description" })]
+    });
+    pending.resolve("Stale description");
+    await waitForProjectRunToSettle();
+    expect(stored.state.keys).toEqual([
+      expect.objectContaining({
+        images: [expect.objectContaining({ description: "Fresh description" })]
+      })
+    ]);
+  });
+});
 
 const waitForProjectRunToSettle = () =>
   new Promise((resolve) => setTimeout(resolve, 0));

@@ -320,7 +320,45 @@ describe("LocalScriptChatService", () => {
     });
     runs.resolvers[1]!(REPLY);
     await waitFor(async () => !(await chat.list(projectId)).pending);
-    expect((await chat.list(projectId)).messages[1]?.status).toBe("FAILED");
+    const settled = (await chat.list(projectId)).messages;
+    expect(settled.find(({ id }) => id === first.message_id)?.status).toBe(
+      "FAILED"
+    );
+    expect(settled.find(({ id }) => id === next.message_id)?.status).toBe(
+      "COMPLETED"
+    );
+  });
+
+  test("the replacement profile starts a new turn while old inference ignores abort", async () => {
+    const { projectId, messages } = await setup();
+    const runs = deferredRuns();
+    const profile = new AbortController();
+    const nextProfile = new AbortController();
+    const chat = new LocalScriptChatService(messages, async () => {}, runs.run);
+    const old = await chat.post(
+      { projectId, message: "old", tools: TOOLS },
+      profile.signal
+    );
+    expect(runs.prompts).toHaveLength(1);
+    profile.abort();
+
+    const next = await chat.post(
+      { projectId, message: "new", tools: TOOLS },
+      nextProfile.signal
+    );
+    expect(next.message_id).not.toBe(old.message_id);
+    expect(runs.prompts).toHaveLength(2);
+    runs.resolvers[0]!("malformed");
+    runs.resolvers[1]!(REPLY);
+    await waitFor(async () => !(await chat.list(projectId)).pending);
+    expect(runs.prompts).toHaveLength(2);
+    const transcript = (await chat.list(projectId)).messages;
+    expect(transcript.find(({ id }) => id === old.message_id)?.status).toBe(
+      "FAILED"
+    );
+    expect(transcript.find(({ id }) => id === next.message_id)?.status).toBe(
+      "COMPLETED"
+    );
   });
 
   test.each(["malformed", REPLY])(

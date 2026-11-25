@@ -1,6 +1,13 @@
-import { AsyncResource } from "node:async_hooks";
+import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, stat } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  readFile,
+  rm,
+  stat,
+  writeFile
+} from "node:fs/promises";
 import path from "node:path";
 
 import { and, asc, eq, inArray } from "drizzle-orm";
@@ -12,13 +19,16 @@ import type {
   LocalQueueItem,
   LocalVideoRenderInput
 } from "../../shared/contracts";
-import { ComfyClient } from "../comfy/ComfyClient";
+import { ComfyClient, drainComfyProfile } from "../comfy/ComfyClient";
 import type { ComfyLivePrompt } from "../comfy/ComfyProgressMonitor";
 import {
   comfyProgressMonitorFor,
   onAnyComfyPromptSettled
 } from "../comfy/comfyProgressMonitors";
-import { readComfyPromptWithSafetyPoll } from "../comfy/readComfyPromptWithSafetyPoll";
+import {
+  awaitComfyAbort,
+  readComfyPromptWithSafetyPoll
+} from "../comfy/readComfyPromptWithSafetyPoll";
 import { DatabaseManager } from "../database/databaseManager";
 import {
   assets,
@@ -37,7 +47,6 @@ import { validateVideo } from "../media/validateVideo";
 import { InferenceUnavailableError } from "../providers/inferenceUnavailableError";
 import {
   atomicWriteFile,
-  atomicCopyFile,
   atomicProduceFile,
   publishFile
 } from "../storage/atomicFile";
@@ -174,12 +183,18 @@ export const buildVideoThumbnailArgs = (
   outputPath
 ];
 
+type ComfySubmissionMetadata = {
+  // False is proof the POST has not started; older rows without it may already
+  // have been accepted before this process had a chance to save the ID.
+  comfySubmissionStarted?: boolean;
+};
+
 type StoredImageRequest = Omit<LocalImageRenderInput, "inputImage"> & {
   kind?: "image";
   inputRelativePath?: string;
   inputImageId?: string;
   comfyEndpoint?: string;
-};
+} & ComfySubmissionMetadata;
 
 type StoredVideoRequest = LocalVideoRenderInput & {
   kind: "video";
@@ -195,7 +210,7 @@ type StoredVideoRequest = LocalVideoRenderInput & {
   comfyEndpoint?: string;
   inputCrop?: CropRect;
   cropBack?: CropBack;
-};
+} & ComfySubmissionMetadata;
 
 type StoredImageToVideoRequest = LocalVideoRenderInput & {
   kind: "image-to-video";
@@ -252,6 +267,17 @@ const readRenderRequest = (value: string): StoredRequest => {
       "Saved render settings are damaged. The original data has been kept."
     );
   return request;
+};
+
+const hasUnknownComfySubmission = (
+  job: typeof imageRenderJobs.$inferSelect
+): boolean => {
+  if (job.providerRequestId || !isComfyRenderModel(job.model)) return false;
+  return (
+    job.status !== "PENDING" ||
+    parseJson<ComfySubmissionMetadata>(job.requestJson)
+      .comfySubmissionStarted !== false
+  );
 };
 
 const DEFAULT_RAW_VIDEO_CONTROL_STRENGTH = 0.5;
@@ -364,23 +390,42 @@ export const planSettingsCrop = (
   return { plan, sourceDimensions: declaredDimensions };
 };
 
+type RenderKick = {
+  profile?: AbortSignal;
+  requested: boolean;
+  submittingJobId?: string;
+};
+
 export class ImageRenderService {
+  private readonly inferenceProfile = new AsyncLocalStorage<
+    AbortSignal | undefined
+  >();
+  private readonly issuedLocalWork = new WeakMap<
+    AbortSignal,
+    Set<Promise<unknown>>
+  >();
   readonly libraryWork = new LibraryWorkSession(() => ({
     timer: null as NodeJS.Timeout | null,
-    processing: false,
-    isKickRequestedDuringProcessing: false,
+    recovering: false,
+    kick: undefined as RenderKick | undefined,
+    pollingProfile: undefined as AbortSignal | undefined,
+    previousDrain: undefined as Promise<void> | undefined,
+    pendingProfiles: new Map<string, AbortSignal>(),
     stopListeningForComfySettles: null as (() => void) | null,
     comfyStatusCheckedAtByJobId: new Map<string, number>()
   }));
-  private readonly files = this.libraryWork.guard({
-    mkdir,
-    readFile,
-    stat,
-    atomicWriteFile,
-    atomicCopyFile,
-    atomicProduceFile,
-    publishFile
-  });
+  private readonly files = this.guardProfile(
+    this.libraryWork.guard({
+      mkdir,
+      readFile,
+      stat,
+      copyFile,
+      writeFile,
+      atomicWriteFile,
+      atomicProduceFile,
+      publishFile
+    })
+  );
 
   constructor(
     private readonly manager: DatabaseManager,
@@ -393,38 +438,47 @@ export class ImageRenderService {
     ) => void,
     /** Gates saved endpoints too, not only endpoint lookup for new renders. */
     private readonly assertInferenceAvailable: () => Promise<void> = async () => {},
-    private readonly captureImageSession?: () => AbortSignal
+    private readonly captureImageSession?: () => AbortSignal,
+    private readonly captureInferenceProfile?: () => AbortSignal
   ) {
     this.manager = this.libraryWork.guard(manager);
     this.getLibraryRoot = this.libraryWork.guard({
       getLibraryRoot
     }).getLibraryRoot;
-    this.getComfyEndpoint = this.libraryWork.bind(getComfyEndpoint);
-    this.assertInferenceAvailable = this.libraryWork.bind(
+    this.getComfyEndpoint = this.guardInferenceRead(getComfyEndpoint);
+    this.assertInferenceAvailable = this.guardInferenceRead(
       assertInferenceAvailable
     );
-    this.reconcileInterruptedRenders = this.libraryWork.bind(
-      this.reconcileInterruptedRenders.bind(this)
+    const reconcile = this.reconcileInterruptedRenders.bind(this);
+    const submit = this.submit.bind(this);
+    const submitVideo = this.submitVideo.bind(this);
+    const cancel = this.cancel.bind(this);
+    const kick = this.kick.bind(this);
+    this.reconcileInterruptedRenders = () => this.runInference(reconcile);
+    this.submit = (input, origin) =>
+      this.runInference(() => submit(input), origin);
+    this.submitVideo = (input, origin) =>
+      this.runInference(() => submitVideo(input), origin);
+    this.cancel = (jobId, origin) =>
+      this.runInference(() => cancel(jobId), origin);
+    this.kick = () => this.runInference(kick);
+    const local = this.guardProfile(
+      this.libraryWork.guard({
+        listQueue: this.listQueue.bind(this),
+        markInteracted: this.markInteracted.bind(this),
+        ensureVideoRenderDirectory: this.ensureVideoRenderDirectory.bind(this),
+        completeComfyVideo: this.completeComfyVideo.bind(this),
+        updateProviderProgress: this.updateProviderProgress.bind(this),
+        trimVideo: this.trimVideo.bind(this),
+        filterVideoFile: this.filterVideoFile.bind(this),
+        completeImageBytes: this.completeImageBytes.bind(this),
+        completeVideoFile: this.completeVideoFile.bind(this),
+        extractVideoThumbnail: this.extractVideoThumbnail.bind(this),
+        finishWithStatus: this.finishWithStatus.bind(this),
+        assetPath: this.assetPath.bind(this),
+        fileDataUrl: this.fileDataUrl.bind(this)
+      })
     );
-    this.submit = this.libraryWork.bind(this.submit.bind(this));
-    this.submitVideo = this.libraryWork.bind(this.submitVideo.bind(this));
-    this.cancel = this.libraryWork.bind(this.cancel.bind(this));
-    this.kick = this.libraryWork.bind(this.kick.bind(this));
-    const local = this.libraryWork.guard({
-      listQueue: this.listQueue.bind(this),
-      markInteracted: this.markInteracted.bind(this),
-      ensureVideoRenderDirectory: this.ensureVideoRenderDirectory.bind(this),
-      completeComfyVideo: this.completeComfyVideo.bind(this),
-      updateProviderProgress: this.updateProviderProgress.bind(this),
-      trimVideo: this.trimVideo.bind(this),
-      filterVideoFile: this.filterVideoFile.bind(this),
-      completeImageBytes: this.completeImageBytes.bind(this),
-      completeVideoFile: this.completeVideoFile.bind(this),
-      extractVideoThumbnail: this.extractVideoThumbnail.bind(this),
-      finishWithStatus: this.finishWithStatus.bind(this),
-      assetPath: this.assetPath.bind(this),
-      fileDataUrl: this.fileDataUrl.bind(this)
-    });
     this.listQueue = local.listQueue;
     this.markInteracted = local.markInteracted;
     this.ensureVideoRenderDirectory = local.ensureVideoRenderDirectory;
@@ -450,12 +504,116 @@ export class ImageRenderService {
     this.startWithRecovery();
   }
 
-  private ownedComfy(endpoint: string): ComfyClient {
+  private async runInference<T>(
+    op: () => Promise<T>,
+    origin?: AbortSignal
+  ): Promise<T> {
+    const profile =
+      origin ??
+      this.inferenceProfile.getStore() ??
+      this.captureInferenceProfile?.();
+    profile?.throwIfAborted();
+    return this.libraryWork.run(() =>
+      this.inferenceProfile.run(profile, async () => {
+        try {
+          const result = await op();
+          profile?.throwIfAborted();
+          return result;
+        } catch (error) {
+          profile?.throwIfAborted();
+          throw error;
+        }
+      })
+    );
+  }
+
+  private assertWork(): void {
     this.libraryWork.capture();
+    this.inferenceProfile.getStore()?.throwIfAborted();
+  }
+
+  private get workSignal(): AbortSignal {
+    const profile = this.inferenceProfile.getStore();
+    return profile
+      ? AbortSignal.any([profile, this.libraryWork.signal])
+      : this.libraryWork.signal;
+  }
+
+  private guardInferenceRead<T>(read: () => Promise<T>): () => Promise<T> {
+    return this.libraryWork.bind(async () => {
+      this.assertWork();
+      return awaitComfyAbort(read(), this.workSignal);
+    });
+  }
+
+  private guardProfile<T extends object>(target: T): T {
+    return new Proxy(target, {
+      get: (object, property) => {
+        const value: unknown = Reflect.get(object, property, object);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          this.assertWork();
+          return this.trackLocalWork(
+            () => Reflect.apply(value, object, args) as Promise<unknown>
+          );
+        };
+      }
+    });
+  }
+
+  private async trackLocalWork<T>(op: () => Promise<T>): Promise<T> {
+    this.assertWork();
+    const profile = this.inferenceProfile.getStore();
+    if (!profile) return op();
+    let localWork = this.issuedLocalWork.get(profile);
+    if (!localWork) this.issuedLocalWork.set(profile, (localWork = new Set()));
+    const issued = Promise.resolve().then(() => {
+      this.assertWork();
+      return op();
+    });
+    localWork.add(issued);
+    try {
+      const result = await issued;
+      profile.throwIfAborted();
+      return result;
+    } finally {
+      localWork.delete(issued);
+    }
+  }
+
+  async drainInferenceProfile(profile: AbortSignal): Promise<void> {
+    const transfers = drainComfyProfile(profile);
+    const localWork = this.issuedLocalWork.get(profile);
+    if (localWork) await Promise.allSettled(localWork);
+    await transfers;
+  }
+
+  private async transaction(
+    op: Parameters<DatabaseManager["transaction"]>[0]
+  ): Promise<void> {
+    await this.trackLocalWork(() =>
+      this.manager.transaction(async (database) => {
+        this.assertWork();
+        await op(database);
+        // Roll back if retirement happened before committing the issued unit.
+        this.assertWork();
+      })
+    );
+  }
+
+  private ownedComfy(
+    endpoint: string,
+    job?: typeof imageRenderJobs.$inferSelect
+  ): ComfyClient {
+    this.assertWork();
     const client = new ComfyClient(
       endpoint,
       undefined,
-      this.libraryWork.signal
+      this.libraryWork.signal,
+      this.inferenceProfile.getStore(),
+      job && !job.providerRequestId
+        ? () => this.markComfySubmission(job, endpoint)
+        : undefined
     );
     const transfers = this.libraryWork.guard({
       uploadFile: client.uploadFile.bind(client),
@@ -468,6 +626,53 @@ export class ImageRenderService {
     return this.libraryWork.guard(client, false);
   }
 
+  private rememberPendingProfile(jobId: string): void {
+    const profile = this.inferenceProfile.getStore();
+    const pending = this.libraryWork.state.pendingProfiles;
+    if (profile && !pending.has(jobId)) pending.set(jobId, profile);
+  }
+
+  private isRetiredPending(job: typeof imageRenderJobs.$inferSelect): boolean {
+    return (
+      job.status === "PENDING" &&
+      !job.providerRequestId &&
+      this.libraryWork.state.pendingProfiles.get(job.id)?.aborted === true
+    );
+  }
+
+  private async markComfySubmission(
+    job: typeof imageRenderJobs.$inferSelect,
+    endpoint: string
+  ): Promise<void> {
+    const request = readRenderRequest(job.requestJson);
+    const kick = this.libraryWork.state.kick;
+    if (kick) kick.submittingJobId = job.id;
+    await this.transaction(async (database) => {
+      const [marked] = await database
+        .update(imageRenderJobs)
+        .set({
+          requestJson: JSON.stringify({
+            ...request,
+            comfyEndpoint: endpoint,
+            comfySubmissionStarted: true
+          })
+        })
+        .where(
+          and(
+            eq(imageRenderJobs.id, job.id),
+            eq(imageRenderJobs.status, "PENDING"),
+            eq(imageRenderJobs.requestJson, job.requestJson)
+          )
+        )
+        .returning({ id: imageRenderJobs.id });
+      if (!marked)
+        throw new DOMException(
+          "The render is no longer pending submission",
+          "AbortError"
+        );
+    });
+  }
+
   /** Policy pauses are not failed jobs and must not make a clean external
    * startup display a library-health error. Corrupt settings still surface. */
   private async canProcessInference(): Promise<boolean> {
@@ -475,6 +680,7 @@ export class ImageRenderService {
       await this.assertInferenceAvailable();
       return true;
     } catch (error) {
+      this.assertWork();
       if (error instanceof InferenceUnavailableError) return false;
       throw error;
     }
@@ -486,10 +692,12 @@ export class ImageRenderService {
         try {
           await this.reconcileInterruptedRenders();
           this.libraryWork.capture();
-          this.start();
           clearLibraryIssue("Interrupted render recovery");
+          this.start();
         } catch (error) {
-          if (!this.libraryWork.signal.aborted)
+          if (this.libraryWork.signal.aborted) return;
+          if (this.wasAborted(error)) this.start();
+          else
             reportLibraryIssue({
               id: "Interrupted render recovery",
               kind: "service",
@@ -511,7 +719,13 @@ export class ImageRenderService {
         const timer = setInterval(() => this.scheduleKick(), POLL_INTERVAL_MS);
         this.libraryWork.state.timer = timer;
         timer.unref();
-        const schedule = AsyncResource.bind(() => this.scheduleKick());
+        const schedule = AsyncResource.bind(
+          (_promptId: string, profile?: AbortSignal) => {
+            if (profile?.aborted || this.libraryWork.signal.aborted) return;
+            const current = this.availableProgressProfile();
+            if (current === profile) this.scheduleKick();
+          }
+        );
         this.libraryWork.state.stopListeningForComfySettles =
           onAnyComfyPromptSettled(schedule);
         this.scheduleKick();
@@ -519,16 +733,41 @@ export class ImageRenderService {
       .catch(() => {});
   }
 
+  private wasAborted(error: unknown): boolean {
+    return (
+      this.inferenceProfile.getStore()?.aborted === true ||
+      (error instanceof Error && error.name === "AbortError")
+    );
+  }
+
+  private availableProgressProfile(): AbortSignal | undefined | null {
+    // A suspended profile suppresses live data without blocking local history.
+    try {
+      return (
+        this.inferenceProfile.getStore() ?? this.captureInferenceProfile?.()
+      );
+    } catch {
+      return null;
+    }
+  }
+
   private scheduleKick(): void {
     if (this.libraryWork.signal.aborted) return;
+    const profile = this.availableProgressProfile();
+    if (profile === null || profile?.aborted) return;
     void this.libraryWork
       .run(async () => {
         try {
-          await this.kick();
+          await this.inferenceProfile.run(profile, () => this.kick());
           this.libraryWork.capture();
+          profile?.throwIfAborted();
           clearLibraryIssue("Render polling");
         } catch (error) {
-          if (!this.libraryWork.signal.aborted)
+          if (
+            !this.libraryWork.signal.aborted &&
+            !profile?.aborted &&
+            !this.wasAborted(error)
+          )
             reportLibraryIssue({
               id: "Render polling",
               kind: "service",
@@ -544,7 +783,7 @@ export class ImageRenderService {
   async reconcileInterruptedRenders(): Promise<void> {
     const descriptionSession = this.captureImageSession?.();
     if (!(await this.canProcessInference())) return;
-    this.libraryWork.state.processing = true;
+    this.libraryWork.state.recovering = true;
     try {
       const jobs = await this.libraryWork.boundary(async () =>
         this.manager.get().select().from(imageRenderJobs)
@@ -595,7 +834,7 @@ export class ImageRenderService {
             );
           } else {
             await this.libraryWork.boundary(() =>
-              validateVideo(asset.sourcePath, this.libraryWork.signal)
+              validateVideo(asset.sourcePath, this.workSignal)
             );
             const request = parseJson<CompletableVideoRequest>(job.requestJson);
             // The published output has already been cropped. Do not crop it twice.
@@ -605,10 +844,10 @@ export class ImageRenderService {
               asset.sourcePath
             );
           }
-          this.libraryWork.capture();
+          this.assertWork();
           clearLibraryIssue(`render:${job.id}`);
         } catch (error) {
-          this.libraryWork.capture();
+          this.assertWork();
           const message =
             error instanceof Error ? error.message : String(error);
           reportLibraryIssue({
@@ -629,7 +868,7 @@ export class ImageRenderService {
         }
       }
     } finally {
-      this.libraryWork.state.processing = false;
+      this.libraryWork.state.recovering = false;
     }
   }
 
@@ -641,15 +880,21 @@ export class ImageRenderService {
     this.libraryWork.state.stopListeningForComfySettles = null;
   }
 
-  async submit(input: LocalImageRenderInput): Promise<{ jobId: string }> {
+  async submit(
+    input: LocalImageRenderInput,
+    _origin?: AbortSignal
+  ): Promise<{ jobId: string }> {
     await this.assertInferenceAvailable();
     if (!this.manager.isOpen())
       throw new Error("Choose a Mago library folder first");
+    let comfyEndpoint: string;
     if (input.model === "qwen") {
+      comfyEndpoint = await this.getComfyEndpoint();
       await assertComfyRenderModelReady(
-        await this.getComfyEndpoint(),
+        comfyEndpoint,
         input.model,
-        input.settings
+        input.settings,
+        this.workSignal
       );
       if (input.referenceImageIds.length > 2)
         throw new Error("Qwen Image Edit supports up to two reference images");
@@ -672,7 +917,7 @@ export class ImageRenderService {
         jobId,
         `input.${decoded.extension}`
       );
-      await this.files.atomicWriteFile(
+      await this.writeLocalFile(
         path.join(root, inputRelativePath),
         decoded.bytes
       );
@@ -691,10 +936,13 @@ export class ImageRenderService {
     };
     const storedRequest: StoredRequest = {
       ...requestWithoutData,
+      comfySubmissionStarted: false,
+      comfyEndpoint,
       inputRelativePath
     };
 
-    await this.manager.transaction(async (database) => {
+    this.rememberPendingProfile(jobId);
+    await this.transaction(async (database) => {
       const [shot] = await database
         .select()
         .from(shots)
@@ -778,13 +1026,22 @@ export class ImageRenderService {
     return { jobId };
   }
 
-  async submitVideo(input: LocalVideoRenderInput): Promise<{ jobId: string }> {
+  async submitVideo(
+    input: LocalVideoRenderInput,
+    _origin?: AbortSignal
+  ): Promise<{ jobId: string }> {
     await this.assertInferenceAvailable();
     if (!this.manager.isOpen())
       throw new Error("Choose a Mago library folder first");
+    let comfyEndpoint: string;
     if (isComfyRenderModel(input.model)) {
-      const endpoint = await this.getComfyEndpoint();
-      await assertComfyRenderModelReady(endpoint, input.model, input.settings);
+      comfyEndpoint = await this.getComfyEndpoint();
+      await assertComfyRenderModelReady(
+        comfyEndpoint,
+        input.model,
+        input.settings,
+        this.workSignal
+      );
       if (
         input.model === "ltx_2_3_spatial_upscaler" &&
         input.referenceImageIds.length !== 0
@@ -920,6 +1177,8 @@ export class ImageRenderService {
       sourceThumbnailRelativePath:
         sourceAsset.thumbnailRelativePath ?? undefined,
       name: outputTrack.name,
+      comfySubmissionStarted: false,
+      comfyEndpoint,
       inputRelativePath,
       inputCrop: croppedRender?.plan.inputCrop ?? undefined,
       cropBack: croppedRender
@@ -927,7 +1186,8 @@ export class ImageRenderService {
         : undefined
     };
 
-    await this.manager.transaction(async (transaction) => {
+    this.rememberPendingProfile(jobId);
+    await this.transaction(async (transaction) => {
       await transaction.insert(assets).values({
         id: assetId,
         name: outputTrack.name,
@@ -996,16 +1256,25 @@ export class ImageRenderService {
   }
 
   async listQueue(): Promise<LocalQueueItem[]> {
+    const profile = this.availableProgressProfile();
     if (!this.manager.isOpen()) return [];
     const database = this.manager.get();
     const jobs = await database
       .select()
       .from(imageRenderJobs)
       .orderBy(asc(imageRenderJobs.createdAt));
-    const unfinishedPositions = getUnfinishedQueuePositions(jobs);
+    const unfinishedPositions = getUnfinishedQueuePositions(
+      jobs.filter((job) => {
+        try {
+          return !hasUnknownComfySubmission(job) && !this.isRetiredPending(job);
+        } catch {
+          return true;
+        }
+      })
+    );
     const now = new Date();
-    return Promise.all(
-      jobs.map(async (job, index) => {
+    const queries = await Promise.all(
+      jobs.map(async (job) => {
         const [[project], [shot], [track]] = await Promise.all([
           database
             .select()
@@ -1023,108 +1292,144 @@ export class ImageRenderService {
             .where(eq(tracks.id, job.trackId))
             .limit(1)
         ]);
-        this.libraryWork.capture();
-        let request: StoredRequest;
-        let requestError: string | null = null;
-        try {
-          request = readRenderRequest(job.requestJson);
-        } catch (error) {
-          requestError = error instanceof Error ? error.message : String(error);
-          reportLibraryIssue({
-            id: `render:${job.id}`,
-            kind: "asset",
-            projectId: job.projectId,
-            assetId: job.assetId,
-            message: requestError
-          });
-          request = {
-            projectId: job.projectId,
-            shotId: job.shotId,
-            sourceAssetId: "",
-            frame: 0,
-            name: "Unreadable render",
-            model: "qwen",
-            settings: {},
-            referenceImageIds: []
-          };
-        }
-        const frameRange = isStoredVideoOutputRequest(request)
-          ? request.frameRange
-          : [request.frame, request.frame];
-        const liveComfyPrompt = requestError ? null : this.liveComfyPrompt(job);
-        const eta = liveComfyPrompt
-          ? comfyRenderEta({
-              model: job.model,
-              livePrompt: liveComfyPrompt,
-              now
-            })
-          : getRenderEta({
-              model: job.model,
-              status: job.status,
-              startedAt: job.startedAt,
-              now
-            });
-        return {
-          id: job.id,
-          queue_id: job.providerRequestId ?? job.id,
-          asset_id: job.assetId,
-          clip_id: job.clipId,
-          active: !requestError && ACTIVE_STATUSES.includes(job.status),
-          status: requestError ? "ERROR" : job.status,
-          progress: eta.progress ?? job.progress,
-          order: index,
-          display_order: unfinishedPositions.get(job.id),
-          kind: isStoredVideoOutputRequest(request) ? "video" : "image",
-          price: request.estimatedCostUsd ?? 0,
-          price_currency: "USD",
-          project_id: job.projectId,
-          project_name: project?.name ?? "Local project",
-          timeline_id: job.shotId,
-          timeline_name: shot?.name ?? "Shot",
-          layer_id: job.trackId,
-          layer_name: track?.name ?? request.name,
-          frame_range: frameRange,
-          data: {
-            ...(isStoredVideoOutputRequest(request)
-              ? {}
-              : { frame: request.frame }),
-            settings: request.settings,
-            source_asset:
-              request.kind === "image-to-video"
-                ? request.startImageAssetId
-                : request.sourceAssetId,
-            status: job.status
-          },
-          user_id: "local",
-          show_done: true,
-          interacted_with: job.interacted,
-          isCancelable: !requestError && ACTIVE_STATUSES.includes(job.status),
-          created_at: job.createdAt.toISOString(),
-          render_started_at: (job.startedAt ?? job.createdAt).toISOString(),
-          render_model: job.model,
-          ETA: eta.ETA,
-          estimated_end_time: eta.estimatedEndTime,
-          finished_at: (job.finishedAt ?? job.updatedAt).toISOString(),
-          error: requestError
-            ? { error_type: "saved_data_error", error_message: requestError }
-            : job.error
-              ? {
-                  error_type:
-                    isComfyRenderModel(job.model) &&
-                    isComfyOutOfMemoryError(job.error)
-                      ? "OutOfMemoryError"
-                      : "provider_error",
-                  error_message: isComfyRenderModel(job.model)
-                    ? job.error
-                    : job.error
-                }
-              : undefined
-        };
+        return { job, project, shot, track };
       })
     );
+    this.libraryWork.capture();
+    return queries.map(({ job, project, shot, track }, index) => {
+      let request: StoredRequest;
+      let requestError: string | null = null;
+      try {
+        request = readRenderRequest(job.requestJson);
+      } catch (error) {
+        requestError = error instanceof Error ? error.message : String(error);
+        reportLibraryIssue({
+          id: `render:${job.id}`,
+          kind: "asset",
+          projectId: job.projectId,
+          assetId: job.assetId,
+          message: requestError
+        });
+        request = {
+          projectId: job.projectId,
+          shotId: job.shotId,
+          sourceAssetId: "",
+          frame: 0,
+          name: "Unreadable render",
+          model: "qwen",
+          settings: {},
+          referenceImageIds: []
+        };
+      }
+      const frameRange = isStoredVideoOutputRequest(request)
+        ? request.frameRange
+        : [request.frame, request.frame];
+      const kick = this.libraryWork.state.kick;
+      const isSubmittingNow =
+        kick &&
+        kick.profile === profile &&
+        !profile?.aborted &&
+        kick.submittingJobId === job.id;
+      const submissionUnknown =
+        !requestError &&
+        !isSubmittingNow &&
+        ACTIVE_STATUSES.includes(job.status) &&
+        hasUnknownComfySubmission(job);
+      const retiredPending = !submissionUnknown && this.isRetiredPending(job);
+      const liveComfyPrompt = requestError
+        ? null
+        : this.liveComfyPrompt(job, profile);
+      const eta = liveComfyPrompt
+        ? comfyRenderEta({
+            model: job.model,
+            livePrompt: liveComfyPrompt,
+            now
+          })
+        : getRenderEta({
+            model: job.model,
+            status: job.status,
+            startedAt: job.startedAt,
+            now
+          });
+      return {
+        id: job.id,
+        queue_id: job.providerRequestId ?? job.id,
+        asset_id: job.assetId,
+        clip_id: job.clipId,
+        active:
+          !requestError &&
+          !submissionUnknown &&
+          !retiredPending &&
+          ACTIVE_STATUSES.includes(job.status),
+        status:
+          requestError || submissionUnknown || retiredPending
+            ? "ERROR"
+            : job.status,
+        progress: eta.progress ?? job.progress,
+        order: index,
+        display_order: unfinishedPositions.get(job.id),
+        kind: isStoredVideoOutputRequest(request) ? "video" : "image",
+        price: request.estimatedCostUsd ?? 0,
+        price_currency: "USD",
+        project_id: job.projectId,
+        project_name: project?.name ?? "Local project",
+        timeline_id: job.shotId,
+        timeline_name: shot?.name ?? "Shot",
+        layer_id: job.trackId,
+        layer_name: track?.name ?? request.name,
+        frame_range: frameRange,
+        data: {
+          ...(isStoredVideoOutputRequest(request)
+            ? {}
+            : { frame: request.frame }),
+          settings: request.settings,
+          source_asset:
+            request.kind === "image-to-video"
+              ? request.startImageAssetId
+              : request.sourceAssetId,
+          status: job.status
+        },
+        user_id: "local",
+        show_done: true,
+        interacted_with: job.interacted,
+        isCancelable: !requestError && ACTIVE_STATUSES.includes(job.status),
+        created_at: job.createdAt.toISOString(),
+        render_started_at: (job.startedAt ?? job.createdAt).toISOString(),
+        render_model: job.model,
+        ETA: eta.ETA,
+        estimated_end_time: eta.estimatedEndTime,
+        finished_at: (job.finishedAt ?? job.updatedAt).toISOString(),
+        error: requestError
+          ? { error_type: "saved_data_error", error_message: requestError }
+          : submissionUnknown
+            ? {
+                error_type: "submission_unknown",
+                error_message:
+                  "ComfyUI may have received this render. It will not be submitted again automatically."
+              }
+            : retiredPending
+              ? {
+                  error_type: "profile_changed",
+                  error_message:
+                    "The profile changed before this render was submitted. Start a new render to continue."
+                }
+              : job.error
+                ? {
+                    error_type:
+                      isComfyRenderModel(job.model) &&
+                      isComfyOutOfMemoryError(job.error)
+                        ? "OutOfMemoryError"
+                        : "provider_error",
+                    error_message: isComfyRenderModel(job.model)
+                      ? job.error
+                      : job.error
+                  }
+                : undefined
+      };
+    });
   }
 
-  async cancel(jobId: string): Promise<void> {
+  async cancel(jobId: string, _origin?: AbortSignal): Promise<void> {
     await this.assertInferenceAvailable();
     const database = this.manager.get();
     const [job] = await this.libraryWork.boundary(async () =>
@@ -1182,12 +1487,14 @@ export class ImageRenderService {
             ).cancel(job.providerRequestId);
         }
       } catch (error) {
+        this.assertWork();
         console.warn(
           "Unable to cancel provider request; marking it cancelled locally",
           error
         );
       }
     }
+    this.assertWork();
     this.libraryWork.state.comfyStatusCheckedAtByJobId.delete(job.id);
     await this.finishWithStatus(
       job.id,
@@ -1196,6 +1503,7 @@ export class ImageRenderService {
       "CANCELLED",
       "cancelled"
     );
+    this.libraryWork.state.pendingProfiles.delete(job.id);
   }
 
   async markInteracted(jobId: string): Promise<void> {
@@ -1209,13 +1517,33 @@ export class ImageRenderService {
   async kick(): Promise<void> {
     const descriptionSession = this.captureImageSession?.();
     if (!this.manager.isOpen()) return;
-    if (this.libraryWork.state.processing) {
-      this.libraryWork.state.isKickRequestedDuringProcessing = true;
+    const state = this.libraryWork.state;
+    if (state.recovering) return;
+    const profile = this.inferenceProfile.getStore();
+    if (state.kick && state.kick.profile === profile) {
+      state.kick.requested = true;
       return;
     }
-    this.libraryWork.state.processing = true;
-    this.libraryWork.state.isKickRequestedDuringProcessing = false;
+    const kick: RenderKick = { profile, requested: false };
+    const previousProfile = state.pollingProfile;
+    state.kick = kick;
+    state.pollingProfile = profile;
     try {
+      if (previousProfile !== profile) {
+        state.comfyStatusCheckedAtByJobId.clear();
+        if (previousProfile) {
+          const drain = this.drainInferenceProfile(previousProfile);
+          state.previousDrain = state.previousDrain
+            ? Promise.all([state.previousDrain, drain]).then(() => {})
+            : drain;
+        }
+      }
+      const previousDrain = state.previousDrain;
+      if (previousDrain) {
+        await awaitComfyAbort(previousDrain, this.workSignal);
+        if (state.previousDrain === previousDrain)
+          state.previousDrain = undefined;
+      }
       if (!(await this.canProcessInference())) return;
       const jobs = await this.libraryWork.boundary(async () =>
         this.manager
@@ -1224,15 +1552,27 @@ export class ImageRenderService {
           .from(imageRenderJobs)
           .where(inArray(imageRenderJobs.status, ACTIVE_STATUSES))
       );
+      this.assertWork();
+      for (const job of jobs) {
+        if (
+          job.status === "PENDING" &&
+          isComfyRenderModel(job.model) &&
+          !job.providerRequestId
+        )
+          this.rememberPendingProfile(job.id);
+      }
       for (const job of jobs) {
         // A changed profile pauses the queue without marking saved jobs failed.
         if (!(await this.canProcessInference())) return;
         try {
           await this.process(job, descriptionSession);
-          this.libraryWork.capture();
+          this.assertWork();
+          if (kick.submittingJobId === job.id)
+            state.pendingProfiles.delete(job.id);
           clearLibraryIssue(`render-poll:${job.id}`);
         } catch (error) {
-          this.libraryWork.capture();
+          this.assertWork();
+          if (this.wasAborted(error)) continue;
           const rawMessage =
             error instanceof Error ? error.message : "Unknown render error";
           const message = rawMessage;
@@ -1264,20 +1604,33 @@ export class ImageRenderService {
             "failed",
             message
           );
+          state.pendingProfiles.delete(job.id);
+        } finally {
+          kick.submittingJobId = undefined;
         }
       }
     } finally {
-      this.libraryWork.state.processing = false;
+      if (state.kick === kick) {
+        state.kick = undefined;
+        if (kick.requested && !profile?.aborted) this.scheduleKick();
+      }
     }
-    if (this.libraryWork.state.isKickRequestedDuringProcessing)
-      this.scheduleKick();
   }
 
   private async process(
     job: typeof imageRenderJobs.$inferSelect,
     descriptionSession?: AbortSignal
   ): Promise<void> {
+    this.assertWork();
     readRenderRequest(job.requestJson);
+    if (
+      isComfyRenderModel(job.model) &&
+      !job.providerRequestId &&
+      (job.status !== "PENDING" ||
+        hasUnknownComfySubmission(job) ||
+        this.isRetiredPending(job))
+    )
+      return;
     if (job.model === "qwen") {
       await this.processComfyQwen(job, descriptionSession);
       return;
@@ -1320,7 +1673,7 @@ export class ImageRenderService {
     const client = new ComfyQwenClient(
       endpoint,
       resolveQwenImageEditSetup(request.settings.qwen_image_edit_setup),
-      this.ownedComfy(endpoint)
+      this.ownedComfy(endpoint, job)
     );
     if (!job.providerRequestId) {
       const imagePaths = [
@@ -1349,7 +1702,7 @@ export class ImageRenderService {
             : undefined
       });
       const now = new Date();
-      await this.manager.transaction(async (database) => {
+      await this.transaction(async (database) => {
         await database
           .update(imageRenderJobs)
           .set({
@@ -1405,7 +1758,7 @@ export class ImageRenderService {
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
     const client = new ComfyWanAnimateClient(
       endpoint,
-      this.ownedComfy(endpoint)
+      this.ownedComfy(endpoint, job)
     );
     const { width, height } = this.resolveWanDimensions(
       request.settings,
@@ -1449,7 +1802,7 @@ export class ImageRenderService {
             : undefined
       });
       const now = new Date();
-      await this.manager.transaction(async (database) => {
+      await this.transaction(async (database) => {
         await database
           .update(imageRenderJobs)
           .set({
@@ -1511,7 +1864,10 @@ export class ImageRenderService {
   ): Promise<void> {
     const request = parseJson<StoredVideoRequest>(job.requestJson);
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
-    const client = new ComfyWanVaceClient(endpoint, this.ownedComfy(endpoint));
+    const client = new ComfyWanVaceClient(
+      endpoint,
+      this.ownedComfy(endpoint, job)
+    );
     const { width, height } = this.resolveWanDimensions(
       request.settings,
       request.inputCrop
@@ -1561,7 +1917,7 @@ export class ImageRenderService {
             : undefined
       });
       const now = new Date();
-      await this.manager.transaction(async (database) => {
+      await this.transaction(async (database) => {
         await database
           .update(imageRenderJobs)
           .set({
@@ -1625,7 +1981,7 @@ export class ImageRenderService {
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
     const client = new ComfyWanFunControlClient(
       endpoint,
-      this.ownedComfy(endpoint)
+      this.ownedComfy(endpoint, job)
     );
     const { width, height } = this.resolveWanDimensions(
       request.settings,
@@ -1698,7 +2054,7 @@ export class ImageRenderService {
             : undefined
       });
       const now = new Date();
-      await this.manager.transaction(async (database) => {
+      await this.transaction(async (database) => {
         await database
           .update(imageRenderJobs)
           .set({
@@ -1762,7 +2118,7 @@ export class ImageRenderService {
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
     const client = new ComfyMagoAnimateClient(
       endpoint,
-      this.ownedComfy(endpoint)
+      this.ownedComfy(endpoint, job)
     );
     const { width, height } = this.resolveWanDimensions(
       request.settings,
@@ -1840,7 +2196,7 @@ export class ImageRenderService {
             : undefined
       });
       const now = new Date();
-      await this.manager.transaction(async (database) => {
+      await this.transaction(async (database) => {
         await database
           .update(imageRenderJobs)
           .set({
@@ -1904,7 +2260,7 @@ export class ImageRenderService {
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
     const client = new ComfyLtxUpscaleClient(
       endpoint,
-      this.ownedComfy(endpoint)
+      this.ownedComfy(endpoint, job)
     );
     const factor: LtxUpscaleFactor =
       Number(request.settings.ltx_upscale_factor) === LTX_UPSCALE_FACTOR_4
@@ -1967,7 +2323,7 @@ export class ImageRenderService {
             : undefined
       });
       const now = new Date();
-      await this.manager.transaction(async (database) => {
+      await this.transaction(async (database) => {
         await database
           .update(imageRenderJobs)
           .set({
@@ -2025,14 +2381,16 @@ export class ImageRenderService {
   }
 
   private liveComfyPrompt(
-    job: typeof imageRenderJobs.$inferSelect
+    job: typeof imageRenderJobs.$inferSelect,
+    profile = this.availableProgressProfile()
   ): ComfyLivePrompt | null {
+    if (profile === null || profile?.aborted) return null;
     if (!isComfyRenderModel(job.model) || !job.providerRequestId) return null;
     const { comfyEndpoint } = parseJson<{ comfyEndpoint?: string }>(
       job.requestJson
     );
     if (!comfyEndpoint) return null;
-    return comfyProgressMonitorFor(comfyEndpoint).livePrompt(
+    return comfyProgressMonitorFor(comfyEndpoint, profile).livePrompt(
       job.providerRequestId
     );
   }
@@ -2044,7 +2402,7 @@ export class ImageRenderService {
     const endpoint = request.comfyEndpoint ?? (await this.getComfyEndpoint());
     const client = new ComfyMiniMaxH3Client(
       endpoint,
-      this.ownedComfy(endpoint)
+      this.ownedComfy(endpoint, job)
     );
     if (!job.providerRequestId) {
       const root = await this.requireLibraryRoot();
@@ -2066,7 +2424,7 @@ export class ImageRenderService {
         request.referenceImageIds.map((assetId) => this.assetPath(assetId))
       );
       const doesSourceVideoHaveAudio = await this.libraryWork.boundary(() =>
-        doesVideoHaveAudioStream(inputPath, this.libraryWork.signal)
+        doesVideoHaveAudioStream(inputPath, this.workSignal)
       );
       const promptId = await client.submitMiniMaxH3(
         buildMiniMaxH3RenderRequest({
@@ -2079,7 +2437,7 @@ export class ImageRenderService {
         })
       );
       const now = new Date();
-      await this.manager.transaction(async (database) => {
+      await this.transaction(async (database) => {
         await database
           .update(imageRenderJobs)
           .set({
@@ -2145,14 +2503,18 @@ export class ImageRenderService {
     readOverHttp: () => Promise<TResult>
   ): Promise<TResult | { state: "queued" | "running" }> {
     const { result, statusCheckedAt } = await readComfyPromptWithSafetyPoll({
-      monitor: comfyProgressMonitorFor(endpoint),
+      monitor: comfyProgressMonitorFor(
+        endpoint,
+        this.inferenceProfile.getStore()
+      ),
       promptId,
       lastStatusCheckAt:
         this.libraryWork.state.comfyStatusCheckedAtByJobId.get(job.id) ??
         Number.NEGATIVE_INFINITY,
-      readOverHttp: this.libraryWork.bind(readOverHttp)
+      readOverHttp: this.libraryWork.bind(readOverHttp),
+      signal: this.workSignal
     });
-    this.libraryWork.capture();
+    this.assertWork();
     const isPromptOver =
       result.state === "finished" || result.state === "error";
     if (isPromptOver)
@@ -2209,7 +2571,7 @@ export class ImageRenderService {
         ? RUNNING_PROGRESS
         : QUEUED_PROGRESS;
     const now = new Date();
-    await this.manager.transaction(async (database) => {
+    await this.transaction(async (database) => {
       await database
         .update(imageRenderJobs)
         .set({ status, progress, updatedAt: now })
@@ -2281,7 +2643,7 @@ export class ImageRenderService {
       await runLibraryFfmpeg(
         executable,
         args,
-        this.libraryWork.signal,
+        this.workSignal,
         "Unable to prepare the selected video for Seedance"
       );
     } catch (error) {
@@ -2321,16 +2683,24 @@ export class ImageRenderService {
       outputPath
     ];
     try {
-      await runLibraryFfmpeg(
-        executable,
-        args,
-        this.libraryWork.signal,
-        errorMessage
-      );
+      await runLibraryFfmpeg(executable, args, this.workSignal, errorMessage);
     } catch (error) {
       await rm(outputPath, { force: true });
       throw error;
     }
+  }
+
+  private async writeLocalFile(
+    destination: string,
+    bytes: Buffer
+  ): Promise<void> {
+    const signal = this.inferenceProfile.getStore();
+    if (!signal) return this.files.atomicWriteFile(destination, bytes);
+    await this.files.atomicProduceFile(
+      destination,
+      (temporary) => this.files.writeFile(temporary, bytes, { flag: "wx" }),
+      this.workSignal
+    );
   }
 
   private async completeImageBytes(
@@ -2353,11 +2723,8 @@ export class ImageRenderService {
       `${job.assetId}.jpg`
     );
     await Promise.all([
-      this.files.atomicWriteFile(
-        path.join(root, outputRelative),
-        image.toPNG()
-      ),
-      this.files.atomicWriteFile(
+      this.writeLocalFile(path.join(root, outputRelative), image.toPNG()),
+      this.writeLocalFile(
         path.join(root, thumbnailRelative),
         image
           .resize({ width: 480, quality: "good" })
@@ -2365,7 +2732,7 @@ export class ImageRenderService {
       )
     ]);
     const now = new Date();
-    await this.manager.transaction(async (database) => {
+    await this.transaction(async (database) => {
       await database
         .update(imageRenderJobs)
         .set({
@@ -2408,7 +2775,7 @@ export class ImageRenderService {
         })
         .where(eq(clips.id, job.clipId));
     });
-    this.libraryWork.capture();
+    this.assertWork();
     this.onImageAvailable?.(job.assetId, descriptionSession);
   }
 
@@ -2426,19 +2793,26 @@ export class ImageRenderService {
       : null;
     if (cropBackVideoFilter) {
       try {
-        await this.files.atomicProduceFile(outputPath, (temporary) =>
-          this.filterVideoFile(
-            renderedVideoPath,
-            temporary,
-            cropBackVideoFilter,
-            "Unable to crop the generated video back to the selected crop area"
-          )
+        await this.files.atomicProduceFile(
+          outputPath,
+          (temporary) =>
+            this.filterVideoFile(
+              renderedVideoPath,
+              temporary,
+              cropBackVideoFilter,
+              "Unable to crop the generated video back to the selected crop area"
+            ),
+          this.workSignal
         );
       } finally {
         await rm(renderedVideoPath, { force: true });
       }
     } else {
-      await this.files.publishFile(renderedVideoPath, outputPath);
+      await this.files.publishFile(
+        renderedVideoPath,
+        outputPath,
+        this.workSignal
+      );
     }
     const deliveredSizeBytes = (await this.files.stat(outputPath)).size;
 
@@ -2451,10 +2825,14 @@ export class ImageRenderService {
       await this.files.atomicProduceFile(
         path.join(root, thumbnailRelative),
         (temporary) =>
-          this.extractVideoThumbnail(path.join(root, outputRelative), temporary)
+          this.extractVideoThumbnail(
+            path.join(root, outputRelative),
+            temporary
+          ),
+        this.workSignal
       );
     } catch (error) {
-      this.libraryWork.capture();
+      this.assertWork();
       console.warn("Unable to extract generated video thumbnail", error);
       thumbnailRelative = null;
       if (request.sourceThumbnailRelativePath) {
@@ -2465,15 +2843,17 @@ export class ImageRenderService {
           "assets",
           `${job.assetId}${extension}`
         );
-        await this.files.atomicCopyFile(
-          path.join(root, request.sourceThumbnailRelativePath),
-          path.join(root, thumbnailRelative)
+        const source = path.join(root, request.sourceThumbnailRelativePath);
+        await this.files.atomicProduceFile(
+          path.join(root, thumbnailRelative),
+          (temporary) => this.files.copyFile(source, temporary),
+          this.workSignal
         );
       }
     }
 
     const now = new Date();
-    await this.manager.transaction(async (database) => {
+    await this.transaction(async (database) => {
       await database
         .update(imageRenderJobs)
         .set({
@@ -2531,7 +2911,7 @@ export class ImageRenderService {
     await runLibraryFfmpeg(
       executable,
       args,
-      this.libraryWork.signal,
+      this.workSignal,
       "Unable to extract first video frame"
     );
   }
@@ -2545,7 +2925,7 @@ export class ImageRenderService {
     error?: string
   ): Promise<void> {
     const now = new Date();
-    await this.manager.transaction(async (database) => {
+    await this.transaction(async (database) => {
       await database
         .update(imageRenderJobs)
         .set({

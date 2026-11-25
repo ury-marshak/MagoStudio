@@ -4,6 +4,10 @@ import { z } from "zod";
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi, isLocalApp } from "@/platform/localDesktop";
 import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+import {
   type PaginatedResponse,
   paginatedResponseSchema
 } from "@/schemas/pagination";
@@ -38,13 +42,16 @@ type ProjectListParams = {
   projectType?: ProjectType;
 };
 
-export const fetchProjectList = async ({
-  page = 1,
-  perPage = DEFAULT_PER_PAGE,
-  sortBy = "updated_at",
-  sortOrder = "desc",
-  projectType
-}: ProjectListParams = {}): Promise<PaginatedResponse<ProjectListItem>> => {
+export const fetchProjectList = async (
+  {
+    page = 1,
+    perPage = DEFAULT_PER_PAGE,
+    sortBy = "updated_at",
+    sortOrder = "desc",
+    projectType
+  }: ProjectListParams = {},
+  work?: RendererLibraryWork
+): Promise<PaginatedResponse<ProjectListItem>> => {
   if (!isLocalApp) {
     const response = await backendApiClient.get("/projects/homepage/list", {
       params: {
@@ -57,8 +64,9 @@ export const fetchProjectList = async ({
     });
     return projectListResponseSchema.parse(response.data);
   }
+  const origin = work ?? rendererLibrary.capture();
   const items = projectListResponseSchema.shape.items
-    .parse(await getLocalDesktopApi().projects.list())
+    .parse(await origin.boundary(() => getLocalDesktopApi().projects.list()))
     .filter((item) => !projectType || item.type === projectType)
     .sort((left, right) => {
       const direction = sortOrder === "asc" ? 1 : -1;

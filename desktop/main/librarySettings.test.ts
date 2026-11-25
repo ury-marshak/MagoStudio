@@ -317,6 +317,47 @@ describe("LibrarySettings", () => {
     });
   });
 
+  it("commits Comfy settings together without replacing omitted or unrelated settings", async () => {
+    const settings = new LibrarySettings();
+    await settings.setTextModelProvider("local");
+    await settings.setAppMode("offline");
+    await Promise.all([
+      settings.saveComfyConfiguration({
+        endpoint: "http://localhost:9199",
+        vlmBackend: "qwen3-vl-4b-heretic-int8",
+        scriptTextModel: "qwen38-27b-q3"
+      }),
+      settings.markLocalSetupCompleted()
+    ]);
+    const stored = JSON.parse(
+      await readFile(
+        path.join(electronState.userDataPath, "settings.json"),
+        "utf8"
+      )
+    );
+    expect(stored).toMatchObject({
+      appMode: "offline",
+      comfyEndpoint: "http://localhost:9199",
+      vlmBackend: "qwen3-vl-4b-heretic-int8",
+      selectedModelGroupVariants: { "local-llm": "qwen38-27b-q3" },
+      textModelProvider: "local",
+      localSetupCompleted: true
+    });
+  });
+
+  it("does not publish inferred Comfy metadata when its signal retires before the settings write", async () => {
+    const controller = new AbortController();
+    const settings = new LibrarySettings();
+    const inferred = settings.setInferredComfyInstall(
+      "http://127.0.0.1:8188",
+      electronState.userDataPath,
+      controller.signal
+    );
+    controller.abort();
+    await expect(inferred).rejects.toHaveProperty("name", "AbortError");
+    await expect(settings.getInferredComfyInstall()).resolves.toBeNull();
+  });
+
   it("ignores variants a group does not declare, and groups without variants", async () => {
     await writeFile(
       path.join(electronState.userDataPath, "settings.json"),

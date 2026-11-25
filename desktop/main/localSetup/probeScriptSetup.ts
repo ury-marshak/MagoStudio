@@ -6,7 +6,7 @@ import type {
 } from "../../shared/contracts";
 import { REQUIRED_COMFYUI_VERSION } from "../../shared/requiredComfyVersion";
 import { asRecord } from "../comfy/asRecord";
-import { ComfyClient } from "../comfy/ComfyClient";
+import { ComfyClient, createProfileComfyClient } from "../comfy/ComfyClient";
 import {
   buildMiniMaxH3Graph,
   LOCAL_SCRIPT_MODEL_FILES as files
@@ -169,9 +169,13 @@ export const evaluateScriptSetup = (
 
 export const probeScriptSetup = async (
   endpoint: string,
-  settings: SetupSettings = defaultSettings
+  settings: SetupSettings = defaultSettings,
+  signal?: AbortSignal
 ): Promise<ScriptSetupStatus> => {
-  const client = new ComfyClient(endpoint);
+  signal?.throwIfAborted();
+  const client = signal
+    ? createProfileComfyClient(endpoint, signal)
+    : new ComfyClient(endpoint);
   const names = [...new Set([...nodeNames(4), ...nodeNames(8)])];
   const entries = await Promise.all(
     names.map(async (name) => {
@@ -181,6 +185,7 @@ export const probeScriptSetup = async (
       return [name, info[name]] as const;
     })
   );
+  signal?.throwIfAborted();
   const info: Record<string, unknown> = Object.fromEntries(entries);
   const optionalNames = [
     ...new Set(
@@ -196,26 +201,26 @@ export const probeScriptSetup = async (
         const result = await client.getJson(
           "/object_info/" + encodeURIComponent(name)
         );
+        signal?.throwIfAborted();
         info[name] = result[name];
       } catch {
+        signal?.throwIfAborted();
         info[name] = { probeError: true };
       }
     })
   );
+  signal?.throwIfAborted();
   const [stats, inventory] = await Promise.all([
     client.getJson("/system_stats").catch(() => null),
-    client
-      .request("/experiment/models", { method: "GET" })
-      .then((response) => response.json())
-      .catch(() => null)
+    client.getPayload("/experiment/models").catch(() => null)
   ]);
+  signal?.throwIfAborted();
   try {
-    const [fileResponse, folderResponse] = await Promise.all([
-      client.request("/models/clip_gguf", { method: "GET" }),
-      client.request("/experiment/models", { method: "GET" })
+    const [available, folders] = await Promise.all([
+      client.getPayload("/models/clip_gguf"),
+      client.getPayload("/experiment/models")
     ]);
-    const available = await fileResponse.json();
-    const folders = await folderResponse.json();
+    signal?.throwIfAborted();
     const folder = Array.isArray(folders)
       ? folders.find((item) => asRecord(item)?.name === "clip_gguf")
       : null;
@@ -228,6 +233,7 @@ export const probeScriptSetup = async (
       throw new Error("Model inventory unavailable");
     info.scriptTextInventory = { input: { required: { model: [available] } } };
   } catch {
+    signal?.throwIfAborted();
     info.scriptTextInventory = { probeError: true };
   }
   return addSetupDestinations(

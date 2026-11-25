@@ -1,7 +1,14 @@
 import { copyFile } from "node:fs/promises";
 import path from "node:path";
 
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  shell,
+  type IpcMainInvokeEvent
+} from "electron";
 
 import {
   IPC_CHANNELS,
@@ -16,10 +23,16 @@ import { ProjectRepository } from "../database/projectRepository";
 import { exportSbsVideo } from "../exports/sbsVideoExport";
 import { listLibraryIssues, reportLibraryIssue } from "../libraryHealth";
 import { LibrarySettings } from "../librarySettings";
+import { LibraryWorkSession } from "../libraryWorkSession";
 import { logStartup } from "../startupDiagnostics";
 
 import { registerRendererLibraryLifecycle } from "./rendererLibraryLifecycle";
 import { requireTrustedSender } from "./trustedSender";
+
+type ExportWork = Pick<
+  LibraryWorkSession<unknown>,
+  "run" | "capture" | "boundary"
+>;
 
 const toLibraryInfo = (rootPath: string): LibraryInfo => ({
   rootPath,
@@ -31,16 +44,55 @@ export const registerLibraryHandlers = ({
   settings,
   databaseManager,
   repository,
+  mediaWork: sharedMediaWork,
   beforeLibraryChange,
   afterLibraryChange
 }: {
   settings: LibrarySettings;
   databaseManager: DatabaseManager;
   repository: ProjectRepository;
+  /** If shared, the application suspends/drains and resets it in its callbacks. */
+  mediaWork?: ExportWork;
   beforeLibraryChange?: () => Promise<void>;
   afterLibraryChange?: () => void;
-}): void => {
+}) => {
   const rendererLifecycle = registerRendererLibraryLifecycle();
+  const ownMediaWork = new LibraryWorkSession(() => undefined);
+  const mediaWork = sharedMediaWork ?? ownMediaWork;
+  const suspend = async () => {
+    await rendererLifecycle.suspend();
+    await Promise.all([
+      sharedMediaWork ? undefined : ownMediaWork.suspend(),
+      beforeLibraryChange?.()
+    ]);
+  };
+  // The dialog is not a drain boundary. Only admitted library I/O is.
+  const handleExport = (
+    channel: string,
+    operation: (
+      event: IpcMainInvokeEvent,
+      value: unknown,
+      signal: AbortSignal
+    ) => Promise<boolean>
+  ) => {
+    ipcMain.handle(channel, async (event, value) => {
+      requireTrustedSender(event);
+      let signal: AbortSignal | undefined;
+      try {
+        return await mediaWork.run(() => {
+          signal = mediaWork.capture();
+          return operation(event, value, signal);
+        });
+      } catch (error) {
+        if (
+          signal?.aborted ||
+          (error instanceof Error && error.name === "AbortError")
+        )
+          return false;
+        throw error;
+      }
+    });
+  };
   ipcMain.handle(IPC_CHANNELS.libraryIssues, (event) => {
     requireTrustedSender(event);
     return listLibraryIssues();
@@ -74,8 +126,7 @@ export const registerLibraryHandlers = ({
       defaultId: backups.length
     });
     if (selected < 0 || selected >= backups.length) return;
-    await rendererLifecycle.suspend();
-    await beforeLibraryChange?.();
+    await suspend();
     await databaseManager.suspendForRecovery();
     try {
       const preserved = await databaseManager.restoreBackup(
@@ -101,15 +152,18 @@ export const registerLibraryHandlers = ({
     return app.getVersion();
   });
 
-  ipcMain.handle(IPC_CHANNELS.filesSaveAssetAs, async (event, value) => {
-    requireTrustedSender(event);
+  handleExport(IPC_CHANNELS.filesSaveAssetAs, async (event, value, signal) => {
     const window = BrowserWindow.fromWebContents(event.sender);
     if (!window) throw new Error("The Mago window is unavailable");
     const input = value as { assetId?: unknown; suggestedName?: unknown };
     if (typeof input.assetId !== "string" || !input.assetId) {
       throw new Error("assetId must be a non-empty string");
     }
-    const sourcePath = await repository.assetSourcePath(input.assetId);
+    const assetId = input.assetId;
+    const sourcePath = await mediaWork.boundary(() =>
+      repository.assetSourcePath(assetId)
+    );
+    signal.throwIfAborted();
     if (!sourcePath)
       throw new Error("This render is not available on disk yet");
     const suggestedName =
@@ -120,78 +174,90 @@ export const registerLibraryHandlers = ({
       title: "Save render",
       defaultPath: `${path.parse(suggestedName).name}${path.extname(sourcePath)}`
     });
-    if (result.canceled || !result.filePath) return false;
-    await copyFile(sourcePath, result.filePath);
+    signal.throwIfAborted();
+    const destination = result.filePath;
+    if (result.canceled || !destination || event.sender.isDestroyed())
+      return false;
+    await mediaWork.boundary(() => copyFile(sourcePath, destination));
     return true;
   });
 
-  ipcMain.handle(IPC_CHANNELS.filesExportSbsVideo, async (event, value) => {
-    requireTrustedSender(event);
-    const window = BrowserWindow.fromWebContents(event.sender);
-    if (!window) throw new Error("The Mago window is unavailable");
-    const candidate = value as Partial<SbsVideoExportInput>;
-    const string = (key: keyof SbsVideoExportInput): string => {
-      const item = candidate[key];
-      if (typeof item !== "string" || !item.trim())
-        throw new Error(`${key} must be a non-empty string`);
-      return item;
-    };
-    const integer = (key: "startFrame" | "endFrame"): number => {
-      const item = candidate[key];
-      if (typeof item !== "number" || !Number.isInteger(item) || item < 0)
-        throw new Error(`${key} must be a non-negative integer`);
-      return item;
-    };
-    const requestId = string("requestId");
-    const inputAssetId = string("inputAssetId");
-    const renderAssetId = string("renderAssetId");
-    const startFrame = integer("startFrame");
-    const endFrame = integer("endFrame");
-    const fps = candidate.fps;
-    if (typeof fps !== "number" || !Number.isFinite(fps) || fps <= 0)
-      throw new Error("fps must be a positive finite number");
-    if (endFrame < startFrame)
-      throw new Error("endFrame must be at least startFrame");
+  handleExport(
+    IPC_CHANNELS.filesExportSbsVideo,
+    async (event, value, signal) => {
+      const window = BrowserWindow.fromWebContents(event.sender);
+      if (!window) throw new Error("The Mago window is unavailable");
+      const candidate = value as Partial<SbsVideoExportInput>;
+      const string = (key: keyof SbsVideoExportInput): string => {
+        const item = candidate[key];
+        if (typeof item !== "string" || !item.trim())
+          throw new Error(`${key} must be a non-empty string`);
+        return item;
+      };
+      const integer = (key: "startFrame" | "endFrame"): number => {
+        const item = candidate[key];
+        if (typeof item !== "number" || !Number.isInteger(item) || item < 0)
+          throw new Error(`${key} must be a non-negative integer`);
+        return item;
+      };
+      const requestId = string("requestId");
+      const inputAssetId = string("inputAssetId");
+      const renderAssetId = string("renderAssetId");
+      const startFrame = integer("startFrame");
+      const endFrame = integer("endFrame");
+      const fps = candidate.fps;
+      if (typeof fps !== "number" || !Number.isFinite(fps) || fps <= 0)
+        throw new Error("fps must be a positive finite number");
+      if (endFrame < startFrame)
+        throw new Error("endFrame must be at least startFrame");
 
-    const [inputPath, renderPath, inputAsset] = await Promise.all([
-      repository.assetSourcePath(inputAssetId),
-      repository.assetSourcePath(renderAssetId),
-      repository.getAsset(inputAssetId)
-    ]);
-    if (!inputPath || !renderPath)
-      throw new Error("The comparison videos are not available on disk");
+      const [inputPath, renderPath, inputAsset] = await Promise.all([
+        mediaWork.boundary(() => repository.assetSourcePath(inputAssetId)),
+        mediaWork.boundary(() => repository.assetSourcePath(renderAssetId)),
+        mediaWork.boundary(() => repository.getAsset(inputAssetId))
+      ]);
+      signal.throwIfAborted();
+      if (!inputPath || !renderPath)
+        throw new Error("The comparison videos are not available on disk");
 
-    const suggestedName = path.basename(string("suggestedName"));
-    const result = await dialog.showSaveDialog(window, {
-      title: "Save side-by-side comparison",
-      defaultPath: suggestedName.toLowerCase().endsWith(".mp4")
-        ? suggestedName
-        : `${suggestedName}.mp4`,
-      filters: [{ name: "MP4 video", extensions: ["mp4"] }]
-    });
-    if (result.canceled || !result.filePath) return false;
+      const suggestedName = path.basename(string("suggestedName"));
+      const result = await dialog.showSaveDialog(window, {
+        title: "Save side-by-side comparison",
+        defaultPath: suggestedName.toLowerCase().endsWith(".mp4")
+          ? suggestedName
+          : `${suggestedName}.mp4`,
+        filters: [{ name: "MP4 video", extensions: ["mp4"] }]
+      });
+      signal.throwIfAborted();
+      const destination = result.filePath;
+      if (result.canceled || !destination || event.sender.isDestroyed())
+        return false;
 
-    await exportSbsVideo(
-      {
-        inputPath,
-        renderPath,
-        destinationPath: result.filePath,
-        startFrame,
-        endFrame,
-        fps,
-        horizontal: (inputAsset?.width ?? 1) >= (inputAsset?.height ?? 1)
-      },
-      (percentage) => {
-        if (!event.sender.isDestroyed()) {
-          event.sender.send(IPC_CHANNELS.filesSbsExportProgress, {
-            requestId,
-            percentage
-          });
-        }
-      }
-    );
-    return true;
-  });
+      await mediaWork.boundary(() =>
+        exportSbsVideo(
+          {
+            inputPath,
+            renderPath,
+            destinationPath: destination,
+            startFrame,
+            endFrame,
+            fps,
+            signal,
+            horizontal: (inputAsset?.width ?? 1) >= (inputAsset?.height ?? 1)
+          },
+          (percentage) => {
+            if (!signal.aborted && !event.sender.isDestroyed()) {
+              event.sender.send(IPC_CHANNELS.filesSbsExportProgress, {
+                requestId,
+                percentage
+              });
+            }
+          }
+        )
+      );
+      return true;
+    }
+  );
 
   ipcMain.handle(IPC_CHANNELS.libraryGet, async (event) => {
     requireTrustedSender(event);
@@ -212,11 +278,11 @@ export const registerLibraryHandlers = ({
     if (result.canceled || !rootPath) return null;
 
     await settings.assertWritable(rootPath);
-    await rendererLifecycle.suspend();
-    await beforeLibraryChange?.();
+    await suspend();
     await databaseManager.open(rootPath);
     await settings.setLibraryRoot(rootPath);
     afterLibraryChange?.();
+    if (!sharedMediaWork) ownMediaWork.reset();
     rendererLifecycle.reset();
     return toLibraryInfo(rootPath);
   });
@@ -228,4 +294,5 @@ export const registerLibraryHandlers = ({
     const errorMessage = await shell.openPath(rootPath);
     if (errorMessage) throw new Error(errorMessage);
   });
+  return rendererLifecycle;
 };

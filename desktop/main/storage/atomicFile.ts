@@ -20,14 +20,16 @@ const destinationQueueKey = (destination: string): string => {
 
 const renameInOrderPerDestination = (
   temporary: string,
-  destination: string
+  destination: string,
+  signal?: AbortSignal
 ): Promise<void> => {
   const queueKey = destinationQueueKey(destination);
   const previousRename =
     pendingRenameByDestination.get(queueKey) ?? Promise.resolve();
-  const queuedRename = previousRename.then(() =>
-    rename(temporary, destination)
-  );
+  const queuedRename = previousRename.then(() => {
+    signal?.throwIfAborted();
+    return rename(temporary, destination);
+  });
   const queuedRenameSettled = queuedRename.catch(() => {});
   pendingRenameByDestination.set(queueKey, queuedRenameSettled);
   void queuedRenameSettled.then(() => {
@@ -47,10 +49,12 @@ export const syncFile = async (temporary: string): Promise<void> => {
 };
 export const publishFile = async (
   temporary: string,
-  destination: string
+  destination: string,
+  signal?: AbortSignal
 ): Promise<void> => {
+  signal?.throwIfAborted();
   await syncFile(temporary);
-  await renameInOrderPerDestination(temporary, destination);
+  await renameInOrderPerDestination(temporary, destination, signal);
 };
 
 export const atomicWriteFile = async (
@@ -86,12 +90,14 @@ export const atomicCopyFile = async (
 
 export const atomicProduceFile = async (
   destination: string,
-  produce: (temporary: string) => Promise<void>
+  produce: (temporary: string) => Promise<void>,
+  signal?: AbortSignal
 ): Promise<void> => {
   const temporary = temporaryFile(destination);
   try {
+    signal?.throwIfAborted();
     await produce(temporary);
-    await publishFile(temporary, destination);
+    await publishFile(temporary, destination, signal);
   } finally {
     await rm(temporary, { force: true }).catch(() => {});
   }

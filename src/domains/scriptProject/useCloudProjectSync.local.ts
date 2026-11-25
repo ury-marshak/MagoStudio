@@ -1,8 +1,10 @@
 import { mediaDownloads } from "@domains/asset/mediaDownloads";
+import { rendererCloudBackgroundWork } from "@domains/cloud/rendererCloudBackgroundWork";
 /* oxlint-disable custom-react/no-use-effect -- cloud mirroring is an external synchronization process */
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useSyncExternalStore } from "react";
 
+import { isCloudAccountActive } from "@/platform/cloudAccount";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
 import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
@@ -25,7 +27,7 @@ export const useCloudProjectSync = (
   timelineId?: string
 ): { isSyncing: boolean } => {
   const queryClient = useQueryClient();
-  const { work } = useRendererLibraryWork();
+  const { work: origin } = useRendererLibraryWork();
   const isSyncing = useSyncExternalStore(
     subscribeCloudProjectSyncStatus,
     getCloudProjectSyncStatus,
@@ -33,24 +35,38 @@ export const useCloudProjectSync = (
   );
 
   useEffect(() => {
-    if (getLocalDesktopApi().account.mode !== "cloud" || work.signal.aborted)
+    if (
+      getLocalDesktopApi().account.mode !== "cloud" ||
+      !isCloudAccountActive()
+    )
       return;
+    const work = rendererCloudBackgroundWork(origin);
+    if (work.signal.aborted) return;
     const invalidate = (queryKey: readonly unknown[]) => {
       if (!work.signal.aborted)
         return queryClient.invalidateQueries({ queryKey });
     };
-    return subscribeCloudAssetReady((_readyProjectId, assetId) => {
+    const unsubscribe = subscribeCloudAssetReady((_readyProjectId, assetId) => {
       if (work.signal.aborted) return;
       void invalidate(queryKeys.videoAsset.byId(assetId));
       void invalidate(queryKeys.imageAsset.byId(assetId));
       void invalidate(["frame-generate", assetId]);
       void invalidate(["cached-video-preview", assetId]);
     });
-  }, [queryClient, work]);
+    const stop = () => {
+      unsubscribe();
+      work.signal.removeEventListener("abort", stop);
+    };
+    work.signal.addEventListener("abort", stop, { once: true });
+    if (work.signal.aborted) stop();
+    return stop;
+  }, [queryClient, origin]);
 
   useEffect(() => {
     const desktop = getLocalDesktopApi();
-    if (desktop.account.mode !== "cloud" || work.signal.aborted) return;
+    if (desktop.account.mode !== "cloud" || !isCloudAccountActive()) return;
+    const work = rendererCloudBackgroundWork(origin);
+    if (work.signal.aborted) return;
     let isActive = true;
     const invalidate = (queryKey: readonly unknown[]) => {
       if (isActive && !work.signal.aborted)
@@ -141,25 +157,30 @@ export const useCloudProjectSync = (
       if (isActive && !work.signal.aborted)
         console.warn("Failed to refresh cloud projects", error);
     });
-    return () => {
+    const stop = () => {
       isActive = false;
+      work.signal.removeEventListener("abort", stop);
       unsubscribeMetadata();
       unsubscribeAssetReady();
       if (projectRefreshTimer) clearTimeout(projectRefreshTimer);
       if (catalogRefreshTimer) clearTimeout(catalogRefreshTimer);
       // Navigation demotes the old project; its media continues in idle slots.
     };
-  }, [projectId, queryClient, work]);
+    work.signal.addEventListener("abort", stop, { once: true });
+    if (work.signal.aborted) stop();
+    return stop;
+  }, [projectId, queryClient, origin]);
 
   // The opened Shot's media is fetched first. This runs after the effect above
   // in the same commit, and that effect's sync starts asynchronously, so the
   // priority is already set when the first download is chosen.
   /* eslint-disable react-you-might-not-need-an-effect/no-event-handler -- priority hint for an external download queue */
   useEffect(() => {
-    if (work.signal.aborted) return;
+    if (origin.signal.aborted) return;
+    // Foreground priority is also used by local preview/cache work.
     mediaDownloads.setForeground(projectId, timelineId);
     if (timelineId) promoteCloudTimeline(timelineId);
-  }, [projectId, timelineId, work]);
+  }, [projectId, timelineId, origin]);
   /* eslint-enable react-you-might-not-need-an-effect/no-event-handler */
 
   return { isSyncing };

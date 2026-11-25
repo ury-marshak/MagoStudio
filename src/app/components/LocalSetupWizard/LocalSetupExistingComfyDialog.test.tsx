@@ -374,6 +374,7 @@ describe("updating an installed node pack from the ComfyUI dialog", () => {
     });
     downloadRequirement.mockResolvedValueOnce({
       outcome: "node-pack-update-needs-confirmation",
+      approvalToken: "fixture-approval",
       customNodesFolder: "D:/ComfyUI/custom_nodes",
       nodePackDirectory: "D:/ComfyUI/custom_nodes/ComfyUI-GGUF",
       backupsFolder: "D:/ComfyUI/backups"
@@ -393,7 +394,8 @@ describe("updating an installed node pack from the ComfyUI dialog", () => {
 
     await waitFor(() =>
       expect(downloadRequirement).toHaveBeenLastCalledWith("UnetLoaderGGUF", {
-        replaceExistingNodePackIn: "D:/ComfyUI/custom_nodes"
+        replaceExistingNodePackIn: "D:/ComfyUI/custom_nodes",
+        approvalToken: "fixture-approval"
       })
     );
   });

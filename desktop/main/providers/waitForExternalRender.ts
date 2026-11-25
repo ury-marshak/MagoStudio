@@ -2,6 +2,7 @@ import { setTimeout } from "node:timers/promises";
 
 import type { ExternalRenderJob } from "./externalRenderJobRepository";
 import type { ExternalRenderJobService } from "./externalRenderJobService";
+import { waitForInference } from "./sharedInference";
 
 const pollIntervalMs = 2500;
 
@@ -9,10 +10,11 @@ export const waitForExternalRender = async (
   jobs: ExternalRenderJobService,
   job: ExternalRenderJob,
   signal: AbortSignal,
-  onSubmitted: () => Promise<void>
+  onSubmitted: () => Promise<void>,
+  profile?: AbortSignal
 ) => {
-  // A library stop aborts transport, not the accepted remote generation. Retain
-  // this exact session even if a provider ignores abort until after reset.
+  // Library/profile retirement aborts transport, not accepted generation.
+  // Retain the original session even if a provider ignores abort.
   const lifetime = jobs.captureSession?.();
   const jobId = job.id;
   try {
@@ -23,11 +25,13 @@ export const waitForExternalRender = async (
       job.status === "CANCELLATION_REQUESTED"
     ) {
       signal.throwIfAborted();
-      job = await jobs.refresh(jobId, signal);
+      job = await waitForInference(jobs.refresh(jobId, signal), signal);
       if (job.status === "SUBMITTED" || job.status === "CANCELLATION_REQUESTED")
         await setTimeout(pollIntervalMs, undefined, { signal });
     }
-    if (job.status === "OUTPUT_READY") job = await jobs.ingest(jobId, signal);
+    if (job.status === "OUTPUT_READY")
+      job = await waitForInference(jobs.ingest(jobId, signal), signal);
+    signal.throwIfAborted();
     const assetId = job.outputJson?.assetIds?.[0];
     if (job.status === "INGESTED" && assetId) return { assetId, job };
     if (job.status === "SUBMISSION_UNKNOWN" || job.status === "SUBMITTING")
@@ -38,8 +42,10 @@ export const waitForExternalRender = async (
       job.error ?? `${job.provider} render ended with status ${job.status}`
     );
   } catch (error) {
-    if (signal.aborted && !lifetime?.aborted)
-      await jobs.cancel(jobId).catch(() => undefined);
+    if (signal.aborted && !lifetime?.aborted && !profile?.aborted)
+      await (profile ? jobs.cancel(jobId, profile) : jobs.cancel(jobId)).catch(
+        () => undefined
+      );
     throw error;
   }
 };

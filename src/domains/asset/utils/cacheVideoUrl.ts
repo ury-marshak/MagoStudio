@@ -1,5 +1,9 @@
-import { rendererLibrary } from "@/platform/rendererLibraryWork";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 import { readableDesktopStorageUrl } from "@/platform/rendererMediaAccess";
+import { createRendererObjectUrl } from "@/platform/rendererObjectUrl";
 
 import { getCachedVideoBlob } from "./getCachedVideoBlob";
 
@@ -8,14 +12,14 @@ import { getCachedVideoBlob } from "./getCachedVideoBlob";
  * the next attempt sees the finished video rather than a stored blank. */
 export const cacheVideoUrl = async (
   url: string,
-  cacheKey: string
+  cacheKey: string,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<{ urlToUse: string; isCached: boolean }> => {
-  const work = rendererLibrary.capture();
   try {
     const blob = await getCachedVideoBlob(url, cacheKey, work);
     work.check();
 
-    const blobUrl = URL.createObjectURL(blob);
+    const blobUrl = createRendererObjectUrl(blob, work);
     return { urlToUse: blobUrl, isCached: true };
   } catch (error) {
     work.check();

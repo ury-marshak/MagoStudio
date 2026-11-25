@@ -138,30 +138,40 @@ export const buildSbsFfmpegArgs = (
 };
 
 export const exportSbsVideo = async (
-  options: Omit<SbsFfmpegOptions, "outputPath"> & { destinationPath: string },
+  options: Omit<SbsFfmpegOptions, "outputPath"> & {
+    destinationPath: string;
+    signal?: AbortSignal;
+  },
   onProgress?: (percentage: number) => void
 ): Promise<void> => {
+  const { signal } = options;
+  signal?.throwIfAborted();
   if (!ffmpegPath) throw new Error("The bundled FFmpeg is unavailable");
-  const [inputStats, renderStats] = await Promise.all([
-    stat(options.inputPath),
-    stat(options.renderPath)
-  ]);
+  const inputStats = await stat(options.inputPath);
+  signal?.throwIfAborted();
+  const renderStats = await stat(options.renderPath);
+  signal?.throwIfAborted();
   if (!inputStats.isFile() || !renderStats.isFile())
     throw new Error("The comparison videos are unavailable on disk");
 
   const temporaryDirectory = await mkdtemp(
     path.join(os.tmpdir(), "mago-sbs-export-")
   );
-  const temporaryOutput = path.join(temporaryDirectory, "comparison.mp4");
-  const { args, durationSeconds } = buildSbsFfmpegArgs({
-    ...options,
-    outputPath: temporaryOutput
-  });
-  const executable = ffmpegPath.replace("app.asar", "app.asar.unpacked");
+  const reportProgress = (percentage: number) => {
+    if (!signal?.aborted) onProgress?.(percentage);
+  };
 
   try {
-    onProgress?.(INITIAL_PROGRESS_PERCENTAGE);
+    signal?.throwIfAborted();
+    const temporaryOutput = path.join(temporaryDirectory, "comparison.mp4");
+    const { args, durationSeconds } = buildSbsFfmpegArgs({
+      ...options,
+      outputPath: temporaryOutput
+    });
+    const executable = ffmpegPath.replace("app.asar", "app.asar.unpacked");
+    reportProgress(INITIAL_PROGRESS_PERCENTAGE);
     await new Promise<void>((resolve, reject) => {
+      signal?.throwIfAborted();
       const child = spawn(executable, args, {
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"]
@@ -185,7 +195,7 @@ export const exportSbsVideo = async (
               )
             )
           );
-          onProgress?.(percentage);
+          reportProgress(percentage);
         }
       });
       child.stderr.on("data", (chunk: Buffer) => {
@@ -193,9 +203,18 @@ export const exportSbsVideo = async (
           -MAX_ERROR_LENGTH
         );
       });
-      child.once("error", reject);
-      child.once("exit", (code) => {
-        if (code === 0) resolve();
+      let childError: Error | undefined;
+      const stop = () => child.kill("SIGKILL");
+      signal?.addEventListener("abort", stop, { once: true });
+      child.once("error", (error) => {
+        childError = error;
+      });
+      // Even a failed spawn emits close after error. Keep the temporary
+      // directory owned until the child's stdio and process have closed.
+      child.once("close", (code) => {
+        signal?.removeEventListener("abort", stop);
+        if (childError) reject(childError);
+        else if (code === 0) resolve();
         else
           reject(
             new Error(
@@ -206,8 +225,9 @@ export const exportSbsVideo = async (
           );
       });
     });
+    signal?.throwIfAborted();
     await copyFile(temporaryOutput, options.destinationPath);
-    onProgress?.(COMPLETE_PROGRESS_PERCENTAGE);
+    reportProgress(COMPLETE_PROGRESS_PERCENTAGE);
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
   }

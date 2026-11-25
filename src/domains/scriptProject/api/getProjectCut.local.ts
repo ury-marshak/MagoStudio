@@ -1,7 +1,13 @@
+import { rendererCloudBackgroundWork } from "@domains/cloud/rendererCloudBackgroundWork";
 import { ProjectCut, ProjectCutSchema } from "@schemas/scriptProject";
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { isLocalScriptProject } from "../projectOrigin";
 import {
@@ -11,11 +17,13 @@ import {
 
 export const getProjectCut = async (
   projectId: string,
-  options: { preferCache?: boolean } = {}
+  options: { preferCache?: boolean } = {},
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<ProjectCut> => {
   const desktop = getLocalDesktopApi();
-  const isLocal = await isLocalScriptProject(projectId);
-  const cached = (await readScriptProjectSnapshot(projectId))?.cut;
+  const isLocal = await work.boundary(() => isLocalScriptProject(projectId));
+  const cached = (await readScriptProjectSnapshot(projectId, work))?.cut;
+  work.check();
   // Local rendered videos live in this durable snapshot. A generic query
   // invalidation must not replace them with the empty pre-render default.
   if (cached && (isLocal || options.preferCache !== false)) {
@@ -23,13 +31,21 @@ export const getProjectCut = async (
   }
   if (!isLocal && desktop.account.mode === "cloud") {
     try {
-      const response = await backendApiClient.get(`/projects/${projectId}/cut`);
-      const cut = ProjectCutSchema.parse(response.data);
-      await writeScriptProjectSnapshot({ projectId, cut });
-      return ProjectCutSchema.parse(
-        (await readScriptProjectSnapshot(projectId))?.cut ?? cut
+      const cloudWork = rendererCloudBackgroundWork(work);
+      const response = await runRendererLibraryRequest(cloudWork, (signal) =>
+        backendApiClient.get(`/projects/${projectId}/cut`, { signal })
       );
+      cloudWork.check();
+      const cut = ProjectCutSchema.parse(response.data);
+      await writeScriptProjectSnapshot(
+        { projectId, intent: "cloud-import", cut },
+        cloudWork
+      );
+      const refreshed = await readScriptProjectSnapshot(projectId, cloudWork);
+      cloudWork.check();
+      return ProjectCutSchema.parse(refreshed?.cut ?? cut);
     } catch (error) {
+      work.check();
       if (cached) return ProjectCutSchema.parse(cached);
       throw error;
     }

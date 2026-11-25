@@ -2,6 +2,8 @@ import { Layer } from "@schemas/layer";
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
+
 const {
   downloadLayerVideo,
   isTrackOwnedByCloud,
@@ -47,6 +49,8 @@ const renderTrack = {
 
 const stubMirroredAsset = (assetData: Record<string, unknown> | null) => {
   vi.stubGlobal("mago", {
+    account: { mode: "offline" },
+    library: { onWillChange: async () => {}, onDidChange: () => {} },
     assets: {
       get: vi
         .fn()
@@ -67,6 +71,7 @@ const downloadRender = async () => {
 describe("useDownloadImageToVideoRender in the desktop app", () => {
   afterEach(() => {
     vi.clearAllMocks();
+    rendererLibrary.reset();
     vi.unstubAllGlobals();
   });
 
@@ -76,10 +81,13 @@ describe("useDownloadImageToVideoRender in the desktop app", () => {
 
     await downloadRender();
 
-    expect(saveTrackVideoToDisk).toHaveBeenCalledWith({
-      track: renderTrack,
-      fileName: "Render.mp4"
-    });
+    expect(saveTrackVideoToDisk).toHaveBeenCalledWith(
+      {
+        track: renderTrack,
+        fileName: "Render.mp4"
+      },
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(saveLayerDownloadToDisk).not.toHaveBeenCalled();
     expect(triggerBlobDownload).not.toHaveBeenCalled();
   });
@@ -90,10 +98,13 @@ describe("useDownloadImageToVideoRender in the desktop app", () => {
 
     await downloadRender();
 
-    expect(saveTrackVideoToDisk).toHaveBeenCalledWith({
-      track: renderTrack,
-      fileName: "Render.mp4"
-    });
+    expect(saveTrackVideoToDisk).toHaveBeenCalledWith(
+      {
+        track: renderTrack,
+        fileName: "Render.mp4"
+      },
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(saveLayerDownloadToDisk).not.toHaveBeenCalled();
     expect(downloadLayerVideo).not.toHaveBeenCalled();
   });
@@ -104,12 +115,41 @@ describe("useDownloadImageToVideoRender in the desktop app", () => {
 
     await downloadRender();
 
-    expect(saveLayerDownloadToDisk).toHaveBeenCalledWith({
-      layerId: "track-1",
-      kind: "video",
-      suggestedName: "Render.mp4"
-    });
+    expect(saveLayerDownloadToDisk).toHaveBeenCalledWith(
+      {
+        layerId: "track-1",
+        kind: "video",
+        suggestedName: "Render.mp4"
+      },
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(saveTrackVideoToDisk).not.toHaveBeenCalled();
     expect(triggerBlobDownload).not.toHaveBeenCalled();
+  });
+
+  it("does not look up or save the render after an old ownership read settles", async () => {
+    const ownership = Promise.withResolvers<boolean>();
+    isTrackOwnedByCloud.mockReturnValueOnce(ownership.promise);
+    stubMirroredAsset({ cloudMirror: true, status: "ingested" });
+    const { result } = renderHook(() =>
+      useDownloadImageToVideoRender(renderTrack, "project-1")
+    );
+    let saving!: Promise<void>;
+    await act(async () => {
+      saving = result.current.downloadRenderVideo();
+      await vi.waitFor(() =>
+        expect(isTrackOwnedByCloud).toHaveBeenCalledOnce()
+      );
+    });
+    await act(async () => {
+      await rendererLibrary.suspend();
+      rendererLibrary.reset();
+      ownership.resolve(true);
+      await saving;
+    });
+    expect(window.mago.assets.get).not.toHaveBeenCalled();
+    expect(saveTrackVideoToDisk).not.toHaveBeenCalled();
+    expect(saveLayerDownloadToDisk).not.toHaveBeenCalled();
+    expect(result.current.isDownloadingRenderVideo).toBe(false);
   });
 });

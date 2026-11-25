@@ -1,3 +1,5 @@
 import { atom } from "jotai";
 
-export const currentVideoSrcAtom = atom<Record<string, string>>({});
+export const currentVideoSrcAtom = atom<
+  Record<string, { url: string; signal: AbortSignal }>
+>({});

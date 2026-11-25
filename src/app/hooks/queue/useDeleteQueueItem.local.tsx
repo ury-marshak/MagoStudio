@@ -1,6 +1,8 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { cancelCloudQueueItem } from "./cancelCloudQueueItem";
@@ -9,22 +11,24 @@ import { QueueItem } from "./interface";
 export const useDeleteQueueItem = () => {
   const queryClient = useQueryClient();
 
-  return useMutation({
-    mutationFn: async (params: {
-      queueItemId: string;
-      shouldDeleteCloudOutputLayer?: boolean;
-    }) => {
+  return useRendererLibraryMutation({
+    mutationFn: async (
+      params: { queueItemId: string; shouldDeleteCloudOutputLayer?: boolean },
+      work
+    ) => {
       const queueItem = queryClient
-        .getQueryData<QueueItem[]>(queryKeys.queue.all)
+        .getQueryData<QueueItem[]>(libraryQueryKey(queryKeys.queue.all))
         ?.find((candidate) => candidate.id === params.queueItemId);
       if (queueItem?.render_provider === "mago-cloud") {
         await cancelCloudQueueItem({
           queueItem,
           shouldDeleteCloudOutputLayer:
-            params.shouldDeleteCloudOutputLayer ?? false
+            params.shouldDeleteCloudOutputLayer ?? false,
+          work
         });
         return;
       }
+      work.check();
       await getLocalDesktopApi().imageRenders.cancel(params.queueItemId);
     },
     onSuccess: () => {

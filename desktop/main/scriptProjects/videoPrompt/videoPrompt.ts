@@ -223,6 +223,7 @@ export interface CleanPayload {
   environment: JsonRecord;
   props: unknown[];
   references: CleanReference[];
+  opening_frame?: { description: string };
   task_types: string[];
   retention: Record<string, string>;
 }
@@ -377,6 +378,13 @@ export const validateShotPayload = (payload: JsonRecord): CleanPayload => {
     environment: environment as JsonRecord,
     props: props!,
     references: cleanReferences,
+    ...(isRecord(payload.opening_frame)
+      ? {
+          opening_frame: {
+            description: cleanStr(payload.opening_frame.description)
+          }
+        }
+      : {}),
     task_types: taskTypes!.map(cleanStr),
     retention: Object.fromEntries(
       Object.entries(retention as JsonRecord).map(([key, value]) => [
@@ -694,6 +702,7 @@ export const inferTaskTypes = (clean: CleanPayload): string[] => {
   if (clean.references.some((reference) => reference.kind === "video"))
     return ["video continuation"];
   if (
+    clean.opening_frame ||
     clean.references.some(
       (reference) => reference.continuation === CONTINUATION_PIN
     )
@@ -839,12 +848,20 @@ export const buildSkeleton = (
   const summary = `[${taskTypes.join(" + ")}] ${asSentence(shot.description)}${durationClause}`;
 
   const byLabel = new Map(labels.map((label) => [label.label, label]));
+  if (clean.opening_frame)
+    subjectLines.push(
+      "The opening frame is the last frame of the preceding shot."
+    );
   const retentionLines = Object.entries(retention).map(
     ([label, marker]) =>
       `${byLabel.has(label) ? labelPlaceholder(byLabel.get(label)!) : label}: ${marker}` +
       " - carried into the target video as described."
   );
 
+  if (clean.opening_frame)
+    retentionLines.push(
+      "Opening frame: fully_preserved - the opening moment, including poses, framing, setting and light."
+    );
   const look = shot.style || DEFAULT_LOOK;
   const camera = shot.camera || DEFAULT_CAMERA;
   const detailParts = [
@@ -1078,7 +1095,10 @@ export const applyPinnedCamera = (
   clean: CleanPayload,
   labels: Label[]
 ): CleanPayload => {
-  if (!labels.some((label) => label.continuation === CONTINUATION_PIN))
+  if (
+    !clean.opening_frame &&
+    !labels.some((label) => label.continuation === CONTINUATION_PIN)
+  )
     return clean;
   return { ...clean, shot: { ...clean.shot, camera: PINNED_CAMERA } };
 };
@@ -1280,6 +1300,17 @@ export const modelContents = (
   ];
   const continuity = continuationBrief(labels);
   if (continuity) parts.push(continuity);
+  if (clean.opening_frame)
+    parts.push(
+      "## Continuity — unnumbered opening frame\n" +
+        "The supplied opening frame is the final frame of the preceding shot. Open exactly on it. " +
+        "Hold its framing, angle, height and lens, locked off for the whole clip. " +
+        "Do not describe a cut, dissolve or morph. Call it ‘the opening frame’, never use a numbered image, " +
+        "reference placeholder or new label for it. " +
+        NOTHING_RESTARTS +
+        " " +
+        clean.opening_frame.description
+    );
   const brief = dialogueBrief(turns, subjectLabelFor(labels));
   if (brief) parts.push(brief);
   if (hardFailures?.length)

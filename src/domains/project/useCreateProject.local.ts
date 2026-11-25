@@ -1,3 +1,4 @@
+import { rendererCloudBackgroundWork } from "@domains/cloud/rendererCloudBackgroundWork";
 import { writeScriptProjectSnapshot } from "@domains/scriptProject/scriptProjectSnapshot";
 import { syncCloudProjectMetadata } from "@domains/scriptProject/syncCloudScriptProjects";
 import { Project } from "@schemas/project";
@@ -7,6 +8,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
 import {
   rendererLibrary,
   runRendererLibraryRequest
@@ -52,7 +54,8 @@ export const createProject = async (
     throw new Error("Mago Cloud is not available");
   }
   if (!desktop || shouldCreateCloudProject) {
-    const response = await runRendererLibraryRequest(work, (signal) =>
+    const cloudWork = desktop ? rendererCloudBackgroundWork(work) : work;
+    const response = await runRendererLibraryRequest(cloudWork, (signal) =>
       backendApiClient.post(
         `/projects`,
         {
@@ -64,22 +67,23 @@ export const createProject = async (
         { signal }
       )
     );
-    work.check();
+    cloudWork.check();
     const project = response.data as Project;
     if (desktop && shouldCreateCloudProject) {
       if (projectType === "script_to_shots") {
         await writeScriptProjectSnapshot(
           {
             projectId: project.id,
+            intent: "cloud-import",
             project: project as Record<string, unknown>
           },
-          work
+          cloudWork
         );
       } else {
-        await syncCloudProjectMetadata(project.id, work);
+        await syncCloudProjectMetadata(project.id, cloudWork);
       }
     }
-    work.check();
+    cloudWork.check();
     return project;
   }
   const library = await work.boundary(() => desktop.library.get());
@@ -130,7 +134,7 @@ export const useCreateProject = () => {
     mutationFn: createProject,
     onSuccess: (newProject) => {
       queryClient.setQueryData(
-        queryKeys.projects.all,
+        libraryQueryKey(queryKeys.projects.all),
         (old: Project[] | undefined) => {
           return [...(old ?? []), newProject];
         }

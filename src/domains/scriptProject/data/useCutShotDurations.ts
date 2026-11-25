@@ -2,6 +2,7 @@ import { readVideoDurationSeconds } from "@app/utils/video/readVideoDurationSeco
 import { CutShot } from "@schemas/scriptProject";
 import { useQueries } from "@tanstack/react-query";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 export interface CutShotDurations {
@@ -31,15 +32,22 @@ const collectMeasurableCutShots = (
 };
 
 export const useCutShotDurations = (cutShots: CutShot[]): CutShotDurations => {
-  const measurableCutShots = collectMeasurableCutShots(cutShots);
+  const { work, libraryVersion } = useRendererLibraryWork();
+  const measurableCutShots = work.signal.aborted
+    ? []
+    : collectMeasurableCutShots(cutShots);
 
   const results = useQueries({
     queries: measurableCutShots.map(({ assetId, videoUrl }) => ({
-      queryKey: queryKeys.videoDurationSeconds.byAssetId(assetId),
-      queryFn: () => readVideoDurationSeconds(videoUrl),
+      queryKey: [
+        ...queryKeys.videoDurationSeconds.byAssetId(assetId),
+        videoUrl,
+        libraryVersion
+      ],
+      queryFn: () => readVideoDurationSeconds(videoUrl, work),
       staleTime: Infinity,
       gcTime: Infinity,
-      retry: 1
+      retry: (failureCount: number) => !work.signal.aborted && failureCount < 1
     }))
   });
 

@@ -13,10 +13,17 @@ import type { DatabaseManager } from "../database/databaseManager";
 import { assets, projectAssets } from "../database/schema";
 import { doesVideoHaveAudioStream } from "../media/doesVideoHaveAudioStream";
 import { createImageThumbnail } from "../media/imageThumbnail";
-import { publishFile } from "../storage/atomicFile";
+import { probeEffectVideo } from "../ordinaryFal/probeEffectVideo";
+import { publishFile, temporaryFile } from "../storage/atomicFile";
 
 import type { ExternalRenderJob } from "./externalRenderJobRepository";
 import type { MediaRenderOutput } from "./mediaRenderProvider";
+import { consumeProviderBody } from "./providerResponseBody";
+
+const effectEndpoints = new Set([
+  "fal-ai/kling-video/o1/video-to-video/edit",
+  "fal-ai/topaz/upscale/video"
+]);
 
 const downloadTimeoutMs = 120_000;
 const httpOk = 200;
@@ -127,8 +134,8 @@ export class ExternalRenderAssets {
         }
       );
       const fields = local
-        ? await this.mediaFields(job.kind, sourcePath, signal)
-        : await this.downloadFile(job.kind, url, sourcePath, signal);
+        ? await this.mediaFields(job, sourcePath, signal)
+        : await this.downloadFile(job, url, sourcePath, signal);
       signal?.throwIfAborted();
       const thumbnail = path.join(root, thumbnailRelativePath);
       await mkdir(path.dirname(thumbnail), { recursive: true });
@@ -137,10 +144,12 @@ export class ExternalRenderAssets {
         .catch(() => undefined);
       const info = local ?? (await stat(sourcePath));
       signal?.throwIfAborted();
+      const { hasAudio: measuredAudio, ...assetFields } = fields;
       const hasAudio =
-        job.kind === "video"
+        measuredAudio ??
+        (job.kind === "video"
           ? await doesVideoHaveAudioStream(sourcePath)
-          : undefined;
+          : undefined);
       signal?.throwIfAborted();
       files.push({
         id,
@@ -152,7 +161,7 @@ export class ExternalRenderAssets {
         thumbnailRelativePath: preview,
         sizeBytes: info.size,
         modifiedAtImport: info.mtime,
-        ...fields,
+        ...assetFields,
         dataJson: JSON.stringify({
           origin: "generated",
           status: "ingested",
@@ -170,7 +179,7 @@ export class ExternalRenderAssets {
   }
 
   private async downloadFile(
-    kind: ExternalRenderJob["kind"],
+    job: ExternalRenderJob,
     url: string,
     destination: string,
     callerSignal?: AbortSignal
@@ -182,11 +191,13 @@ export class ExternalRenderAssets {
     const signal = callerSignal
       ? AbortSignal.any([callerSignal, timeout])
       : timeout;
-    const extension = path.extname(destination);
-    const temporary = `${destination.slice(0, -extension.length)}.partial${extension}`;
-    await rm(temporary, { force: true });
+    const temporary = temporaryFile(destination);
     try {
       const response = await fetch(target.href, { redirect: "error", signal });
+      if (signal.aborted) {
+        await response.body?.cancel();
+        signal.throwIfAborted();
+      }
       if (unavailableStatuses.has(response.status)) {
         await response.body?.cancel();
         throw new RenderOutputUnavailable(
@@ -199,7 +210,11 @@ export class ExternalRenderAssets {
           `Render output download returned HTTP ${response.status}`
         );
       }
-      await pipeline(response.body, createWriteStream(temporary), { signal });
+      // The source owns its web reader, so abort can cancel a pending read
+      // without another chunk. Keep the transfer enrolled through cleanup.
+      await consumeProviderBody(response.body, signal, (chunks) =>
+        pipeline(chunks, createWriteStream(temporary), { signal })
+      );
       const { size } = await stat(temporary);
       const expected = response.headers.get("content-length");
       if (
@@ -209,9 +224,9 @@ export class ExternalRenderAssets {
           size !== Number(expected))
       )
         throw new Error("Render output download was incomplete");
-      const fields = await this.mediaFields(kind, temporary, signal);
+      const fields = await this.mediaFields(job, temporary, signal);
       signal.throwIfAborted();
-      await publishFile(temporary, destination);
+      await publishFile(temporary, destination, signal);
       return fields;
     } finally {
       await rm(temporary, { force: true });
@@ -219,21 +234,36 @@ export class ExternalRenderAssets {
   }
 
   private async mediaFields(
-    kind: ExternalRenderJob["kind"],
+    job: ExternalRenderJob,
     source: string,
     signal?: AbortSignal
   ) {
     signal?.throwIfAborted();
-    if (kind === "image") {
+    if (job.kind === "image") {
       const image = nativeImage.createFromPath(source);
       if (image.isEmpty())
         throw new Error("Could not decode the rendered image");
-      return image.getSize();
+      return { ...image.getSize(), hasAudio: undefined };
+    }
+    if (job.provider === "fal" && effectEndpoints.has(job.endpoint)) {
+      const video = await probeEffectVideo(source, signal);
+      signal?.throwIfAborted();
+      return {
+        width: video.width,
+        height: video.height,
+        fps: Math.round(video.fps * 1000),
+        frameCount: Math.round(video.durationSeconds * video.fps),
+        duration: Math.round(video.durationSeconds * 1000),
+        hasAudio: video.hasAudio
+      };
     }
     const video = await probeRenderedVideoMetadata(source, signal);
     signal?.throwIfAborted();
     if (!video) throw new Error("Could not read the rendered video");
-    return toDeliveredVideoAssetFields(video, undefined);
+    return {
+      ...toDeliveredVideoAssetFields(video, undefined),
+      hasAudio: undefined
+    };
   }
 
   private async libraryRoot(): Promise<string> {

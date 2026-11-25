@@ -73,7 +73,15 @@ export class VlmService {
   readonly libraryWork = new LibraryWorkSession(() => ({
     pending: new SharedInference<LocalAssetPromptResult>(),
     pendingDescriptions: new SharedInference<string | null>(),
-    queue: Promise.resolve() as Promise<unknown>
+    queue: Promise.resolve() as Promise<unknown>,
+    profiles: new WeakMap<
+      AbortSignal,
+      {
+        pending: SharedInference<LocalAssetPromptResult>;
+        pendingDescriptions: SharedInference<string | null>;
+        queue: Promise<unknown>;
+      }
+    >()
   }));
 
   stop(): void {
@@ -88,7 +96,35 @@ export class VlmService {
     this.libraryWork.reset();
   }
 
+  private profileState(profile?: AbortSignal) {
+    if (!profile) return this.libraryWork.state;
+    profile.throwIfAborted();
+    const { profiles } = this.libraryWork.state;
+    let state = profiles.get(profile);
+    if (!state) {
+      state = {
+        pending: new SharedInference<LocalAssetPromptResult>(),
+        pendingDescriptions: new SharedInference<string | null>(),
+        queue: Promise.resolve()
+      };
+      profiles.set(profile, state);
+    }
+    return state;
+  }
+
+  private signalForProfile(
+    caller?: AbortSignal,
+    profile = this.captureProfile?.()
+  ) {
+    return this.signal(
+      caller && profile
+        ? AbortSignal.any([caller, profile])
+        : (caller ?? profile)
+    );
+  }
+
   private signal(caller?: AbortSignal): AbortSignal {
+    caller?.throwIfAborted();
     const lifetime = this.libraryWork.signal;
     const signal = caller ? AbortSignal.any([caller, lifetime]) : lifetime;
     signal.throwIfAborted();
@@ -101,7 +137,8 @@ export class VlmService {
     private readonly probeVision: (
       signal?: AbortSignal
     ) => Promise<VlmModelStatus>,
-    private readonly generateEnhancement: VisionGenerator = generateVision
+    private readonly generateEnhancement: VisionGenerator = generateVision,
+    private readonly captureProfile?: () => AbortSignal
   ) {
     this.repository = this.libraryWork.guard(repository);
     this.status = this.libraryWork.bind(this.status.bind(this));
@@ -120,8 +157,9 @@ export class VlmService {
     this.enhancePrompt = this.libraryWork.bind(this.enhancePrompt.bind(this));
   }
 
-  status(): Promise<VlmModelStatus> {
-    const signal = this.signal();
+  status(caller?: AbortSignal): Promise<VlmModelStatus> {
+    const profile = this.captureProfile?.();
+    const signal = this.signalForProfile(caller, profile);
     return waitForInference(this.probeVision(signal), signal);
   }
 
@@ -130,10 +168,15 @@ export class VlmService {
     caller?: AbortSignal
   ): Promise<LocalAssetPromptResult> {
     if (!assetId) throw new Error("Asset ID is required");
-    return this.libraryWork.state.pending.run(
+    const profile = this.captureProfile?.();
+    return this.profileState(profile).pending.run(
       assetId,
-      (signal) => this.generateAssetPrompt(assetId, this.signal(signal)),
-      this.signal(caller)
+      (signal) =>
+        this.generateAssetPrompt(
+          assetId,
+          this.signalForProfile(signal, profile)
+        ),
+      this.signalForProfile(caller, profile)
     );
   }
 
@@ -146,9 +189,10 @@ export class VlmService {
     sourcePath: string,
     kind: string,
     generate?: VisionGenerator,
-    caller?: AbortSignal
+    caller?: AbortSignal,
+    profile = this.captureProfile?.()
   ): Promise<string> {
-    const signal = this.signal(caller);
+    const signal = this.signalForProfile(caller, profile);
     const request = entityDescriptionPrompt(kind);
     const description = await this.generate(
       {
@@ -170,7 +214,7 @@ export class VlmService {
     input: ShotVideoEvaluationInput,
     caller?: AbortSignal
   ): Promise<Record<string, unknown>> {
-    const signal = this.signal(caller);
+    const signal = this.signalForProfile(caller);
     const timestamps = sampleMetricsTimestamps(input.durationSeconds);
     const images: Buffer[] = [];
     if (input.referencePaths.length) {
@@ -233,10 +277,15 @@ export class VlmService {
     caller?: AbortSignal
   ): Promise<string | null> {
     if (!assetId) throw new Error("Asset ID is required");
-    return this.libraryWork.state.pendingDescriptions.run(
+    const profile = this.captureProfile?.();
+    return this.profileState(profile).pendingDescriptions.run(
       assetId,
-      (signal) => this.generateImageDescription(assetId, this.signal(signal)),
-      this.signal(caller)
+      (signal) =>
+        this.generateImageDescription(
+          assetId,
+          this.signalForProfile(signal, profile)
+        ),
+      this.signalForProfile(caller, profile)
     );
   }
 
@@ -250,12 +299,18 @@ export class VlmService {
     // Capture before the first readiness/cache await, including when a producer
     // supplies the lifetime it captured before ingestion. Expected teardown is
     // not a library-health failure and must not clear a replacement's issue.
+    try {
+      const profile = this.captureProfile?.();
+      if (profile) origin = AbortSignal.any([origin, profile]);
+    } catch {
+      return;
+    }
     if (origin.aborted) return;
     const id = `Image description ${assetId}`;
     void this.libraryWork
       .run(async () => {
         this.signal(origin);
-        const status = await this.status();
+        const status = await this.status(origin);
         this.signal(origin);
         if (status.ready) await this.describeImageAsset(assetId, origin);
       })
@@ -278,7 +333,7 @@ export class VlmService {
     input: LocalAutoPromptInput,
     caller?: AbortSignal
   ): Promise<LocalAutoPromptResult> {
-    const signal = this.signal(caller);
+    const signal = this.signalForProfile(caller);
     const style = this.decodeImage(input.styleReferenceImage);
     if (!style) throw new Error("styleReferenceImage is required");
 
@@ -330,7 +385,7 @@ export class VlmService {
     input: LocalEnhancePromptInput,
     caller?: AbortSignal
   ): Promise<LocalEnhancePromptResult> {
-    const signal = this.signal(caller);
+    const signal = this.signalForProfile(caller);
     const query = input.query?.trim();
     if (!query) throw new Error("Missing required 'query' field");
     // Text only — the enhancer never had an image, and only the kontext version
@@ -493,8 +548,10 @@ export class VlmService {
   }
 
   private complete(request: GenerateRequest, generate = this.generateVision) {
-    const signal = this.signal(request.signal);
-    const state = this.libraryWork.state;
+    request.signal?.throwIfAborted();
+    const profile = this.captureProfile?.();
+    const signal = this.signalForProfile(request.signal, profile);
+    const state = this.profileState(profile);
     const task = state.queue.then(async () => {
       signal.throwIfAborted();
       const { text, model } = await generate({

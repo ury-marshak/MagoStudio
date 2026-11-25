@@ -2,6 +2,10 @@ import { Badge } from "@components/Badge";
 import { Icon } from "@components/Icon";
 import { IconActionButton } from "@components/IconActionButton";
 import { Tooltip } from "@components/Tooltip";
+import {
+  VIDEO_EFFECTS_LABEL,
+  useVideoEffects
+} from "@components/VideoEffects/useVideoEffects";
 import { useProject } from "@domains/project/useProject";
 import { useSelectedProjectId } from "@domains/project/useSelectedProjectId";
 import { useGoBackToSourceVideo } from "@domains/track/useGoBackToSourceVideo";
@@ -34,6 +38,7 @@ export const InputVideoTrackItem: React.FC<Props> = ({ track }) => {
   const displayName = shot?.name ?? track.name;
 
   const goBackToSourceVideo = useGoBackToSourceVideo();
+  const effects = useVideoEffects(project, track);
 
   return (
     <div className="relative h-full w-full">
@@ -53,11 +58,21 @@ export const InputVideoTrackItem: React.FC<Props> = ({ track }) => {
               className="absolute top-1 left-2 text-code-200"
             />
           )}
-          {/* Empty slots keep the "go back to source" button aligned with
-              the iterate button on render tracks, which sits after a
-              pin and a reuse button in the same justify-around row. */}
-          <div aria-hidden className="size-6" />
-          <div aria-hidden className="size-6" />
+          {/* Preserve the legacy button alignment when effects are unavailable. */}
+          {effects.available ? (
+            <button
+              type="button"
+              className="text-xs text-glyph-primary hover:underline"
+              onClick={effects.open}
+            >
+              {VIDEO_EFFECTS_LABEL}
+            </button>
+          ) : (
+            <>
+              <div aria-hidden className="size-6" />
+              <div aria-hidden className="size-6" />
+            </>
+          )}
           <Tooltip
             textContent={t("actions.go_back_to_source_video.label")}
             placement="top"
@@ -79,6 +94,7 @@ export const InputVideoTrackItem: React.FC<Props> = ({ track }) => {
           </div>
         </div>
       </div>
+      {effects.dialog}
     </div>
   );
 };

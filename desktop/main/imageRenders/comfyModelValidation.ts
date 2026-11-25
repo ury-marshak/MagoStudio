@@ -7,7 +7,7 @@ import {
   resolveMiniMaxH3VfxLora,
   resolveMiniMaxH3VfxMode
 } from "../../shared/minimaxH3VfxModes";
-import { normalizeComfyEndpoint } from "../comfy/normalizeComfyEndpoint";
+import { ComfyClient } from "../comfy/ComfyClient";
 
 import {
   LTX_TILED_SAMPLER_CLASS,
@@ -382,9 +382,11 @@ export const isComfyRenderModelName = (
 export const probeComfyRenderModel = async (
   endpoint: string,
   model: ComfyRenderModelName,
-  settings: Record<string, unknown> = {}
+  settings: Record<string, unknown> = {},
+  signal?: AbortSignal
 ): Promise<ComfyModelStatus> => {
-  const normalized = normalizeComfyEndpoint(endpoint);
+  signal?.throwIfAborted();
+  const client = new ComfyClient(endpoint, undefined, signal);
   const requirements = requirementsFor(model, settings);
   const nodeNames = [
     ...new Set([
@@ -396,21 +398,16 @@ export const probeComfyRenderModel = async (
   try {
     const entries = await Promise.all(
       nodeNames.map(async (nodeName) => {
-        const response = await fetch(
-          `${normalized}/object_info/${encodeURIComponent(nodeName)}`,
-          {
-            method: "GET",
-            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-          }
+        const payload = record(
+          await client.getPayload(
+            `/object_info/${encodeURIComponent(nodeName)}`,
+            AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+          )
         );
-        if (!response.ok)
-          throw new Error(
-            `ComfyUI request failed (${response.status}): ${response.statusText}`
-          );
-        const payload = record(await response.json());
         return [nodeName, record(payload?.[nodeName])] as const;
       })
     );
+    signal?.throwIfAborted();
     const nodes = new Map(entries);
     const missingNodes = nodeNames.filter((nodeName) => !nodes.get(nodeName));
     const missingModels = requirements.files
@@ -441,6 +438,7 @@ export const probeComfyRenderModel = async (
         : `ComfyUI setup is incomplete (${details.join("; ")})`
     };
   } catch (error) {
+    signal?.throwIfAborted();
     return {
       model,
       ready: false,
@@ -456,9 +454,11 @@ export const probeComfyRenderModel = async (
 export const assertComfyRenderModelReady = async (
   endpoint: string,
   model: ComfyRenderModelName,
-  settings: Record<string, unknown> = {}
+  settings: Record<string, unknown> = {},
+  signal?: AbortSignal
 ): Promise<void> => {
-  const status = await probeComfyRenderModel(endpoint, model, settings);
+  const status = await probeComfyRenderModel(endpoint, model, settings, signal);
+  signal?.throwIfAborted();
   if (!status.ready)
     throw new Error(status.message ?? "ComfyUI model is not ready");
 };

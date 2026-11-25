@@ -1,4 +1,4 @@
-import { ipcMain, type IpcMainInvokeEvent } from "electron";
+import { ipcMain, type IpcMainInvokeEvent, type WebContents } from "electron";
 
 import {
   IPC_CHANNELS,
@@ -8,6 +8,7 @@ import {
 import { requireCloudAccount } from "../cloud/requireCloudAccount";
 import { DatabaseManager } from "../database/databaseManager";
 import { LibrarySettings } from "../librarySettings";
+import type { ProfileIoDrain } from "../providers/profileIoDrain";
 import { LocalScriptChatService } from "../scriptProjects/localScriptChatService";
 import { LocalScriptProjectService } from "../scriptProjects/localScriptProjectService";
 
@@ -67,12 +68,18 @@ export const registerScriptProjectHandlers = ({
   service,
   chat,
   databaseManager,
-  settings
+  settings,
+  captureAccountProfile,
+  captureInferenceProfile,
+  profileIo
 }: {
   service: LocalScriptProjectService;
   chat: LocalScriptChatService;
   databaseManager: DatabaseManager;
   settings: LibrarySettings;
+  captureAccountProfile?: (sender: WebContents) => AbortSignal;
+  captureInferenceProfile?: (sender: WebContents) => AbortSignal;
+  profileIo?: ProfileIoDrain;
 }): void => {
   // Capture library context before database setup. Every later continuation,
   // including detached plan work, retains this session rather than the next DB.
@@ -86,27 +93,49 @@ export const registerScriptProjectHandlers = ({
     });
   };
 
-  const ensureDatabase = async (): Promise<void> => {
+  const tryCaptureInference = (
+    sender: WebContents
+  ): AbortSignal | undefined => {
+    try {
+      return captureInferenceProfile?.(sender);
+    } catch (error) {
+      // Pass a retired origin rather than recapturing after database setup.
+      return AbortSignal.abort(error);
+    }
+  };
+
+  const ensureDatabase = async (profile?: AbortSignal): Promise<void> => {
     const signal = service.capturePlanSession();
+    profile?.throwIfAborted();
     if (databaseManager.isOpen()) {
       signal.throwIfAborted();
+      profile?.throwIfAborted();
       return;
     }
     const root = await settings.getLibraryRoot();
+    await service.databaseOperation(() => {
+      signal.throwIfAborted();
+      profile?.throwIfAborted();
+      const open = () => databaseManager.open(root);
+      return profileIo?.run(profile, open) ?? open();
+    });
     signal.throwIfAborted();
-    await service.databaseOperation(() => databaseManager.open(root));
-    signal.throwIfAborted();
+    profile?.throwIfAborted();
   };
 
   handle(
     IPC_CHANNELS.scriptProjectsCacheMedia,
     async (event, projectId: unknown, sourceUrl: unknown) => {
-      await requireCloudAccount(settings);
-      await ensureDatabase();
+      const profile = captureAccountProfile?.(event.sender);
+      await requireCloudAccount(settings, profile);
+      await ensureDatabase(profile);
+      profile?.throwIfAborted();
       await service.cacheMedia(
         requireString(projectId, "projectId"),
-        requireString(sourceUrl, "sourceUrl")
+        requireString(sourceUrl, "sourceUrl"),
+        profile
       );
+      profile?.throwIfAborted();
     }
   );
   handle(
@@ -119,25 +148,36 @@ export const registerScriptProjectHandlers = ({
     }
   );
   handle(IPC_CHANNELS.scriptProjectsPut, async (event, value: unknown) => {
-    await ensureDatabase();
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("script project snapshot must be an object");
+    const input = optionalRecord(value, "script project snapshot");
+    if (!input) throw new Error("script project snapshot must be an object");
+    const intent = input.intent;
+    if (intent !== undefined && intent !== "cloud-import") {
+      throw new Error("Invalid script project snapshot intent");
     }
-    const input = value as Record<string, unknown>;
-    await service.putSnapshot({
-      projectId: requireString(input.projectId, "projectId"),
-      // Saving history is local. Remote URLs are not background-transfer grants.
-      metadataOnly:
-        input.metadataOnly === true ||
-        (await settings.getAppMode()) !== "cloud",
-      project: optionalRecord(input.project, "project"),
-      state: optionalRecord(input.state, "state"),
-      scriptVersions: optionalRecord(input.scriptVersions, "scriptVersions"),
-      planDetails: optionalRecord(input.planDetails, "planDetails") as
-        | Record<string, Record<string, unknown>>
-        | undefined,
-      cut: optionalRecord(input.cut, "cut")
-    } satisfies LocalScriptProjectSnapshotInput);
+    const profile =
+      intent === "cloud-import"
+        ? captureAccountProfile?.(event.sender)
+        : undefined;
+    if (intent === "cloud-import") await requireCloudAccount(settings, profile);
+    await ensureDatabase(profile);
+    profile?.throwIfAborted();
+    await service.putSnapshot(
+      {
+        projectId: requireString(input.projectId, "projectId"),
+        ...(intent ? { intent } : {}),
+        // Local saves can preserve remote URLs, but do not authorize transfers.
+        metadataOnly: intent !== "cloud-import" || input.metadataOnly === true,
+        project: optionalRecord(input.project, "project"),
+        state: optionalRecord(input.state, "state"),
+        scriptVersions: optionalRecord(input.scriptVersions, "scriptVersions"),
+        planDetails: optionalRecord(input.planDetails, "planDetails") as
+          | Record<string, Record<string, unknown>>
+          | undefined,
+        cut: optionalRecord(input.cut, "cut")
+      } satisfies LocalScriptProjectSnapshotInput,
+      profile
+    );
+    profile?.throwIfAborted();
   });
 
   handle(IPC_CHANNELS.scriptProjectsGet, async (event, projectId: unknown) => {
@@ -153,25 +193,34 @@ export const registerScriptProjectHandlers = ({
   handle(
     IPC_CHANNELS.scriptProjectsCancelPlan,
     async (event, planId: unknown) => {
+      const profile = tryCaptureInference(event.sender);
       await ensureDatabase();
-      return service.cancelPlan(requireString(planId, "planId"));
+      return service.cancelPlan(requireString(planId, "planId"), profile);
     }
   );
 
   handle(
     IPC_CHANNELS.scriptProjectsResumePlan,
     async (event, planId: unknown) => {
+      const profile = tryCaptureInference(event.sender);
       await ensureDatabase();
-      return service.resumePlan(requireString(planId, "planId"));
+      return service.resumePlan(
+        requireString(planId, "planId"),
+        false,
+        profile
+      );
     }
   );
 
   handle(IPC_CHANNELS.scriptProjectsCast, async (event, value: unknown) => {
+    const profile = captureInferenceProfile?.(event.sender);
     await ensureDatabase();
+    profile?.throwIfAborted();
     if (!value || typeof value !== "object" || Array.isArray(value))
       throw new Error("local script casting input must be an object");
     return service.cast(
-      value as Parameters<LocalScriptProjectService["cast"]>[0]
+      value as Parameters<LocalScriptProjectService["cast"]>[0],
+      profile
     );
   });
 
@@ -193,7 +242,9 @@ export const registerScriptProjectHandlers = ({
   handle(
     IPC_CHANNELS.scriptProjectsGetRenderMetrics,
     async (event, assetId: unknown) => {
-      const signal = service.captureMetricsSession();
+      const profile = captureInferenceProfile?.(event.sender);
+      const library = service.captureMetricsSession();
+      const signal = profile ? AbortSignal.any([profile, library]) : library;
       await ensureDatabase();
       signal.throwIfAborted();
       return service.getRenderMetrics(
@@ -206,11 +257,13 @@ export const registerScriptProjectHandlers = ({
   handle(
     IPC_CHANNELS.scriptProjectsChatMessage,
     async (event, value: unknown) => {
+      const profile = captureInferenceProfile?.(event.sender);
       const signal = chat.getSessionSignal();
       signal.throwIfAborted();
       await ensureDatabase();
       signal.throwIfAborted();
-      return chat.post(chatMessageInput(value));
+      profile?.throwIfAborted();
+      return chat.post(chatMessageInput(value), profile);
     }
   );
 
@@ -251,24 +304,34 @@ export const registerScriptProjectHandlers = ({
   handle(
     IPC_CHANNELS.scriptProjectsGenerateSheets,
     async (event, value: unknown) => {
-      await ensureDatabase();
       if (!value || typeof value !== "object" || Array.isArray(value))
         throw new Error("local sheet generation input must be an object");
-      return service.generateSheets(
-        value as Parameters<LocalScriptProjectService["generateSheets"]>[0]
-      );
+      const input = value as Parameters<
+        LocalScriptProjectService["generateSheets"]
+      >[0];
+      const profile = input.isDryRun
+        ? undefined
+        : captureInferenceProfile?.(event.sender);
+      await ensureDatabase();
+      profile?.throwIfAborted();
+      return service.generateSheets(input, profile);
     }
   );
 
   handle(
     IPC_CHANNELS.scriptProjectsGenerateShots,
     async (event, value: unknown) => {
-      await ensureDatabase();
       if (!value || typeof value !== "object" || Array.isArray(value))
         throw new Error("local shot generation input must be an object");
-      return service.generateShots(
-        value as Parameters<LocalScriptProjectService["generateShots"]>[0]
-      );
+      const input = value as Parameters<
+        LocalScriptProjectService["generateShots"]
+      >[0];
+      const profile = input.isDryRun
+        ? undefined
+        : captureInferenceProfile?.(event.sender);
+      await ensureDatabase();
+      profile?.throwIfAborted();
+      return service.generateShots(input, profile);
     }
   );
 
@@ -285,14 +348,30 @@ export const registerScriptProjectHandlers = ({
   );
 
   handle(IPC_CHANNELS.scriptProjectsUpdate, async (event, value: unknown) => {
-    const signal = service.captureDescriptionSession();
-    await ensureDatabase();
-    signal.throwIfAborted();
     if (!value || typeof value !== "object" || Array.isArray(value))
       throw new Error("local script update input must be an object");
-    return service.update(
-      value as Parameters<LocalScriptProjectService["update"]>[0],
-      signal
-    );
+    const update = value as Parameters<LocalScriptProjectService["update"]>[0];
+    const requiresCloudWork =
+      update.operation === "begin-cloud-sheet-submission" ||
+      update.operation === "add-cloud-sheet-render";
+    const profile = requiresCloudWork
+      ? captureAccountProfile?.(event.sender)
+      : undefined;
+    const inference =
+      update.operation === "storyboard-generate" ||
+      update.operation === "describe-sheet"
+        ? captureInferenceProfile?.(event.sender)
+        : update.operation === "add-sheet-image"
+          ? tryCaptureInference(event.sender)
+          : undefined;
+    const signal = service.captureDescriptionSession();
+    // Already issued acceptance bookkeeping stays local and recoverable.
+    if (requiresCloudWork && captureAccountProfile)
+      await requireCloudAccount(settings, profile);
+    await ensureDatabase(profile);
+    signal.throwIfAborted();
+    profile?.throwIfAborted();
+    if (update.operation !== "add-sheet-image") inference?.throwIfAborted();
+    return service.update(update, signal, profile, inference);
   });
 };

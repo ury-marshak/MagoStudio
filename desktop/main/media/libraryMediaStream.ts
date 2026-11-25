@@ -7,7 +7,8 @@ import { LibraryWorkSession } from "../libraryWorkSession";
 export const libraryMediaStream = (
   body: ReadableStream<Uint8Array>,
   work: LibraryWorkSession<undefined>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  trackCleanup?: (closed: Promise<void>) => void
 ): ReadableStream<Uint8Array> => {
   const reader = body.getReader();
   let controller: ReadableStreamDefaultController<Uint8Array>;
@@ -17,6 +18,7 @@ export const libraryMediaStream = (
     finish = resolve;
   });
   // Register before returning the response; detached cleanup retains this session.
+  trackCleanup?.(done);
   void work.boundary(() => done).catch(() => {});
   const release = () => {
     signal.removeEventListener("abort", abort);

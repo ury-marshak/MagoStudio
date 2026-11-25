@@ -1,7 +1,12 @@
 import { ProjectType } from "@schemas/scriptProject";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import {
+  type FetchNextPageOptions,
+  useInfiniteQuery
+} from "@tanstack/react-query";
+import { useCallback } from "react";
 
 import { isLocalApp } from "@/platform/localDesktop";
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
 import { queryKeys } from "@/queryKeys";
 
 export type { ProjectListItem } from "./api/fetchProjectList";
@@ -34,30 +39,50 @@ export const useProjectList = ({
   projectType,
   enabled = true
 }: UseProjectListParams = {}) => {
-  const query = useInfiniteQuery({
-    queryKey: queryKeys.projectList.paginated({
+  const scope = useRendererLibraryQueryScope();
+  const queryKey = scope.key(
+    queryKeys.projectList.paginated({
       perPage,
       sortBy,
       sortOrder,
       projectType
-    }),
+    })
+  );
+  const query = useInfiniteQuery({
+    queryKey,
+    retry: scope.retry(queryKey),
     queryFn: ({ pageParam }) =>
-      fetchProjectList({
-        page: pageParam,
-        perPage,
-        sortBy,
-        sortOrder,
-        projectType
-      }),
+      scope.run(() =>
+        fetchProjectList(
+          {
+            page: pageParam,
+            perPage,
+            sortBy,
+            sortOrder,
+            projectType
+          },
+          scope.work
+        )
+      ),
     initialPageParam: 1,
     getNextPageParam: (lastPage) =>
       lastPage.pagination.has_next ? lastPage.pagination.next_num : undefined,
     staleTime: STALE_TIME_MS,
-    enabled,
+    enabled: enabled && scope.active,
     refetchOnMount: isLocalApp ? "always" : true,
     refetchOnWindowFocus: false,
     refetchOnReconnect: true
   });
+  const { fetchNextPage } = query;
+  const { work } = scope;
+  const fetchNextLibraryPage = useCallback(
+    async (options?: FetchNextPageOptions) => {
+      if (work.signal.aborted) return undefined;
+      const result = await fetchNextPage(options);
+      return work.signal.aborted ? undefined : result;
+    },
+    [fetchNextPage, work]
+  );
   const allItems: ProjectListItem[] = keepProjectsOfType(
     query.data?.pages.flatMap((page) => page.items) ?? [],
     projectType
@@ -66,6 +91,7 @@ export const useProjectList = ({
 
   return {
     ...query,
+    fetchNextPage: fetchNextLibraryPage,
     allItems,
     totalCount
   };

@@ -5,6 +5,9 @@ import React, { useState } from "react";
 import { useFormContext } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 
+import { releaseRendererObjectUrl } from "@/platform/rendererObjectUrl";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { useGetImg2ImgRenderStatus } from "../hooks/useGetImg2ImgRenderStatus";
 import { Img2ImgType, ModelSchemaMap } from "../schemas";
 
@@ -32,7 +35,9 @@ export const TweakButton: React.FC<Props> = ({
     useGetImg2ImgRenderStatus({
       clipId
     });
-  const [isLoading, setIsLoading] = useState(false);
+  const { work, libraryVersion } = useRendererLibraryWork();
+  const [loadingVersion, setLoadingVersion] = useState<number>();
+  const isLoading = loadingVersion === libraryVersion;
   const { reset } = useFormContext<Img2ImgType>();
 
   const renderModel = renderItemStatusResponse?.data?.settings?.render_model;
@@ -44,44 +49,53 @@ export const TweakButton: React.FC<Props> = ({
   const showDisabledForRemovedModel = isRemovedModel(renderModel);
 
   const handleTweakIt = async () => {
-    setIsLoading(true);
+    if (work.signal.aborted) return;
+    setLoadingVersion(libraryVersion);
     try {
+      await work.ready();
+      work.check();
       let renderSettings = renderItemStatusResponse?.data?.settings;
 
       if (!renderSettings) {
         const result = await refetchStatus();
+        work.check();
         renderSettings = result.data?.data?.settings;
       }
 
       if (!renderSettings) {
         console.warn("No render settings available for clip:", clipId);
-        setIsLoading(false);
         return;
       }
 
       if (isRemovedModel(renderSettings.render_model)) {
-        setIsLoading(false);
         return;
       }
 
       let inputImage = {};
       if (renderSettings.input_image_id) {
-        const image = await getImageAsset(renderSettings.input_image_id);
+        const image = await getImageAsset(renderSettings.input_image_id, work);
         if (image) {
-          const imageFile = await createFileFromImageData(image);
-          inputImage = {
-            frameImage: [imageFile],
-            frameType: "upload",
-            uploadedImageId: renderSettings.input_image_id
-          };
+          try {
+            work.check();
+            const imageFile = await createFileFromImageData(image, work);
+            inputImage = {
+              frameImage: [imageFile],
+              frameType: "upload",
+              uploadedImageId: renderSettings.input_image_id
+            };
+          } finally {
+            if (image.urlToUse) releaseRendererObjectUrl(image.urlToUse);
+          }
         }
       }
 
+      work.check();
       reset(parseSettingsToImg2ImgForm(renderSettings, inputImage));
-      setIsLoading(false);
     } catch (error) {
-      console.error("Failed to load settings:", error);
-      setIsLoading(false);
+      if (!work.signal.aborted)
+        console.error("Failed to load settings:", error);
+    } finally {
+      if (!work.signal.aborted) setLoadingVersion(undefined);
     }
   };
 

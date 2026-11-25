@@ -2,6 +2,7 @@ import { Layer, LayerType } from "@schemas/layer";
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
 import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
@@ -19,7 +20,7 @@ export const usePostTrack = ({
   const queryClient = useQueryClient();
   const onSuccess = (newTrack: Layer, variables: PostTrackParams) => {
     queryClient.setQueryData(
-      queryKeys.project.byId(selectedProjectId),
+      libraryQueryKey(queryKeys.project.byId(selectedProjectId)),
       (project: Project) => {
         if (!project) {
           return project;

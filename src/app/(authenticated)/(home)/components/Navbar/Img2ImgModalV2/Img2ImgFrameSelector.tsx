@@ -27,11 +27,13 @@ import { Seedream5ProType } from "./schemas/seedream5Pro.schema";
 type Props = {
   currentFrame: number;
   setCurrentFrame: (frame: number) => void;
+  allowMask?: boolean;
 };
 
 export const Img2ImgFrameSelector: React.FC<Props> = ({
   currentFrame,
-  setCurrentFrame
+  setCurrentFrame,
+  allowMask = true
 }) => {
   const { t } = useTranslation();
   const [isZoomedIn, setIsZoomedIn] = useState(false);
@@ -44,7 +46,8 @@ export const Img2ImgFrameSelector: React.FC<Props> = ({
     name: "maskFrameIdx"
   });
   const setDrawMaskActive = useSetAtom(drawMaskActiveAtom);
-  const maskPreviewSrc = useDrawnMaskPreview(currentFrame);
+  const drawnMaskPreview = useDrawnMaskPreview(currentFrame);
+  const maskPreviewSrc = allowMask ? drawnMaskPreview : undefined;
   const { inputTrack } = useInputTrack();
   const [minFrame, maxFrame] = inputTrack ? frameRangeOf(inputTrack) : [0, 0];
   const { inputTrackFrameSrc, isLoading: isFrameLoading } =
@@ -73,7 +76,7 @@ export const Img2ImgFrameSelector: React.FC<Props> = ({
     }
   };
 
-  const isSeedream5Pro = model === "seedream_5_pro";
+  const isSeedream5Pro = allowMask && model === "seedream_5_pro";
   const hasMask = Boolean(maskLayerDataUrl);
   const isOnMaskedFrame = hasMask && maskFrameIdx === currentFrame;
   const isMaskOnOtherFrame = hasMask && !isOnMaskedFrame;

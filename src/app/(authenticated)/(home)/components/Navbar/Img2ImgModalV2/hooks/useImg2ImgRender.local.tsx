@@ -363,7 +363,7 @@ export const useImg2ImgRender = (currentFrame: number) => {
         ]);
         return;
       }
-      await addImage2ImageRender(payload);
+      await addImage2ImageRender(payload, work);
       work.check();
       if (isUnlimitedModeActive) {
         await refreshRendersInProgressIfNeeded();

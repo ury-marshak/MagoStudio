@@ -1,7 +1,9 @@
+import { rendererCloudBackgroundWork } from "@domains/cloud/rendererCloudBackgroundWork";
 import { ProjectState, ProjectStateSchema } from "@schemas/scriptProject";
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 import { isLocalScriptProject } from "../projectOrigin";
 import {
@@ -25,14 +27,23 @@ export const getProjectState = async (
   }
   if (!isLocal && desktop.account.mode === "cloud") {
     try {
+      const work = rendererCloudBackgroundWork(rendererLibrary.capture());
+      work.check();
       const response = await backendApiClient.get(
-        `/projects/${projectId}/state`
+        `/projects/${projectId}/state`,
+        {
+          signal: work.signal
+        }
       );
+      work.check();
       const state = ProjectStateSchema.parse(response.data);
-      await writeScriptProjectSnapshot({ projectId, state });
-      return ProjectStateSchema.parse(
-        (await readScriptProjectSnapshot(projectId))?.state ?? state
+      await writeScriptProjectSnapshot(
+        { projectId, intent: "cloud-import", state },
+        work
       );
+      const refreshed = await readScriptProjectSnapshot(projectId, work);
+      work.check();
+      return ProjectStateSchema.parse(refreshed?.state ?? state);
     } catch (error) {
       if (cached) return ProjectStateSchema.parse(cached);
       throw error;

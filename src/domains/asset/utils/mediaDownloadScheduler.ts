@@ -1,5 +1,6 @@
 import {
   rendererLibrary,
+  runRendererLibraryRequest,
   type RendererLibrarySession,
   type RendererLibraryWork
 } from "@/platform/rendererLibraryWork";
@@ -22,6 +23,8 @@ type Request<T> = Context & {
   run: (signal: AbortSignal) => Promise<T>;
   signal?: AbortSignal;
   work?: RendererLibraryWork;
+  // Main owns transfer cancellation/draining on library change.
+  mainOwnedTransfer?: boolean;
 };
 type Job = Request<unknown> & {
   work: RendererLibraryWork;
@@ -153,8 +156,8 @@ export class MediaDownloadScheduler {
     this.stateAssetIds.set(job.key, job.assetId);
     const cancel = () => {
       if (this.jobs.get(job.key) !== job) return;
-      if (job.controller) job.controller.abort();
-      else {
+      job.controller?.abort();
+      if (!job.controller || job.mainOwnedTransfer) {
         this.jobs.delete(job.key);
         this.states.delete(job.key);
         reject(new DOMException("Cancelled", "AbortError"));
@@ -176,7 +179,13 @@ export class MediaDownloadScheduler {
       (request) => request.assetId === assetId
     );
     await Promise.all(
-      requests.map((request) => this.enqueue({ ...request, signal: undefined }))
+      requests.map((request) =>
+        this.enqueue(
+          request.mainOwnedTransfer
+            ? request
+            : { ...request, signal: undefined }
+        )
+      )
     );
   }
   private publish(): void {
@@ -245,11 +254,14 @@ export class MediaDownloadScheduler {
     job.controller = controller;
     this.states.set(job.key, "downloading");
     this.publish();
-    void job.work
-      .boundary(() => {
-        controller.signal.throwIfAborted();
-        return job.run(controller.signal);
-      })
+    const run = () => {
+      controller.signal.throwIfAborted();
+      return job.run(controller.signal);
+    };
+    const result = job.mainOwnedTransfer
+      ? runRendererLibraryRequest(job.work, run)
+      : job.work.boundary(run);
+    void result
       .then((value) => {
         job.work.check();
         if (this.jobs.get(job.key) !== job) return;

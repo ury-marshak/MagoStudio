@@ -1,3 +1,4 @@
+import { isCloudAccountActive } from "./cloudAccount";
 import {
   providersForImageModel,
   providersForVideoModel,
@@ -70,7 +71,7 @@ export const CLOUD_SUBMISSION_FROM_DESKTOP = true;
 export const isCloudRenderAvailable = (): boolean => {
   if (typeof window === "undefined") return true;
   if (!window.mago) return true;
-  return CLOUD_SUBMISSION_FROM_DESKTOP && window.mago.account?.mode === "cloud";
+  return CLOUD_SUBMISSION_FROM_DESKTOP && isCloudAccountActive();
 };
 
 export const cloudUnavailableReason = ():
@@ -79,9 +80,7 @@ export const cloudUnavailableReason = ():
   | null => {
   if (isCloudRenderAvailable()) return null;
   if (typeof window === "undefined" || !window.mago) return null;
-  return window.mago.account?.mode === "cloud"
-    ? "not-implemented"
-    : "signed-out";
+  return isCloudAccountActive() ? "not-implemented" : "signed-out";
 };
 
 export const isRenderTargetAvailable = (

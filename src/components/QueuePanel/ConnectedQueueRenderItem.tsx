@@ -23,6 +23,7 @@ import duration from "dayjs/plugin/duration";
 import { useRouter } from "next/navigation";
 import { useTranslation } from "react-i18next";
 
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 dayjs.extend(duration);
@@ -89,12 +90,22 @@ export const ConnectedQueueRenderItem: React.FC<
   };
 
   const handleDelete = () => {
+    const work = rendererLibrary.capture();
+    if (work.signal.aborted) return;
+
     showToast({
       message: t("queue_panel.stop_render_confirmation.description", {
         name: item.layer_name
       }),
       onSubmit: async () => {
-        await deleteQueueItem({ queueItemId: item.id });
+        if (work.signal.aborted) return;
+        try {
+          await deleteQueueItem({ queueItemId: item.id }, work);
+        } catch (error) {
+          if (work.signal.aborted) return;
+          throw error;
+        }
+        if (work.signal.aborted) return;
         trackingUtils.renderActions.cancel(item.layer_name, item.asset_id);
         void queryClient.invalidateQueries({ queryKey: queryKeys.balance.all });
       },

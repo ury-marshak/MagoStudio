@@ -69,12 +69,18 @@ const requestJson = async (
           : "Could not reach external provider"
     );
   }
+  if (signal.aborted) {
+    // A transport that ignores abort may still deliver a response body.
+    await response.body?.cancel().catch(() => {});
+    signal.throwIfAborted();
+  }
   if (!response.ok) {
     await response.body?.cancel().catch(() => {});
     throw new Error(`External provider returned HTTP ${response.status}`);
   }
+  let json: unknown;
   try {
-    return await response.json();
+    json = await response.json();
   } catch {
     throw new Error(
       callerSignal?.aborted
@@ -84,6 +90,8 @@ const requestJson = async (
           : "External provider returned invalid JSON"
     );
   }
+  signal.throwIfAborted();
+  return json;
 };
 
 export const generateOpenAiCompatible =
@@ -96,6 +104,7 @@ export const generateOpenAiCompatible =
     temperature,
     signal
   }) => {
+    signal?.throwIfAborted();
     if (images && images.length > maxImages)
       throw new Error(
         `External vision requests support up to ${maxImages} images`
@@ -133,6 +142,7 @@ export const generateOpenAiCompatible =
       },
       signal
     );
+    signal?.throwIfAborted();
     const parsed = completionSchema.safeParse(response);
     if (!parsed.success)
       throw new Error(
@@ -160,6 +170,7 @@ export const probeOpenAiCompatible = async (
       signal
     )
   );
+  signal?.throwIfAborted();
   if (!response.success)
     throw new Error("External provider returned an invalid model list");
   const model = response.data.data.find(({ id }) => id === config.model);

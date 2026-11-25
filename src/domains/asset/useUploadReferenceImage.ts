@@ -5,7 +5,9 @@ import { getImageDimensions, resizeImageToFitWidth } from "@utils";
 import { useRef, useState } from "react";
 
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
 import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
+import { createRendererObjectUrl } from "@/platform/rendererObjectUrl";
 import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
@@ -134,10 +136,10 @@ export const useUploadReferenceImage = () => {
       });
       work.check();
       queryClient.setQueryData<ImageAssetResponse>(
-        queryKeys.imageAsset.byId(asset.id),
+        libraryQueryKey(queryKeys.imageAsset.byId(asset.id)),
         {
           s3_url: asset.filepath,
-          urlToUse: URL.createObjectURL(file),
+          urlToUse: createRendererObjectUrl(file, work),
           asset: asset as ImageAssetResponse["asset"]
         }
       );

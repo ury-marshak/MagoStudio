@@ -2,7 +2,10 @@ import { text } from "node:stream/consumers";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { openCloudStorageDownload } from "./openCloudStorageDownload";
+import {
+  openCloudStorageDownload,
+  withCloudStorageDownload
+} from "./openCloudStorageDownload";
 
 const ALLOWED_HOSTS = [
   "mago-s3-prod.s3.amazonaws.com",
@@ -86,5 +89,63 @@ describe("openCloudStorageDownload", () => {
     expect(fetchFromCloudStorage.mock.calls[0]![1]).toMatchObject({
       signal: controller.signal
     });
+  });
+
+  it("cancels a pending read without another chunk and waits for transport cleanup", async () => {
+    const profile = new AbortController();
+    let incomplete: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let release!: () => void;
+    const cleanup = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const canceled = vi.fn(() => {
+      incomplete = undefined;
+      return cleanup;
+    });
+    let reading!: () => void;
+    const readingPartialBody = new Promise<void>((resolve) => {
+      reading = resolve;
+    });
+    const response = new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            incomplete = controller;
+            controller.enqueue(new TextEncoder().encode("partial"));
+          },
+          pull() {
+            reading();
+          },
+          cancel: canceled
+        },
+        { highWaterMark: 0 }
+      )
+    );
+    const released = vi.fn();
+    const pending = withCloudStorageDownload(
+      {
+        url: OBJECT_URL,
+        allowedHosts: ALLOWED_HOSTS,
+        fetchFromCloudStorage: vi.fn().mockResolvedValue(response),
+        signal: profile.signal
+      },
+      ({ body }) => text(body)
+    ).finally(released);
+    const rejected = expect(pending).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    try {
+      await readingPartialBody;
+      profile.abort();
+      await vi.waitFor(() => expect(canceled).toHaveBeenCalledOnce(), {
+        timeout: 250
+      });
+      expect(released).not.toHaveBeenCalled();
+    } finally {
+      incomplete?.close();
+      release();
+      await Promise.allSettled([rejected]);
+    }
+    await rejected;
   });
 });

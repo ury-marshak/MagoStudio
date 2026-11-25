@@ -104,7 +104,8 @@ const adaptI2vPromptInput = (value: unknown): LocalAdaptI2vPromptInput => {
 export const registerVlmHandlers = (
   service: VlmService,
   i2vPromptAdapter: LocalI2vPromptAdapter,
-  hasExternalText: () => Promise<boolean>
+  hasExternalText: () => Promise<boolean>,
+  captureInferenceProfile?: (sender: WebContents) => AbortSignal
 ): (() => void) => {
   const requests = new InferenceRequests();
   const run = <T>(
@@ -115,8 +116,13 @@ export const registerVlmHandlers = (
     service.libraryWork.run(() => {
       // Capture before InferenceRequests schedules its start microtask.
       const lifetime = service.libraryWork.capture();
+      const profile = captureInferenceProfile?.(sender);
       return requests.run(sender, requestId, (caller) => {
-        const signal = AbortSignal.any([caller, lifetime]);
+        const signal = AbortSignal.any([
+          caller,
+          lifetime,
+          ...(profile ? [profile] : [])
+        ]);
         signal.throwIfAborted();
         return waitForInference(task(signal), signal);
       });
@@ -127,11 +133,13 @@ export const registerVlmHandlers = (
   });
   ipcMain.handle(IPC_CHANNELS.vlmStatus, async (event) => {
     requireTrustedSender(event);
-    return service.status();
+    return service.status(captureInferenceProfile?.(event.sender));
   });
   ipcMain.handle(IPC_CHANNELS.vlmHasExternalText, async (event) => {
     requireTrustedSender(event);
-    return hasExternalText();
+    const profile = captureInferenceProfile?.(event.sender);
+    const available = hasExternalText();
+    return profile ? waitForInference(available, profile) : available;
   });
   ipcMain.handle(
     IPC_CHANNELS.vlmCaptionAsset,

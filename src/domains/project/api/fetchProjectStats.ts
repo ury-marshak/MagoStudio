@@ -2,6 +2,11 @@ import { Project } from "@schemas/project";
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi, isLocalApp } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { buildLocalScriptRenderStats } from "../utils/localScriptRenderStats";
 
@@ -53,8 +58,10 @@ export interface ProjectStatsResponse {
 
 export const fetchProjectStats = async (
   projectId: Project["id"] | undefined,
-  origin?: Project["origin"]
+  origin?: Project["origin"],
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<ProjectStatsResponse | undefined> => {
+  work.check();
   if (!projectId) {
     return undefined;
   }
@@ -62,19 +69,25 @@ export const fetchProjectStats = async (
   if (isLocalApp && origin !== "cloud") {
     const desktop = getLocalDesktopApi();
     const [projectStats, snapshot] = await Promise.all([
-      desktop.projects
-        .stats(projectId)
+      work
+        .boundary(() => desktop.projects.stats(projectId))
         .then((value) => value as unknown as ProjectStatsResponse),
-      desktop.scriptProjects?.get(projectId) ?? Promise.resolve(null)
+      work.boundary(
+        () => desktop.scriptProjects?.get(projectId) ?? Promise.resolve(null)
+      )
     ]);
+    work.check();
     return {
       ...projectStats,
       ...buildLocalScriptRenderStats(snapshot)
     };
   }
 
-  const response = await backendApiClient.get<ProjectStatsResponse>(
-    `/projects/stats/${projectId}`
+  const response = await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.get<ProjectStatsResponse>(
+      `/projects/stats/${projectId}`,
+      isLocalApp ? { signal } : undefined
+    )
   );
 
   return response.data;

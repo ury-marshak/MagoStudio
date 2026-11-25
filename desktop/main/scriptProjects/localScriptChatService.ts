@@ -130,17 +130,20 @@ export class LocalScriptChatService {
       signal.throwIfAborted();
       return {
         project_id: projectId,
-        pending: rows.at(-1)?.status === "PENDING",
+        pending: rows.some((row) => row.status === "PENDING"),
         messages: rows.map(toWireMessage)
       };
     });
   }
 
   post(
-    input: LocalScriptChatMessageInput
+    input: LocalScriptChatMessageInput,
+    profile?: AbortSignal
   ): Promise<LocalScriptChatMessageAccepted> {
     const session = this.session;
-    return this.inProject(session, input.projectId, async (signal) => {
+    return this.inProject(session, input.projectId, async (library) => {
+      const signal = profile ? AbortSignal.any([library, profile]) : library;
+      signal.throwIfAborted();
       await this.assertLocalProject(input.projectId);
       signal.throwIfAborted();
       const message = input.message.trim();
@@ -189,7 +192,15 @@ export class LocalScriptChatService {
       }
       signal.throwIfAborted();
       const controller = new AbortController();
+      const turnSignal = AbortSignal.any([signal, controller.signal]);
+      const forget = () => {
+        if (session.running.get(answer.id) === controller)
+          session.running.delete(answer.id);
+      };
       session.running.set(answer.id, controller);
+      // Retire the pending turn immediately; an abort-ignoring model must not
+      // occupy the same project's chat slot in the replacement profile.
+      turnSignal.addEventListener("abort", forget, { once: true });
       void runBackgroundTask("Script chat", () =>
         this.answer(
           session,
@@ -197,8 +208,11 @@ export class LocalScriptChatService {
           answer.id,
           buildScriptChatPrompt({ systemPrompt, tools, history, message }),
           tools,
-          AbortSignal.any([signal, controller.signal])
-        ).finally(() => session.running.delete(answer.id))
+          turnSignal
+        ).finally(() => {
+          turnSignal.removeEventListener("abort", forget);
+          forget();
+        })
       );
       return this.accepted(answer);
     });

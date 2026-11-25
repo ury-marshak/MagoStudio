@@ -23,7 +23,7 @@ import {
 import * as schema from "./schema";
 import { createDrizzleDatabase } from "./sqliteProxy";
 
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 const BACKUP_INTERVAL_MS = 900_000;
 const SQLITE_CORRUPT = 11;
 const SQLITE_NOTADB = 26;
@@ -142,15 +142,18 @@ export class DatabaseManager {
   }
 
   async transaction<T>(
-    callback: (database: SqliteRemoteDatabase<typeof schema>) => Promise<T>
+    callback: (database: SqliteRemoteDatabase<typeof schema>) => Promise<T>,
+    signal?: AbortSignal
   ): Promise<T> {
     this.get();
     if (!this.sqlite || !this.database) {
       throw new Error("The Mago library database is not open");
     }
+    signal?.throwIfAborted();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
       const result = await callback(this.database);
+      signal?.throwIfAborted();
       this.sqlite.exec("COMMIT");
       return result;
     } catch (error) {

@@ -1,4 +1,5 @@
 import type { VlmModelStatus } from "../../shared/contracts";
+import { createProfileComfyClient } from "../comfy/ComfyClient";
 import type { LibrarySettings } from "../librarySettings";
 
 import { ComfyVlmClient } from "./comfyVlmClient";
@@ -9,15 +10,26 @@ import {
 } from "./vlmModelFiles";
 
 export const generateComfyVision =
-  (settings: LibrarySettings): VisionGenerator =>
+  (
+    settings: LibrarySettings,
+    captureProfile?: () => AbortSignal
+  ): VisionGenerator =>
   async (request) => {
+    const profile = captureProfile?.();
     request.signal?.throwIfAborted();
     const [endpoint, model] = await Promise.all([
       settings.getComfyEndpoint(),
       settings.getVlmBackend()
     ]);
     request.signal?.throwIfAborted();
-    const text = await new ComfyVlmClient(endpoint, model).generate(request);
+    profile?.throwIfAborted();
+    const comfy = profile
+      ? createProfileComfyClient(endpoint, profile, request.signal)
+      : undefined;
+    const text = await new ComfyVlmClient(endpoint, model, comfy).generate(
+      request
+    );
+    profile?.throwIfAborted();
     request.signal?.throwIfAborted();
     return { text, model };
   };
@@ -25,7 +37,8 @@ export const generateComfyVision =
 /** Probe models outside the generation queue so settings can check readiness. */
 export const probeComfyVision = async (
   settings: LibrarySettings,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  profile?: AbortSignal
 ): Promise<VlmModelStatus> => {
   signal?.throwIfAborted();
   try {
@@ -33,9 +46,16 @@ export const probeComfyVision = async (
     signal?.throwIfAborted();
     const backend = await settings.getVlmBackend();
     signal?.throwIfAborted();
-    const models = await new ComfyVlmClient(endpoint, backend).probeModels(
-      signal
-    );
+    profile?.throwIfAborted();
+    const comfy = profile
+      ? createProfileComfyClient(endpoint, profile, signal)
+      : undefined;
+    const models = await new ComfyVlmClient(
+      endpoint,
+      backend,
+      comfy
+    ).probeModels(signal);
+    profile?.throwIfAborted();
     signal?.throwIfAborted();
     const installMessage =
       backend === "qwen3-vl-4b-heretic-int8"
@@ -49,9 +69,11 @@ export const probeComfyVision = async (
     };
   } catch (error) {
     signal?.throwIfAborted();
+    profile?.throwIfAborted();
     // Missing node, or ComfyUI went away between the endpoint check and here.
     const backend = await settings.getVlmBackend();
     signal?.throwIfAborted();
+    profile?.throwIfAborted();
     return {
       backend,
       ready: false,

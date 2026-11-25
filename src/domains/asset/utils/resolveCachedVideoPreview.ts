@@ -1,6 +1,10 @@
 import { extractFrameFromVideo } from "@app/services/mediaBunny";
 
-import { rendererLibrary } from "@/platform/rendererLibraryWork";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+import { createRendererObjectUrl } from "@/platform/rendererObjectUrl";
 
 import { cacheGet } from "./cacheStorage";
 import { getFrameFromCache, saveFrameToCache } from "./frameCache";
@@ -22,22 +26,23 @@ export interface CachedVideoPreview {
  * behind it never change, and re-downloading a finished render on every visit is what this
  * exists to stop.
  *
- * Playable object URLs are deliberately never revoked. Their Blobs are held by the query
- * that called this, so revoking would break replays without releasing the bytes — and handing
- * the URL back synchronously is what lets a warm cache fill a `src` on the first render,
- * before anything has started playing. Thumbnail-only reads do not create an object URL. */
-export const resolveCachedVideoPreview = async ({
-  assetId,
-  videoUrl,
-  fps,
-  loadVideo = true
-}: {
-  assetId: string;
-  videoUrl: string;
-  fps: number;
-  loadVideo?: boolean;
-}): Promise<CachedVideoPreview> => {
-  const work = rendererLibrary.capture();
+ * Keep shared playable URLs for replays within the owning library.
+ * Thumbnail-only reads do not create an object URL. */
+export const resolveCachedVideoPreview = async (
+  {
+    assetId,
+    videoUrl,
+    fps,
+    loadVideo = true
+  }: {
+    assetId: string;
+    videoUrl: string;
+    fps: number;
+    loadVideo?: boolean;
+  },
+  work: RendererLibraryWork = rendererLibrary.capture()
+): Promise<CachedVideoPreview> => {
+  await work.ready();
   work.check();
   const cachedFirstFrameUrl = await getFrameFromCache(
     assetId,
@@ -65,25 +70,30 @@ export const resolveCachedVideoPreview = async ({
     ? videoUrl
     : await getCachedVideoBlob(videoUrl, assetId, work);
   work.check();
-  const videoObjectUrl = loadVideo
-    ? typeof videoSource === "string"
-      ? videoSource
-      : URL.createObjectURL(videoSource)
-    : null;
-
-  if (cachedFirstFrameUrl)
+  const result = (firstFrameUrl: string | null): CachedVideoPreview => {
+    work.check();
     return {
-      videoObjectUrl,
-      firstFrameUrl: cachedFirstFrameUrl,
+      videoObjectUrl: loadVideo
+        ? typeof videoSource === "string"
+          ? videoSource
+          : createRendererObjectUrl(videoSource, work)
+        : null,
+      firstFrameUrl,
       isVideoAvailable: true
     };
+  };
+
+  if (cachedFirstFrameUrl) return result(cachedFirstFrameUrl);
 
   try {
-    const extractedFirstFrameUrl = await extractFrameFromVideo({
-      videoSource,
-      frameNumber: FIRST_FRAME_NUMBER,
-      fps
-    });
+    const extractedFirstFrameUrl = await extractFrameFromVideo(
+      {
+        videoSource,
+        frameNumber: FIRST_FRAME_NUMBER,
+        fps
+      },
+      work
+    );
     work.check();
     await saveFrameToCache(
       assetId,
@@ -92,13 +102,8 @@ export const resolveCachedVideoPreview = async ({
       fps,
       work
     );
-    return {
-      videoObjectUrl,
-      firstFrameUrl: extractedFirstFrameUrl,
-      isVideoAvailable: true
-    };
+    return result(extractedFirstFrameUrl);
   } catch {
-    work.check();
-    return { videoObjectUrl, firstFrameUrl: null, isVideoAvailable: true };
+    return result(null);
   }
 };

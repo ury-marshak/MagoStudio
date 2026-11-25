@@ -8,6 +8,8 @@ import { cn } from "@utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 type Props = {
   clip: CutTimelineClip;
   isActive: boolean;
@@ -24,6 +26,7 @@ export const CutPlayerVideo: React.FC<Props> = ({
   registerElement
 }) => {
   const { t } = useTranslation();
+  const { work } = useRendererLibraryWork();
   const downloadState = useAssetDownloadState(clip.assetId);
   const isDownloading =
     downloadState === "queued" || downloadState === "downloading";
@@ -36,8 +39,12 @@ export const CutPlayerVideo: React.FC<Props> = ({
   });
 
   // Wait for the scheduled copy, then pin its source once playback starts.
-  const [pinnedVideoUrl, setPinnedVideoUrl] = useState<string>();
-  const videoUrl = pinnedVideoUrl ?? playableVideoUrl;
+  const [pin, setPin] = useState<{ url: string; signal: AbortSignal }>();
+  const videoUrl = work.signal.aborted
+    ? undefined
+    : pin?.signal === work.signal
+      ? pin.url
+      : playableVideoUrl;
   if (!videoUrl) {
     return isActive && !isDownloading ? (
       <CircularProgress aria-label={t("status.loading_video.label")} />
@@ -48,11 +55,19 @@ export const CutPlayerVideo: React.FC<Props> = ({
     <video
       ref={registerElement}
       src={videoUrl}
-      onPlay={() => setPinnedVideoUrl(playableVideoUrl)}
+      onPlay={() => {
+        if (!work.signal.aborted && playableVideoUrl) {
+          setPin({ url: playableVideoUrl, signal: work.signal });
+        }
+      }}
       preload="auto"
       playsInline
-      onEnded={onEnded}
-      onError={onError}
+      onEnded={() => {
+        if (!work.signal.aborted) onEnded();
+      }}
+      onError={() => {
+        if (!work.signal.aborted) onError();
+      }}
       className={cn(
         "absolute inset-0 h-full w-full object-contain",
         isActive ? "opacity-100" : "pointer-events-none opacity-0"

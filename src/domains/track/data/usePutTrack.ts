@@ -2,6 +2,7 @@ import { Layer } from "@schemas/layer";
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
 import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
@@ -18,7 +19,7 @@ export const usePutTrack = ({
   const queryClient = useQueryClient();
   const onSuccess = (data: Layer) => {
     queryClient.setQueryData<Project>(
-      queryKeys.project.byId(selectedProjectId),
+      libraryQueryKey(queryKeys.project.byId(selectedProjectId)),
       (project) =>
         buildUpdatedProjectAfterTrackPut(project, selectedShotId, data)
     );

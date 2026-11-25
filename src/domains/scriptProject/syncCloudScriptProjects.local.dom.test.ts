@@ -142,6 +142,7 @@ describe("cloud script-project synchronization", () => {
     await vi.waitFor(() => expect(cacheMedia).toHaveBeenCalledOnce());
     expect(put).toHaveBeenCalledWith(
       expect.objectContaining({
+        intent: "cloud-import",
         metadataOnly: true,
         cut: expect.objectContaining({ shots: expect.any(Array) })
       })
@@ -358,6 +359,8 @@ describe("cloud script-project synchronization", () => {
     });
     expect(put).toHaveBeenCalledWith({
       projectId: "script-1",
+      intent: "cloud-import",
+      metadataOnly: true,
       project
     });
   });

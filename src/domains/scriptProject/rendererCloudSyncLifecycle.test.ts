@@ -31,6 +31,7 @@ vi.mock("electron", () => ({
       fixture.handlers.set(name, handler)
   },
   ipcRenderer: {
+    sendSync: (channel: string) => channel === "account:is-current",
     invoke: async (name: string, ...args: unknown[]) => {
       fixture.calls.push(name);
       return fixture.handlers.get(name)!(

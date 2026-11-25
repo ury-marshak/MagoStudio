@@ -76,6 +76,7 @@ it.each(["kick", "reconcileInterruptedRenders"] as const)(
       assetId: "asset",
       model: "qwen",
       status: "INQUEUE",
+      providerRequestId: "accepted",
       requestJson: JSON.stringify({
         frame: 0,
         settings: {},

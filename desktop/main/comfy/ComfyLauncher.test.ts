@@ -5,14 +5,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ComfyLauncher } from "./ComfyLauncher";
 
+const deferred = <T>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+};
+
 const mocks = vi.hoisted(() => ({
   spawn: vi.fn(),
+  execFile: vi.fn(),
   stat: vi.fn(),
   readFile: vi.fn(),
   mkdir: vi.fn(),
   open: vi.fn()
 }));
-vi.mock("node:child_process", () => ({ spawn: mocks.spawn }));
+vi.mock("node:child_process", () => ({
+  spawn: mocks.spawn,
+  execFile: mocks.execFile
+}));
 vi.mock("node:fs/promises", () => ({
   stat: mocks.stat,
   readFile: mocks.readFile,
@@ -250,6 +262,116 @@ describe("ComfyUI batch launcher", () => {
     await expect(launcher.launch()).rejects.toThrow("Cannot start");
     await launcher.launch();
     expect(mocks.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("allows a fresh attempt at the same endpoint while a retired probe is still pending", async () => {
+    const launcher = new ComfyLauncher(settings, comfyOutputLogPath);
+    const old = new AbortController();
+    const current = new AbortController();
+    const probe = deferred<Response>();
+    vi.mocked(fetch).mockReturnValueOnce(probe.promise);
+    const endpoint = await settings.getComfyEndpoint();
+    const stale = launcher.launch({ endpoint, signal: old.signal });
+    const rejected = expect(stale).rejects.toHaveProperty("name", "AbortError");
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    old.abort();
+    await launcher.launch({ endpoint, signal: current.signal });
+    const cancel = vi.fn();
+    probe.resolve(new Response(new ReadableStream({ cancel })));
+    await rejected;
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(mocks.spawn).toHaveBeenCalledOnce();
+    expect(launcher.getLaunchedProcess(endpoint, current.signal)).toEqual({
+      status: "running"
+    });
+  });
+
+  it("closes a retired log handle and never spawns after the delayed open", async () => {
+    const launcher = new ComfyLauncher(settings, comfyOutputLogPath);
+    const controller = new AbortController();
+    const log = deferred<{ fd: number; close: () => Promise<void> }>();
+    const closed = deferred<void>();
+    const close = vi.fn(() => closed.promise);
+    mocks.open.mockReturnValueOnce(log.promise);
+    const launch = launcher.launch({ signal: controller.signal });
+    const rejected = expect(launch).rejects.toHaveProperty(
+      "name",
+      "AbortError"
+    );
+    await vi.waitFor(() => expect(mocks.open).toHaveBeenCalledOnce());
+    controller.abort();
+    const drained = vi.fn();
+    const cleanup = launcher
+      .drainLaunchCleanup(controller.signal)
+      .then(drained);
+    log.resolve({ fd: comfyOutputLogFd, close });
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+    expect(drained).not.toHaveBeenCalled();
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    closed.resolve();
+    await Promise.all([rejected, cleanup]);
+  });
+
+  it("detaches a late child and ignores its exit without stopping an outside listener", async () => {
+    const launcher = new ComfyLauncher(settings, comfyOutputLogPath);
+    const controller = new AbortController();
+    const child = Object.assign(new EventEmitter(), {
+      pid: 1234,
+      exitCode: null,
+      unref: vi.fn()
+    });
+    const close = vi.fn(async () => {});
+    mocks.open.mockResolvedValueOnce({ fd: comfyOutputLogFd, close });
+    mocks.spawn.mockReturnValueOnce(child);
+    const launch = launcher.launch({ signal: controller.signal });
+    const rejected = expect(launch).rejects.toHaveProperty(
+      "name",
+      "AbortError"
+    );
+    await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalledOnce());
+    controller.abort();
+    await Promise.all([
+      rejected,
+      launcher.drainLaunchCleanup(controller.signal)
+    ]);
+    expect(close).toHaveBeenCalledOnce();
+    expect(
+      launcher.getLaunchedProcess(undefined, controller.signal)
+    ).toBeNull();
+    const current = new AbortController();
+    vi.mocked(fetch).mockResolvedValueOnce(new Response("{}"));
+    await launcher.launch({ signal: current.signal });
+    child.emit("spawn");
+    child.emit("exit", 1);
+    expect(child.unref).toHaveBeenCalledOnce();
+    expect(mocks.open).toHaveBeenCalledOnce();
+    expect(launcher.getLaunchedProcess(undefined, current.signal)).toBeNull();
+    expect(mocks.spawn).toHaveBeenCalledOnce();
+  });
+
+  it("does not kill the outside listener discovered by an explicit restart after retirement", async () => {
+    const listing = deferred<string>();
+    mocks.execFile.mockImplementation((_command, _args, _options, callback) => {
+      void listing.promise.then((stdout) => callback(null, stdout));
+    });
+    const launcher = new ComfyLauncher(settings, comfyOutputLogPath);
+    const controller = new AbortController();
+    const restart = launcher.relaunchProcessStartedOutsideMago(
+      "http://127.0.0.1:9000",
+      controller.signal
+    );
+    const rejected = expect(restart).rejects.toHaveProperty(
+      "name",
+      "AbortError"
+    );
+    await vi.waitFor(() => expect(mocks.execFile).toHaveBeenCalledOnce());
+    controller.abort();
+    listing.resolve(
+      "  TCP    127.0.0.1:9000    0.0.0.0:0    LISTENING    4567"
+    );
+    await rejected;
+    expect(mocks.spawn).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 

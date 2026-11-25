@@ -13,10 +13,18 @@ import { textOf } from "../../vlm/dialogue";
 import { changedFields, fingerprint } from "../renderSpec";
 
 import {
+  FAL_OPENING_FRAME_POLICY,
+  falOpeningFrameSchema,
+  hasUnboundImageNumber,
+  isFalOpeningPin,
+  numberedContinuitySlots,
+  openingFrameMatchesAspect,
+  openingFrameMismatch
+} from "./falOpeningFrame";
+import {
   defaultSequentialAppendix,
   isDefaultSequentialAppendix,
   OPENING_FRAME_CUT,
-  OPENING_FRAME_PIN,
   OPENING_FRAMES,
   sequentialFingerprint
 } from "./sequentialContinuation";
@@ -428,22 +436,13 @@ export const planShotRun = ({
       });
       continue;
     }
-    // fal's start image also sets the canvas; this slice supports references only.
-    if (
-      videoSettings.render_provider === FAL_SHOT_PROVIDER &&
-      sequential?.mode === "last_frame" &&
-      sequential.opening_frame === OPENING_FRAME_PIN
-    ) {
-      blocked.push({
-        ...reference,
-        missing: [],
-        reason_code: "unsupported_opening_frame",
-        reason:
-          "Pinned opening frames are unavailable with H3 Max (fal): the start image also " +
-          "determines the canvas; use last_frame cut/off or key_frames instead"
-      });
-      continue;
-    }
+    const isFal = videoSettings.render_provider === FAL_SHOT_PROVIDER;
+    const openingPin = isFal && isFalOpeningPin(sequential);
+    const aspect = textOf(
+      (isRecord(videoSettings.provider_settings)
+        ? videoSettings.provider_settings.aspect_ratio
+        : undefined) ?? "16:9"
+    );
     let sequentialSpec: JsonRecord | null = null;
     let previousTimelineId: string | null = null;
     let previousAssetId: string | null = null;
@@ -455,13 +454,37 @@ export const planShotRun = ({
       if (!previousInRun) {
         const previousCut = cutByTimeline.get(previousTimelineId);
         const previousPin = shotPin(previousCut);
+        const version = records(previousCut?.versions).find(
+          (version) =>
+            version.asset_id === previousPin && version.ready === true
+        );
+        if (version) previousAssetId = previousPin;
+        const dimensions = version?.decoded_frame_dimensions;
         if (
-          records(previousCut?.versions).some(
-            (version) =>
-              version.asset_id === previousPin && version.ready === true
+          openingPin &&
+          isRecord(dimensions) &&
+          isNumber(dimensions.width) &&
+          dimensions.width > 0 &&
+          isNumber(dimensions.height) &&
+          dimensions.height > 0 &&
+          !openingFrameMatchesAspect(
+            dimensions.width,
+            dimensions.height,
+            aspect
           )
-        )
-          previousAssetId = previousPin;
+        ) {
+          blocked.push({
+            ...reference,
+            missing: [],
+            reason_code: "fal_opening_frame_aspect_mismatch",
+            reason: openingFrameMismatch(
+              dimensions.width,
+              dimensions.height,
+              aspect
+            )
+          });
+          continue;
+        }
       }
       if (!previousAssetId && !previousInRun) {
         blocked.push({
@@ -476,6 +499,9 @@ export const planShotRun = ({
       }
       sequentialSpec = {
         ...sequentialFingerprint(sequential),
+        ...(openingPin
+          ? { opening_frame_preparation: FAL_OPENING_FRAME_POLICY }
+          : {}),
         ...(videoSettings.render_provider === FAL_SHOT_PROVIDER &&
         sequential.mode === "last_chunk"
           ? { tail_preparation: FAL_VIDEO_TAIL_PROFILE }
@@ -522,18 +548,37 @@ export const planShotRun = ({
     };
     const referenceCapacity =
       FAL_SHOT_IMAGE_SLOTS -
-      (sequential?.mode === "last_frame" || sequential?.mode === "key_frames"
-        ? 1
-        : 0) -
+      numberedContinuitySlots(sequential, isFal) -
       Number(isRecord(renderShot._local_storyboard));
+    const referenceCount = Object.values(
+      isRecord(shot.references) ? shot.references : {}
+    ).flatMap((value) => records(value)).length;
+    const rawReferencePrompt = openingPin
+      ? [shot.video_prompt, sequential?.prompt_appendix].map(textOf).join(" ")
+      : textOf(shot.video_prompt);
+    if (
+      openingPin &&
+      shotRewrite === "raw" &&
+      hasUnboundImageNumber(
+        rawReferencePrompt,
+        Math.min(referenceCount, referenceCapacity)
+      )
+    ) {
+      blocked.push({
+        ...reference,
+        missing: [],
+        reason_code: "fal_opening_frame_numbered_reference",
+        reason:
+          "The pinned opening frame is not a numbered image. Remove references to its Image number or choose Cut or Loose reference."
+      });
+      continue;
+    }
     if (
       videoSettings.render_provider === FAL_SHOT_PROVIDER &&
       shotRewrite === "raw" &&
       hasRawNumberedReferenceOverflow(
-        textOf(shot.video_prompt),
-        Object.values(isRecord(shot.references) ? shot.references : {}).flatMap(
-          (value) => records(value)
-        ).length,
+        rawReferencePrompt,
+        referenceCount,
         referenceCapacity
       )
     ) {
@@ -550,8 +595,8 @@ export const planShotRun = ({
     }
     const spec = shotSpec(renderShot, shotSettings, outputSize, sequentialSpec);
     if (
-      videoSettings.render_provider === FAL_SHOT_PROVIDER &&
-      sequential?.mode === "last_chunk" &&
+      isFal &&
+      (openingPin || sequential?.mode === "last_chunk") &&
       !previousInRun
     ) {
       // Reuse an immutable prepared binding only if all unprepared inputs match.
@@ -564,8 +609,27 @@ export const planShotRun = ({
           !isRecord(version.render_spec.sequential)
         )
           continue;
-        const { prepared_video, ...baseSequential } =
+        const { prepared_video, prepared_opening_frame, ...baseSequential } =
           version.render_spec.sequential;
+        const baseSpec = { ...version.render_spec, sequential: baseSequential };
+        if (fingerprint(baseSpec) !== fingerprint(spec)) continue;
+        if (openingPin) {
+          const valid = falOpeningFrameSchema.safeParse(prepared_opening_frame);
+          if (
+            !valid.success ||
+            valid.data.predecessor_asset_id !== previousAssetId ||
+            valid.data.predecessor_timeline_id !== previousTimelineId ||
+            valid.data.aspect_ratio !== aspect ||
+            !openingFrameMatchesAspect(
+              valid.data.width,
+              valid.data.height,
+              aspect
+            )
+          )
+            continue;
+          spec.sequential = { ...sequentialSpec, prepared_opening_frame };
+          break;
+        }
         if (
           !isRecord(prepared_video) ||
           typeof prepared_video.asset_id !== "string" ||
@@ -577,14 +641,11 @@ export const planShotRun = ({
         );
         if (
           !valid.success ||
-          valid.data.requested_seconds !== sequential.chunk_seconds
+          valid.data.requested_seconds !== sequential?.chunk_seconds
         )
           continue;
-        const baseSpec = { ...version.render_spec, sequential: baseSequential };
-        if (fingerprint(baseSpec) === fingerprint(spec)) {
-          spec.sequential = { ...sequentialSpec, prepared_video };
-          break;
-        }
+        spec.sequential = { ...sequentialSpec, prepared_video };
+        break;
       }
     }
     const value = fingerprint(spec);

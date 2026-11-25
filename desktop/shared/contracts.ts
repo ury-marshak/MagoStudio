@@ -5,6 +5,7 @@ import type {
   LocalModelGroupId,
   LocalModelGroupInstallState
 } from "./localModelGroups";
+import type { OrdinaryFalAccount, OrdinaryFalApi } from "./ordinaryFal";
 import type { TextModelRequest, TextModelResponse } from "./textModelRequest";
 /**
  * Whether this window talks to cloud Mago at all.
@@ -25,6 +26,8 @@ export interface FalProviderConfig {
   storyboardImageModel?: FalSheetModel;
   shotProvider?: typeof FAL_SHOT_PROVIDER | "local-comfy";
 }
+
+export type FalProviderMetadata = FalProviderConfig & OrdinaryFalAccount;
 
 export const externalReasoningEfforts = ["low", "medium", "high"] as const;
 
@@ -80,14 +83,15 @@ export interface LocalVideoImportResult {
   shotId: string;
 }
 
-export interface LocalImageImport {
+export type LocalImageImport = {
   projectId: string;
-  sourcePath: string;
   name: string;
   width: number;
   height: number;
-  thumbnailDataUrl: string;
-}
+} & (
+  | { sourcePath: string; thumbnailDataUrl: string; dataUrl?: never }
+  | { dataUrl: string; thumbnailDataUrl?: string; sourcePath?: never }
+);
 
 export const LOCAL_IMAGE_MODEL_NAMES = [
   "gpt_image_2",
@@ -403,6 +407,8 @@ export interface LocalScriptProjectSnapshot {
 
 export interface LocalScriptProjectSnapshotInput {
   projectId: string;
+  /** Cloud imports need an active Cloud profile even when metadata-only. */
+  intent?: "cloud-import";
   metadataOnly?: boolean;
   project?: Record<string, unknown>;
   state?: Record<string, unknown>;
@@ -470,6 +476,7 @@ export interface LocalScriptShotsInput {
 export interface LocalSequentialShotConfig {
   enabled: boolean;
   mode: "last_frame" | "key_frames" | "last_chunk";
+  opening_frame?: "cut" | "pin" | "off" | null;
   num_select?: number | null;
   chunk_seconds?: number | null;
   prompt_appendix?: string | null;
@@ -582,6 +589,7 @@ export type SetupRequirementDownloadResult =
     }
   | {
       outcome: "node-pack-update-needs-confirmation";
+      approvalToken?: string;
       customNodesFolder: string;
       nodePackDirectory: string;
       backupsFolder: string;
@@ -640,8 +648,14 @@ export interface MagoDesktopApi {
     mode: MagoAppMode;
     /** Persists the choice and rebuilds the window with the new mode. */
     chooseMode: (mode: Exclude<MagoAppMode, "unchosen">) => Promise<void>;
-    /** Drops the stored choice and rebuilds so the sign-in gate shows again. */
+    /** Retires this window before the renderer asks Clerk to sign out. */
+    beginSignOut: () => Promise<void>;
+    /** Drops the stored choice after beginSignOut and rebuilds the window. */
     signOut: () => Promise<void>;
+    /** Authoritative check for deferred account work in this window. */
+    isCurrent: () => boolean;
+    /** Subscribes to retirement of the window’s account profile. */
+    onRetired: (listener: () => void) => () => void;
     /** Subscribes to `mago://` links. Returns an unsubscribe function. */
     onDeepLink: (
       listener: (link: {
@@ -664,7 +678,7 @@ export interface MagoDesktopApi {
     pauseDownload: (name: string) => Promise<void>;
     downloadRequirement: (
       name: string,
-      options?: { replaceExistingNodePackIn?: string }
+      options?: { replaceExistingNodePackIn?: string; approvalToken?: string }
     ) => Promise<SetupRequirementDownloadResult | null>;
     downloadRequirements: (
       batchName: string,
@@ -717,6 +731,7 @@ export interface MagoDesktopApi {
       frameHeight: number;
     }) => Promise<string>;
   };
+  ordinaryFal?: OrdinaryFalApi;
   cloud: {
     /** Local-to-cloud id mapping. The cloud copy is derived and disposable. */
     links: {
@@ -895,10 +910,10 @@ export interface MagoDesktopApi {
     ) => Promise<ExternalModelConfig | null>;
     check: (capability: ExternalModelCapability) => Promise<void>;
     fal: {
-      get: () => Promise<FalProviderConfig | null>;
+      get: () => Promise<FalProviderMetadata | null>;
       save: (
         config: FalProviderConfig | null
-      ) => Promise<FalProviderConfig | null>;
+      ) => Promise<FalProviderMetadata | null>;
       check: () => Promise<void>;
     };
   };
@@ -1048,6 +1063,13 @@ export const IPC_CHANNELS = {
   accountChooseMode: "account:choose-mode",
   accountSignOut: "account:sign-out",
   accountDeepLink: "account:deep-link",
+  accountBeginSignOut: "account:begin-sign-out",
+  accountIsCurrent: "account:is-current",
+  accountRetired: "account:retired",
+  accountRetiredAck: "account:retired-ack",
+  ordinaryFalSubmit: "ordinary-fal:submit",
+  ordinaryFalGet: "ordinary-fal:get",
+  ordinaryFalList: "ordinary-fal:list",
   cloudLinkGet: "cloud:link-get",
   cloudLinkPut: "cloud:link-put",
   cloudLinkPatch: "cloud:link-patch",

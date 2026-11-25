@@ -70,6 +70,34 @@ describe("readComfyPromptWithSafetyPoll", () => {
     expect(monitor.forget).toHaveBeenCalledWith("p1");
   });
 
+  it("throws the profile abort instead of applying a late HTTP settlement", async () => {
+    const monitor = createMonitor(runningPrompt);
+    const profile = new AbortController();
+    let finish!: (result: { state: "finished" }) => void;
+    const http = new Promise<{ state: "finished" }>((resolve) => {
+      finish = resolve;
+    });
+    const readOverHttp = vi.fn(() => http);
+    const options = {
+      monitor,
+      promptId: "p1",
+      lastStatusCheckAt: Number.NEGATIVE_INFINITY,
+      readOverHttp,
+      signal: profile.signal
+    };
+    const old = readComfyPromptWithSafetyPoll(options);
+    profile.abort();
+    await expect(old).rejects.toBe(profile.signal.reason);
+    await expect(readComfyPromptWithSafetyPoll(options)).rejects.toBe(
+      profile.signal.reason
+    );
+    finish({ state: "finished" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(readOverHttp).toHaveBeenCalledOnce();
+    expect(monitor.forget).not.toHaveBeenCalled();
+    expect(monitor.resetConnection).not.toHaveBeenCalled();
+  });
+
   it("polls over HTTP when the socket cannot vouch for the prompt", async () => {
     const monitor = createMonitor(null);
     const readOverHttp = vi.fn().mockResolvedValue({ state: "queued" });

@@ -5,6 +5,12 @@ import { MenuItem } from "@components/MenuItem";
 import { MenuItemButton } from "@components/MenuItemButton";
 import { MenuItemText } from "@components/MenuItemText";
 import { MenuList } from "@components/MenuList";
+import {
+  VIDEO_EFFECTS_LABEL,
+  useVideoEffects
+} from "@components/VideoEffects/useVideoEffects";
+import { useProject } from "@domains/project/useProject";
+import { useSelectedProjectId } from "@domains/project/useSelectedProjectId";
 import { useResolvedQueueStatus } from "@domains/queue/useResolvedQueueStatus";
 import { isRenderCancelable } from "@domains/queue/utils/isRenderCancelable";
 import { useSelectedShot } from "@domains/shot/useSelectedShot";
@@ -14,6 +20,7 @@ import { useFilteredAndSortedTracks } from "@domains/track/useFilteredAndSortedT
 import { useSelectedTrackIds } from "@domains/track/useSelectedTrackIds";
 import { useSetSelectedTrackIds } from "@domains/track/useSetSelectedTrackIds";
 import { getTrackAssetData } from "@domains/track/utils/getTrackAssetData";
+import { isMaskTrack } from "@domains/track/utils/isMaskTrack";
 import { useDownloadInfoRichVideo } from "@hooks/files/useDownloadInfoRichVideo";
 import {
   isVideoDownloadable,
@@ -32,6 +39,9 @@ import { Layer } from "@schemas/layer";
 import { useToast } from "@store/useToast";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+
+import { isLocalApp } from "@/platform/localDesktop";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 import { CopyRenderSettingsMenuItem } from "./CopyRenderSettingsMenuItem";
 
@@ -78,6 +88,13 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({
   } = useDownloadInfoRichVideo(track);
 
   const isEXR = isEXRRender(track);
+  const projectId = useSelectedProjectId();
+  const { data: project } = useProject(
+    projectId,
+    (data) => data,
+    !isLocalApp || typeof window === "undefined" || !window.mago?.ordinaryFal
+  );
+  const effects = useVideoEffects(project, track, isEXR || isMaskTrack(track));
   const handleDownloadError = () => {
     showToast({
       message: t("notifications.download_failed.description")
@@ -89,14 +106,7 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({
     areVideoAndFramesDownloadable(track) && !isDownloading;
   const canDownloadEXR = isEXRDownloadable(track) && !isDownloading;
 
-  const deleteTrackWithRecovery = () => {
-    handleDeleteTrack(track, queue).catch((error: unknown) => {
-      console.error("Failed to delete track:", error);
-      setIsHiddenWhileDeleting(false);
-    });
-  };
-
-  return (
+  const menu = (
     <Menu
       className="flex items-center"
       button={
@@ -114,6 +124,18 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({
     >
       {({ close }) => (
         <MenuList>
+          {effects.available && (
+            <MenuItem>
+              <MenuItemButton
+                onClick={() => {
+                  close();
+                  effects.open();
+                }}
+              >
+                <MenuItemText title={VIDEO_EFFECTS_LABEL} />
+              </MenuItemButton>
+            </MenuItem>
+          )}
           {isEXR ? (
             <MenuItem>
               <MenuItemButton
@@ -235,6 +257,16 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({
               aria-label="Delete layer"
               disabled={!isDeletable}
               onClick={async () => {
+                const work = rendererLibrary.capture();
+                if (work.signal.aborted) return;
+
+                const restoreVisibility = () => setIsHiddenWhileDeleting(false);
+                const stopRestoringOnSwitch = () =>
+                  work.signal.removeEventListener("abort", restoreVisibility);
+                // The parent row can survive a reset with the same track ID.
+                work.signal.addEventListener("abort", restoreVisibility, {
+                  once: true
+                });
                 setIsHiddenWhileDeleting(true);
                 let newSelectedTrackIds = selectedTrackIds.filter(
                   (trackId) => trackId !== track.id
@@ -246,6 +278,18 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({
 
                 setSelectedTrackIds(newSelectedTrackIds);
 
+                const confirmDelete = () => {
+                  if (work.signal.aborted) return;
+                  void handleDeleteTrack(track, queue, work)
+                    .catch((error: unknown) => {
+                      if (work.signal.aborted) return;
+                      console.error("Failed to delete track:", error);
+                      restoreVisibility();
+                    })
+                    .finally(stopRestoringOnSwitch);
+                  close();
+                };
+
                 showToast({
                   message: (
                     <span>
@@ -255,19 +299,15 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({
                   onSubmitText: "Delete",
                   onCancelText: "Cancel",
                   ...(isDeletable && { showTimer: false }),
-                  onSubmit: () => {
-                    deleteTrackWithRecovery();
-                    close();
-                  },
+                  onSubmit: confirmDelete,
                   onCancel: () => {
-                    setIsHiddenWhileDeleting(false);
+                    if (work.signal.aborted) return;
+                    stopRestoringOnSwitch();
+                    restoreVisibility();
                     setSelectedTrackIds([track.id]);
                     close();
                   },
-                  onClose: () => {
-                    deleteTrackWithRecovery();
-                    close();
-                  }
+                  onClose: confirmDelete
                 });
               }}
             >
@@ -277,5 +317,12 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({
         </MenuList>
       )}
     </Menu>
+  );
+
+  return (
+    <>
+      {menu}
+      {effects.dialog}
+    </>
   );
 };

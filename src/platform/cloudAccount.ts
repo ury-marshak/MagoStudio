@@ -1,3 +1,5 @@
+import { isRendererAccountProfileRetired } from "./rendererAccountProfile";
+
 /**
  * Whether there is a cloud Mago account behind this session.
  *
@@ -14,7 +16,9 @@
 export const isCloudAccountActive = (): boolean => {
   if (typeof window === "undefined") return true;
   if (!window.mago) return true;
-  return window.mago.account?.mode === "cloud";
+  return (
+    window.mago.account?.mode === "cloud" && !isRendererAccountProfileRetired()
+  );
 };
 
 /**

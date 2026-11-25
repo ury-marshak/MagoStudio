@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { LOCAL_SCRIPT_MODEL_FILES as files } from "../scriptProjects/comfyScriptProjectClient";
 
-import { evaluateScriptSetup } from "./probeScriptSetup";
+import { evaluateScriptSetup, probeScriptSetup } from "./probeScriptSetup";
 
 const installed = (): Record<string, unknown> => {
   const empty = evaluateScriptSetup({});
@@ -25,6 +25,50 @@ const installed = (): Record<string, unknown> => {
   };
   return info;
 };
+
+it("does not start text inventory probes after a pending setup inventory request retires", async () => {
+  const origin = new AbortController();
+  let answerInventory!: (response: Response) => void;
+  const inventory = new Promise<Response>((resolve) => {
+    answerInventory = resolve;
+  });
+  const fetchMock = vi.fn((url: string) =>
+    url.endsWith("/experiment/models")
+      ? inventory
+      : Promise.resolve(Response.json({}))
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  try {
+    const probe = probeScriptSetup(
+      "http://127.0.0.1:8188",
+      undefined,
+      origin.signal
+    );
+    const rejection = expect(probe).rejects.toHaveProperty(
+      "name",
+      "AbortError"
+    );
+    await vi.waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:8188/experiment/models",
+        expect.anything()
+      )
+    );
+    origin.abort();
+    const cancel = vi.fn();
+    answerInventory(new Response(new ReadableStream({ cancel })));
+    await rejection;
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(
+      fetchMock.mock.calls.filter(([url]) => url.endsWith("/experiment/models"))
+    ).toHaveLength(1);
+    expect(
+      fetchMock.mock.calls.some(([url]) => url.endsWith("/models/clip_gguf"))
+    ).toBe(false);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
 
 describe("ScriptShot minimum setup", () => {
   it("accepts vanilla and the 4-step LoRA without captioning, image models, local LLM or PDD", () => {

@@ -1,8 +1,6 @@
-import { execFile } from "node:child_process";
 import path from "node:path";
-import { promisify } from "node:util";
 
-const run = promisify(execFile);
+import { runSetupProcess } from "./runSetupProcess";
 
 export const extractStarterArchive = async (
   archive: string,
@@ -41,7 +39,7 @@ try {
   exit 1
 }`;
   try {
-    await run(
+    const { exitCode, output } = await runSetupProcess(
       "powershell.exe",
       [
         "-NoProfile",
@@ -49,22 +47,22 @@ try {
         "-EncodedCommand",
         Buffer.from(script, "utf16le").toString("base64")
       ],
+      signal,
       {
-        windowsHide: true,
-        signal,
-        env: {
-          ...process.env,
-          MAGO_INSTALL_ARCHIVE: path.toNamespacedPath(archive),
-          MAGO_INSTALL_STAGE: path.toNamespacedPath(staging)
-        }
+        ...process.env,
+        MAGO_INSTALL_ARCHIVE: path.toNamespacedPath(archive),
+        MAGO_INSTALL_STAGE: path.toNamespacedPath(staging)
       }
     );
+    if (exitCode !== 0) throw new Error(output.trim());
   } catch (error) {
     signal.throwIfAborted();
-    const stderr = (error as { stderr?: string }).stderr?.trim();
-    throw new Error(
-      `Could not extract the ComfyUI bundle. ${stderr || "Retry the installation."}`,
-      { cause: error }
-    );
+    const detail =
+      error instanceof Error && error.message
+        ? error.message
+        : "Retry the installation.";
+    throw new Error(`Could not extract the ComfyUI bundle. ${detail}`, {
+      cause: error
+    });
   }
 };

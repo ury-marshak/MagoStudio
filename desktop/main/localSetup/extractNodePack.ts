@@ -20,8 +20,10 @@ const MAX_EXTRACTED_BYTES = 512 * 1024 * 1024;
 export const extractNodePack = async (
   archive: string,
   destination: string,
-  stripRoot = true
+  stripRoot = true,
+  signal?: AbortSignal
 ): Promise<void> => {
+  signal?.throwIfAborted();
   if (await stat(destination).catch(() => null))
     throw new Error(
       "The node pack folder already exists. Move it aside before installing; existing files were preserved."
@@ -30,7 +32,9 @@ export const extractNodePack = async (
     throw new Error(
       "Node ZIP is too large for automatic extraction. Extract it manually."
     );
-  const bytes = await readFile(archive);
+  signal?.throwIfAborted();
+  const bytes = await readFile(archive, { signal });
+  signal?.throwIfAborted();
   let end = bytes.length - 22;
   while (
     end >= Math.max(0, bytes.length - 65557) &&
@@ -115,6 +119,7 @@ export const extractNodePack = async (
   );
   try {
     for (const [name, data] of Object.entries(files)) {
+      signal?.throwIfAborted();
       const relative = stripRoot ? name.split("/").slice(1).join("/") : name;
       if (!relative) continue;
       const output = path.resolve(staging, relative);
@@ -128,6 +133,7 @@ export const extractNodePack = async (
     }
     if (await stat(destination).catch(() => null))
       throw new Error("The node folder already exists.");
+    signal?.throwIfAborted();
     await rename(staging, destination);
   } finally {
     await rm(staging, { recursive: true, force: true });

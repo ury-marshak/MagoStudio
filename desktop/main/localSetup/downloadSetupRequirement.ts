@@ -13,15 +13,26 @@ import { installManualNodePackDependencies } from "./installManualNodePackDepend
 import { NodePackAlreadyInstalledError } from "./NodePackAlreadyInstalledError";
 import { resolveNodePackBackupsFolder } from "./resolveNodePackBackupsFolder";
 import { resolveSetupRequirements } from "./resolveSetupRequirements";
+import type { SetupAttempt } from "./setupAttempt";
 
 export const downloadSetupRequirement = async (
   window: BrowserWindow,
   settings: ComfySettings,
   name: string,
   signal?: AbortSignal,
-  { replaceExistingNodePackIn }: { replaceExistingNodePackIn?: string } = {}
+  {
+    replaceExistingNodePackIn,
+    attempt
+  }: { replaceExistingNodePackIn?: string; attempt?: SetupAttempt } = {}
 ): Promise<SetupRequirementDownloadResult | null> => {
-  const [requirement] = await resolveSetupRequirements(settings, [name]);
+  const issue = <T>(work: () => Promise<T>) =>
+    attempt ? attempt.issue(work) : work();
+  const [requirement] = await resolveSetupRequirements(
+    settings,
+    [name],
+    signal
+  );
+  signal?.throwIfAborted();
   const isReplacingNodePack = replaceExistingNodePackIn !== undefined;
   if (
     isReplacingNodePack &&
@@ -31,17 +42,18 @@ export const downloadSetupRequirement = async (
     throw new Error("Only an installed node pack can be updated in place.");
   const folder =
     replaceExistingNodePackIn ??
-    (await chooseSetupRequirementFolder(window, settings, requirement));
+    (await chooseSetupRequirementFolder(window, settings, requirement, signal));
+  signal?.throwIfAborted();
   if (!folder) return null;
   let savedTo: string;
   try {
-    savedTo = await downloadSetupRequirementIntoFolder(
-      requirement,
-      folder,
-      signal,
-      { replaceExistingNodePack: isReplacingNodePack }
+    savedTo = await issue(() =>
+      downloadSetupRequirementIntoFolder(requirement, folder, signal, {
+        replaceExistingNodePack: isReplacingNodePack
+      })
     );
   } catch (error) {
+    signal?.throwIfAborted();
     if (!(error instanceof NodePackAlreadyInstalledError)) throw error;
     return {
       outcome: "node-pack-update-needs-confirmation",
@@ -50,14 +62,14 @@ export const downloadSetupRequirement = async (
       backupsFolder: resolveNodePackBackupsFolder(folder)
     };
   }
+  signal?.throwIfAborted();
   if (requirement.installKind !== "node") return { outcome: "saved", savedTo };
-  return {
-    outcome: "saved",
-    savedTo,
-    nodePackDependencies: await installManualNodePackDependencies({
-      nodePackDirectory: savedTo,
-      endpoint: settings.endpoint,
-      signal
-    })
-  };
+  const nodePackDependencies = await installManualNodePackDependencies({
+    nodePackDirectory: savedTo,
+    endpoint: settings.endpoint,
+    signal,
+    attempt
+  });
+  signal?.throwIfAborted();
+  return { outcome: "saved", savedTo, nodePackDependencies };
 };

@@ -1,12 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { IPC_CHANNELS } from "../../shared/contracts";
+import { ProfileIoDrain } from "../providers/profileIoDrain";
 
 import { registerScriptProjectHandlers } from "./registerScriptProjectHandlers";
 
 const mocks = vi.hoisted(() => ({ handle: vi.fn(), trusted: vi.fn() }));
 vi.mock("electron", () => ({ ipcMain: { handle: mocks.handle } }));
 vi.mock("./trustedSender", () => ({ requireTrustedSender: mocks.trusted }));
+
+const deferred = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
 
 const setup = (channel: string = IPC_CHANNELS.scriptProjectsCancelChat) => {
   const controller = new AbortController();
@@ -24,9 +33,27 @@ const setup = (channel: string = IPC_CHANNELS.scriptProjectsCancelChat) => {
     return controller.signal;
   });
   const databaseManager = { isOpen: vi.fn(() => true), open: vi.fn() };
+  const profile = new AbortController();
+  const profileIo = new ProfileIoDrain();
+  const captureAccountProfile = vi.fn(() => {
+    profile.signal.throwIfAborted();
+    return profile.signal;
+  });
+  const putSnapshot = vi.fn();
+  const cacheMedia = vi.fn();
+  const getAppMode = vi.fn<() => Promise<"cloud" | "offline">>(
+    async () => "cloud"
+  );
+  const getLibraryRoot = vi.fn(async () => "/fixture/library");
   registerScriptProjectHandlers({
     chat: { cancel, post, list, getSessionSignal: () => controller.signal },
     databaseManager,
+    captureAccountProfile:
+      channel === IPC_CHANNELS.scriptProjectsPut ||
+      channel === IPC_CHANNELS.scriptProjectsCacheMedia
+        ? captureAccountProfile
+        : undefined,
+    profileIo,
     service: {
       inLibrary: async (operation: () => Promise<unknown>) => operation(),
       capturePlanSession: () => {
@@ -35,17 +62,26 @@ const setup = (channel: string = IPC_CHANNELS.scriptProjectsCancelChat) => {
       },
       databaseOperation: async (operation: () => Promise<unknown>) =>
         operation(),
+      putSnapshot,
+      cacheMedia,
       getRenderMetrics: metrics,
       captureMetricsSession,
       update,
       captureDescriptionSession
     },
-    settings: {}
+    settings: { getAppMode, getLibraryRoot }
   } as unknown as Parameters<typeof registerScriptProjectHandlers>[0]);
   const handler = mocks.handle.mock.calls.find(
     ([name]) => name === channel
   )![1];
   return {
+    profile,
+    profileIo,
+    captureAccountProfile,
+    putSnapshot,
+    cacheMedia,
+    getAppMode,
+    getLibraryRoot,
     cancel,
     post,
     list,
@@ -59,6 +95,107 @@ const setup = (channel: string = IPC_CHANNELS.scriptProjectsCancelChat) => {
   };
 };
 
+describe("Director Cloud snapshot IPC", () => {
+  const input = {
+    projectId: "fixture",
+    intent: "cloud-import",
+    metadataOnly: true
+  };
+
+  it("requires trust and a saved Cloud mode before opening the DB", async () => {
+    const test = setup(IPC_CHANNELS.scriptProjectsPut);
+    mocks.trusted.mockImplementationOnce(() => {
+      throw new Error("untrusted");
+    });
+    await expect(test.handler({}, input)).rejects.toThrow("untrusted");
+    expect(test.captureAccountProfile).not.toHaveBeenCalled();
+    test.getAppMode.mockResolvedValueOnce("offline");
+    await expect(test.handler({}, input)).rejects.toThrow(
+      "explicit cloud account"
+    );
+    expect(test.databaseManager.isOpen).not.toHaveBeenCalled();
+    expect(test.putSnapshot).not.toHaveBeenCalled();
+    await test.handler({}, input);
+    expect(test.putSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining(input),
+      test.profile.signal
+    );
+  });
+
+  it("rejects retired imports but saves local metadata with no account check", async () => {
+    const test = setup(IPC_CHANNELS.scriptProjectsPut);
+    test.profile.abort();
+    await expect(test.handler({}, input)).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    expect(test.databaseManager.isOpen).not.toHaveBeenCalled();
+    const state = { url: "https://fixture.example/image.png" };
+    await test.handler({}, { projectId: "fixture", state });
+    expect(test.getAppMode).not.toHaveBeenCalled();
+    expect(test.captureAccountProfile).toHaveBeenCalledTimes(1);
+    expect(test.putSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: "fixture",
+        state,
+        metadataOnly: true
+      }),
+      undefined
+    );
+  });
+
+  it.each(["import", "cache"])(
+    "does not open the DB after a retired %s root lookup",
+    async (route) => {
+      const test = setup(
+        route === "import"
+          ? IPC_CHANNELS.scriptProjectsPut
+          : IPC_CHANNELS.scriptProjectsCacheMedia
+      );
+      const root = deferred<string>();
+      test.databaseManager.isOpen.mockReturnValue(false);
+      test.getLibraryRoot.mockReturnValueOnce(root.promise);
+      const pending =
+        route === "import"
+          ? test.handler({}, input)
+          : test.handler({}, "fixture", "https://fixture.example/image.png");
+      const rejected = expect(pending).rejects.toMatchObject({
+        name: "AbortError"
+      });
+      await vi.waitFor(() =>
+        expect(test.getLibraryRoot).toHaveBeenCalledOnce()
+      );
+      test.profile.abort();
+      root.resolve("/fixture/library");
+      await rejected;
+      expect(test.databaseManager.open).not.toHaveBeenCalled();
+      expect(test.putSnapshot).not.toHaveBeenCalled();
+      expect(test.cacheMedia).not.toHaveBeenCalled();
+    }
+  );
+
+  it("drains a lazy open already issued but does not start the import", async () => {
+    const test = setup(IPC_CHANNELS.scriptProjectsPut);
+    const open = deferred<void>();
+    test.databaseManager.isOpen.mockReturnValue(false);
+    test.databaseManager.open.mockReturnValueOnce(open.promise);
+    const rejected = expect(test.handler({}, input)).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await vi.waitFor(() =>
+      expect(test.databaseManager.open).toHaveBeenCalledOnce()
+    );
+    test.profile.abort();
+    const drained = vi.fn();
+    const drain = test.profileIo.drainRetired().then(drained);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(drained).not.toHaveBeenCalled();
+    open.resolve();
+    await Promise.all([drain, rejected]);
+    expect(test.putSnapshot).not.toHaveBeenCalled();
+  });
+});
+
 describe("Director sheet description session IPC", () => {
   it("forwards the captured session to updates", async () => {
     const test = setup(IPC_CHANNELS.scriptProjectsUpdate);
@@ -68,7 +205,12 @@ describe("Director sheet description session IPC", () => {
       payload: { token: "hero" }
     };
     await test.handler({}, input);
-    expect(test.update).toHaveBeenCalledWith(input, test.controller.signal);
+    expect(test.update).toHaveBeenCalledWith(
+      input,
+      test.controller.signal,
+      undefined,
+      undefined
+    );
   });
 
   it("checks trust before session capture or database access", async () => {

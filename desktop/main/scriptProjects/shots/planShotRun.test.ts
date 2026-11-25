@@ -68,8 +68,8 @@ const FAL_SETTINGS = { ...SETTINGS, render_provider: FAL_SHOT_PROVIDER };
 
 describe("planShotRun fal sequential frames", () => {
   it.each(
-    FRAME_MODES.filter((config) => config.opening_frame !== "pin").flatMap(
-      (config) => [false, true].map((sameRun) => ({ config, sameRun }))
+    FRAME_MODES.flatMap((config) =>
+      [false, true].map((sameRun) => ({ config, sameRun }))
     )
   )(
     "allows $config with same-run predecessor: $sameRun",
@@ -113,16 +113,27 @@ describe("planShotRun fal sequential frames", () => {
     }
   );
 
-  it.each(
-    [false, true].flatMap((sameRun) =>
-      [
-        [1280, 720],
-        [720, 1280]
-      ].map((outputSize) => ({ sameRun, outputSize }))
-    )
-  )(
-    "blocks pin with same-run predecessor: $sameRun and output size: $outputSize",
-    ({ sameRun, outputSize }) => {
+  it.each([
+    {
+      aspect: "16:9",
+      width: 1344,
+      height: 768,
+      sameRun: false,
+      blocked: false
+    },
+    {
+      aspect: "9:16",
+      width: 768,
+      height: 1344,
+      sameRun: false,
+      blocked: false
+    },
+    { aspect: "9:16", width: 1344, height: 768, sameRun: false, blocked: true },
+    { aspect: "9:16", width: 1344, height: 768, sameRun: true, blocked: false }
+  ])(
+    "checks saved frame geometry unless the predecessor is in this run: %j",
+    ({ aspect, width, height, sameRun, blocked }) => {
+      const old = rendered("shot-1", "old", "previous-video");
       const run = plan(
         [
           shot(1),
@@ -135,26 +146,76 @@ describe("planShotRun fal sequential frames", () => {
           })
         ],
         {
-          videoSettings: FAL_SETTINGS,
-          outputSize,
+          videoSettings: {
+            ...FAL_SETTINGS,
+            provider_settings: { aspect_ratio: aspect }
+          },
           ...(sameRun ? {} : { timelineIds: ["shot-2"] })
         },
-        { cutShots: [rendered("shot-1", "old", "previous-video")] }
+        {
+          cutShots: [
+            {
+              ...old,
+              versions: [
+                {
+                  ...old.versions[0],
+                  decoded_frame_dimensions: { width, height }
+                }
+              ]
+            }
+          ]
+        }
       );
       expect(run.preview.would_run_timeline_ids).toEqual(
-        sameRun ? ["shot-1"] : []
+        sameRun ? ["shot-1", "shot-2"] : blocked ? [] : ["shot-2"]
       );
-      expect(run.preview.blocked).toEqual([
-        expect.objectContaining({
-          timeline_id: "shot-2",
-          reason_code: "unsupported_opening_frame",
-          reason: expect.stringContaining(
-            "start image also determines the canvas"
-          )
-        })
-      ]);
+      expect(run.preview.blocked).toEqual(
+        blocked
+          ? [
+              expect.objectContaining({
+                timeline_id: "shot-2",
+                reason_code: "fal_opening_frame_aspect_mismatch",
+                reason: expect.stringContaining("Change the shot’s aspect")
+              })
+            ]
+          : []
+      );
     }
   );
+
+  it("keeps nine numbered references and refuses raw prompts addressing the old continuity slot", () => {
+    const refs = Array.from({ length: 9 }, (_, index) => ({
+      asset_id: "sheet-" + index
+    }));
+    const preview = (prompt: string) =>
+      plan(
+        [
+          shot(1),
+          shot(2, {
+            references: { characters: refs },
+            video_prompt: prompt,
+            sequential: {
+              enabled: true,
+              mode: "last_frame",
+              opening_frame: "pin"
+            }
+          })
+        ],
+        {
+          videoSettings: { ...FAL_SETTINGS, prompt_rewrite: "raw" },
+          timelineIds: ["shot-2"]
+        },
+        {
+          cutShots: [rendered("shot-1", "old", "previous-video")]
+        }
+      ).preview;
+    expect(preview("Image 9").would_run_timeline_ids).toEqual(["shot-2"]);
+    expect(preview("Image 10").blocked).toEqual([
+      expect.objectContaining({
+        reason_code: "fal_opening_frame_numbered_reference"
+      })
+    ]);
+  });
 
   it("plans a video tail with an independent modality and sourced pricing examples", () => {
     const run = plan(

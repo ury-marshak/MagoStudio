@@ -69,11 +69,14 @@ export function useVideoFrame({
             frameNumber,
             fps: fps!
           })
-        : await extractFrameFromVideo({
-            videoSource: videoUrl!,
-            frameNumber,
-            fps
-          });
+        : await extractFrameFromVideo(
+            {
+              videoSource: videoUrl!,
+              frameNumber,
+              fps
+            },
+            work
+          );
       work.check();
       saveFrameToCache(assetId!, frameNumber, frame, fps, work).catch(() => {});
       return frame;

@@ -13,6 +13,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { getLocalDesktopApi, isLocalApp } from "@/platform/localDesktop";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 
 export const useDownloadImageToVideoRender = (
   track: Layer,
@@ -20,40 +21,54 @@ export const useDownloadImageToVideoRender = (
 ) => {
   const { t } = useTranslation();
   const { showToast } = useToast();
-  const [isDownloadingRenderVideo, setIsDownloadingRenderVideo] =
-    useState(false);
+  const { work } = useRendererLibraryWork();
+  const [downloadingWork, setDownloadingWork] = useState<typeof work | null>(
+    null
+  );
+  const isDownloadingRenderVideo =
+    downloadingWork === work && !work.signal.aborted;
 
   const downloadRenderVideo = async () => {
-    setIsDownloadingRenderVideo(true);
+    if (work.signal.aborted) return;
+    setDownloadingWork(work);
 
     try {
+      await work.ready();
+      work.check();
       const fileName = `${sanitizeDownloadFilename(track.name)}.mp4`;
       if (!isLocalApp) {
         const videoBlob = await downloadLayerVideo({ layerId: track.id });
+        work.check();
         triggerBlobDownload(videoBlob, fileName);
       } else {
         const isTrackStoredInCloud = await isTrackOwnedByCloud({
           projectId,
           trackId: track.id
         });
+        work.check();
         const trackAssetId = getTrackAssetId(track);
         const mirroredTrackAsset =
           isTrackStoredInCloud && trackAssetId
             ? await getLocalDesktopApi().assets.get(trackAssetId)
             : null;
+        work.check();
         const isCloudRenderVideoOnlyInCloud =
           isTrackStoredInCloud &&
           !isCloudMirroredAssetCachedLocally(mirroredTrackAsset);
         if (isCloudRenderVideoOnlyInCloud) {
-          await saveLayerDownloadToDisk({
-            layerId: track.id,
-            kind: "video",
-            suggestedName: fileName
-          });
+          await saveLayerDownloadToDisk(
+            {
+              layerId: track.id,
+              kind: "video",
+              suggestedName: fileName
+            },
+            work
+          );
         } else {
-          await saveTrackVideoToDisk({ track, fileName });
+          await saveTrackVideoToDisk({ track, fileName }, work);
         }
       }
+      work.check();
       trackingUtils.exportActions.exportMedias({
         trackId: track.id,
         assetId: getTrackAssetId(track) ?? "",
@@ -62,11 +77,12 @@ export const useDownloadImageToVideoRender = (
         exportType: "video"
       });
     } catch {
+      if (work.signal.aborted) return;
       showToast({
         message: t("projectTimeline.imageToVideo.downloadFailed.label")
       });
     } finally {
-      setIsDownloadingRenderVideo(false);
+      if (!work.signal.aborted) setDownloadingWork(null);
     }
   };
 

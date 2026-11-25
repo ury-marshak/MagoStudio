@@ -556,7 +556,9 @@ const SequentialBlockedReasonCodeSchema = z
     "no_prompt",
     "no_reference_image",
     "duration_out_of_range",
-    "unsupported_opening_frame"
+    "unsupported_opening_frame",
+    "fal_opening_frame_aspect_mismatch",
+    "fal_opening_frame_numbered_reference"
   ])
   .nullable()
   .optional()

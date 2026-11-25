@@ -15,6 +15,7 @@ import {
   setApiKey
 } from "@/lib/backend-api-client";
 import { isCloudAccountActive } from "@/platform/cloudAccount";
+import { captureRendererAccountProfile } from "@/platform/rendererAccountProfile";
 
 export const BackendApiProvider = ({
   children
@@ -29,15 +30,26 @@ export const BackendApiProvider = ({
 
   useEffect(() => {
     if (!isLoaded || !isCloudAccountActive()) return;
+    const profile = captureRendererAccountProfile();
+    if (profile?.aborted) return;
 
     if (!isSignedIn) {
       router.push(hasAccountCookie() ? "/sign-in" : "/sign-up");
       return;
     }
 
-    initializeBackendApiClient(getToken);
+    const controller = new AbortController();
+    const signal = profile
+      ? AbortSignal.any([controller.signal, profile])
+      : controller.signal;
+    // The IPC notification aborts cooperative transports. Recheck with main at
+    // settlement as the response can beat the notification into the renderer.
+    const isCurrent = () => !signal.aborted && isCloudAccountActive();
 
-    registerUnauthorizedHandler(() => router.push("/sign-in"));
+    initializeBackendApiClient(getToken);
+    registerUnauthorizedHandler(() => {
+      if (isCurrent()) router.push("/sign-in");
+    });
 
     let fetchApiUrl = API_URL.replace("/v02", "");
     if (fetchApiUrl.endsWith("/")) {
@@ -45,12 +57,11 @@ export const BackendApiProvider = ({
     }
     fetchApiUrl = `${fetchApiUrl}/auth`;
 
-    let active = true;
     const fetchApiKey = async () => {
       try {
-        if (!isCloudAccountActive()) return;
+        if (!isCurrent()) return;
         const token = await getToken({ template: "basicToken" });
-        if (!active || !isCloudAccountActive()) return;
+        if (!isCurrent()) return;
         const response = await axios.post<{
           api_key: string;
           key_id: string;
@@ -59,16 +70,17 @@ export const BackendApiProvider = ({
           fetchApiUrl,
           {},
           {
+            signal,
             headers: {
               Authorization: `Bearer ${token}`
             }
           }
         );
 
-        if (!active || !isCloudAccountActive()) return;
+        if (!isCurrent()) return;
         setApiKey(response.data.api_key);
       } catch (error) {
-        if (!active || !isCloudAccountActive()) return;
+        if (!isCurrent()) return;
         rejectApiKeyInitialization(error);
         console.error("Failed to fetch API key:", error);
         router.push("/api-key-error");
@@ -76,9 +88,7 @@ export const BackendApiProvider = ({
     };
 
     void fetchApiKey();
-    return () => {
-      active = false;
-    };
+    return () => controller.abort();
   }, [getToken, isSignedIn, isLoaded, router]);
 
   return children;

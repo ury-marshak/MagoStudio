@@ -8,6 +8,8 @@ import {
 } from "@domains/asset/utils/filmstripCache";
 import { useQuery } from "@tanstack/react-query";
 
+import { releaseRendererObjectUrl } from "@/platform/rendererObjectUrl";
+
 interface UseMediaBunnyFilmstripProps {
   assetId: string;
   trackId: string;
@@ -84,7 +86,7 @@ export function useMediaBunnyFilmstrip({
           frameHeight: 65
         });
       } finally {
-        if (downloadedVideo) URL.revokeObjectURL(sourceUrl);
+        if (downloadedVideo) releaseRendererObjectUrl(sourceUrl);
       }
 
       if (filmstrip) {

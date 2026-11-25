@@ -4,7 +4,7 @@ import { isLongFormRunPath } from "@domains/longFormRun/utils/isLongFormRunPath"
 import { useMountEffect } from "@hooks/useMountEffect";
 import { useState } from "react";
 
-import { isCloudAccountActive } from "@/platform/cloudAccount";
+import { captureRendererCloudAccountScope } from "@/platform/rendererCloudAccountScope";
 
 import { getAmplitudeAutocaptureOptions } from "./getAmplitudeAutocaptureOptions";
 
@@ -18,7 +18,8 @@ export const AmplitudeProvider: React.FC<Props> = ({ children }) => {
   const [isAmplitudeInitialized, setIsAmplitudeInitialized] = useState(false);
 
   useMountEffect(() => {
-    if (!isCloudAccountActive()) return;
+    const account = captureRendererCloudAccountScope();
+    if (!account.isActive()) return;
     if (!AMPLITUDE_API_KEY) {
       if (process.env.NODE_ENV === "production") {
         console.error("AMPLITUDE_API_KEY is not set");
@@ -26,33 +27,62 @@ export const AmplitudeProvider: React.FC<Props> = ({ children }) => {
       return;
     }
 
-    amplitude
+    let disposed = false;
+    const isActive = () => !disposed && account.isActive();
+    const optOut = () => amplitude.setOptOut(true);
+    account.signal?.addEventListener("abort", optOut, { once: true });
+
+    const initialized = amplitude
       .init(AMPLITUDE_API_KEY, undefined, {
         autocapture: getAmplitudeAutocaptureOptions()
       })
       .promise.then(() => {
-        if (isCloudAccountActive()) setIsAmplitudeInitialized(true);
+        if (account.signal?.aborted) optOut();
+        if (!isActive()) return false;
+        setIsAmplitudeInitialized(true);
+        return true;
       })
       .catch((error) => {
-        console.error("Amplitude initialization failed", error);
+        if (isActive()) console.error("Amplitude initialization failed", error);
+        return false;
       });
 
     if (!isLongFormRunPath(window.location.pathname)) {
-      import("@amplitude/plugin-session-replay-browser")
-        .then(({ sessionReplayPlugin }) => {
-          if (!isCloudAccountActive()) return;
-          amplitude.add(
-            sessionReplayPlugin({
-              sampleRate: 0.5,
-              privacyConfig: { defaultMaskLevel: "conservative" },
-              useWebWorker: true
-            })
-          );
+      void Promise.all([
+        initialized,
+        import("@amplitude/plugin-session-replay-browser")
+      ])
+        .then(async ([ready, { sessionReplayPlugin }]) => {
+          if (!ready || !isActive()) return;
+          const plugin = sessionReplayPlugin({
+            sampleRate: 0.5,
+            privacyConfig: { defaultMaskLevel: "conservative" },
+            useWebWorker: true
+          });
+          const remove = () => {
+            void amplitude.remove(plugin.name).promise.catch(() => {});
+          };
+          try {
+            await amplitude.add(plugin).promise;
+          } catch (error) {
+            // A setup that rejects may not have registered for SDK removal.
+            if (account.signal?.aborted) await plugin.teardown?.();
+            throw error;
+          }
+          // Removal during setup can miss a not-yet-registered plugin.
+          if (!account.signal) return;
+          if (!account.isActive()) remove();
+          else account.signal.addEventListener("abort", remove, { once: true });
         })
         .catch((error) => {
-          console.error("Session replay plugin failed to load", error);
+          if (isActive())
+            console.error("Session replay plugin failed to load", error);
         });
     }
+    return () => {
+      disposed = true;
+      // Keep the retirement opt-out/removal for the window-owned SDK.
+    };
   });
 
   return (

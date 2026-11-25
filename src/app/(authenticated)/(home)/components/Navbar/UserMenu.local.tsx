@@ -62,6 +62,8 @@ export function UserMenu() {
     null
   );
   const [signInError, setSignInError] = useState<string | null>(null);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+  const signingOut = useRef(false);
   const [libraryError, setLibraryError] = useState<string | null>(null);
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
     null
@@ -346,13 +348,24 @@ export function UserMenu() {
   }, [t]);
 
   const handleSignOut = useCallback(async () => {
-    if (!window.confirm(t("localSettings.signOutConfirm"))) return;
-    await signOut();
-    // Drops the stored mode entirely rather than switching to "offline" --
-    // identity mode is baked into the window at boot (see identity.tsx), so
-    // this takes the same rebuild the sign-in gate uses, and lands back on
-    // that gate so there is still a way to sign back in afterwards.
-    await window.mago.account.signOut();
+    if (
+      signingOut.current ||
+      !window.confirm(t("localSettings.signOutConfirm"))
+    )
+      return;
+    signingOut.current = true;
+    const account = window.mago.account;
+    try {
+      setSignOutError(null);
+      await account.beginSignOut();
+      // The desktop replacement owns navigation after Clerk clears its session.
+      await signOut(() => undefined);
+      await account.signOut();
+    } catch (error) {
+      setSignOutError(error instanceof Error ? error.message : String(error));
+    } finally {
+      signingOut.current = false;
+    }
   }, [signOut, t]);
 
   return (
@@ -436,6 +449,11 @@ export function UserMenu() {
               onSignOut={() => void handleSignOut()}
               onNavigateAway={() => void saveComfyEndpoint()}
             />
+            {signOutError && (
+              <Text variant="xs" color="glyph-error">
+                {signOutError}
+              </Text>
+            )}
           </TabPanel>
           <TabPanel
             id={LOCAL_SETTINGS_TAB_IDS.models}

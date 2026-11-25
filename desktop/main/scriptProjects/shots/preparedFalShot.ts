@@ -20,6 +20,13 @@ import {
 import type { ExternalRenderJob } from "../../providers/externalRenderJobRepository";
 import { fingerprint } from "../renderSpec";
 
+import {
+  falOpeningFrameSchema,
+  FAL_OPENING_FRAME_POLICY,
+  hasUnboundImageNumber,
+  openingFrameMatchesAspect
+} from "./falOpeningFrame";
+
 const maxKeyframes = 4;
 const minOutputSeconds = 5;
 const maxOutputSeconds = 15;
@@ -34,7 +41,7 @@ const selection = z.discriminatedUnion("mode", [
   z.strictObject({
     mode: z.literal("last_frame"),
     prompt_appendix: z.string(),
-    opening_frame: z.enum(["cut", "off"]).optional()
+    opening_frame: z.enum(["cut", "off", "pin"]).optional()
   }),
   z.strictObject({
     mode: z.literal("key_frames"),
@@ -66,6 +73,7 @@ const schema = z.strictObject({
   duration: z.number().min(minOutputSeconds).max(maxOutputSeconds),
   settings,
   image_ids: z.array(id).max(FAL_SHOT_IMAGE_SLOTS),
+  opening_frame: falOpeningFrameSchema.optional(),
   video_inputs: z
     .array(
       z.strictObject({
@@ -157,9 +165,11 @@ export const preparedShotCost = (
 export const parsePreparedFalShot = (value: unknown): PreparedFalShot => {
   const parsed = schema.parse(value);
   const { digest: savedDigest, ...body } = parsed;
+  const opener = parsed.opening_frame;
   const ids = [
     ...parsed.image_ids,
-    ...parsed.video_inputs.map((video) => video.asset_id)
+    ...parsed.video_inputs.map((video) => video.asset_id),
+    ...(opener ? [opener.asset_id] : [])
   ];
   const continuation = parsed.continues_from;
   const predecessor = parsed.predecessor;
@@ -183,6 +193,36 @@ export const parsePreparedFalShot = (value: unknown): PreparedFalShot => {
     )
   )
     throw new Error("The saved shot preparation is inconsistent");
+  const pin =
+    predecessor.selection?.mode === "last_frame" &&
+    predecessor.selection.opening_frame === "pin";
+  if (pin !== Boolean(opener))
+    throw new Error("The saved shot opening-frame selection is inconsistent");
+  if (opener) {
+    const spec = json.parse(parsed.render_spec.sequential);
+    if (
+      opener.asset_id !== continuation?.reference_asset_id ||
+      opener.predecessor_timeline_id !== predecessor.timeline_id ||
+      opener.predecessor_asset_id !== predecessor.asset_id ||
+      opener.aspect_ratio !== parsed.settings.aspect_ratio ||
+      !openingFrameMatchesAspect(
+        opener.width,
+        opener.height,
+        opener.aspect_ratio
+      ) ||
+      spec.opening_frame_preparation !== FAL_OPENING_FRAME_POLICY ||
+      spec.prev_asset_id !== predecessor.asset_id ||
+      !equal(spec.prepared_opening_frame, opener) ||
+      !equal(parsed.media_provenance.continuity?.opening_frame, opener) ||
+      parsed.image_slots.some((slot) => slot.role === "continuity") ||
+      parsed.video_inputs.length ||
+      continuation?.tail_provenance ||
+      hasUnboundImageNumber(parsed.prompt, parsed.image_ids.length)
+    )
+      throw new Error(
+        "The saved shot opening-frame provenance is inconsistent"
+      );
+  }
   if (predecessor.selection) {
     if (
       !continuation ||
@@ -209,10 +249,11 @@ export const parsePreparedFalShot = (value: unknown): PreparedFalShot => {
       )
         throw new Error("The saved shot video provenance is inconsistent");
     } else if (
-      parsed.video_inputs.length ||
-      parsed.image_slots.at(-1)?.role !== "continuity" ||
-      parsed.image_ids.at(-1) !== continuation.reference_asset_id ||
-      continuation.tail_provenance
+      !opener &&
+      (parsed.video_inputs.length ||
+        parsed.image_slots.at(-1)?.role !== "continuity" ||
+        parsed.image_ids.at(-1) !== continuation.reference_asset_id ||
+        continuation.tail_provenance)
     )
       throw new Error("The saved shot frame provenance is inconsistent");
   } else if (
@@ -285,6 +326,13 @@ export const assertPreparedShotOwner = (
     );
 };
 
+const uploadUrls = z.array(z.string().url());
+const matchesUploadArray = (value: unknown, count: number): boolean => {
+  if (!count) return value === undefined;
+  const parsed = uploadUrls.safeParse(value);
+  return parsed.success && parsed.data.length === count;
+};
+
 /** Accepted jobs are authoritative; never rebuild their uploaded request. */
 export const assertPreparedShotJob = (
   prepared: PreparedFalShot,
@@ -299,29 +347,29 @@ export const assertPreparedShotJob = (
   const {
     reference_image_urls: images,
     reference_video_urls: videos,
+    image_url: openingUrl,
     ...request
   } = job.requestJson;
-  const { seed, ...effective } = prepared.settings;
+  const { seed, aspect_ratio, ...effective } = prepared.settings;
   if (
     job.provider !== prepared.provider ||
     job.endpoint !== prepared.endpoint ||
     job.kind !== "video" ||
     !equal(job.inputAssetIds, [
       ...prepared.image_ids,
-      ...prepared.video_inputs.map((video) => video.asset_id)
+      ...prepared.video_inputs.map((video) => video.asset_id),
+      ...(prepared.opening_frame ? [prepared.opening_frame.asset_id] : [])
     ]) ||
-    (images === undefined
-      ? 0
-      : z.array(z.string().url()).parse(images).length) !==
-      prepared.image_ids.length ||
-    (videos === undefined
-      ? 0
-      : z.array(z.string().url()).parse(videos).length) !==
-      prepared.video_inputs.length ||
+    (prepared.opening_frame
+      ? !z.string().url().safeParse(openingUrl).success
+      : openingUrl !== undefined) ||
+    !matchesUploadArray(images, prepared.image_ids.length) ||
+    !matchesUploadArray(videos, prepared.video_inputs.length) ||
     !equal(request, {
       prompt: prepared.prompt,
       duration: prepared.duration,
       ...effective,
+      ...(prepared.opening_frame ? {} : { aspect_ratio }),
       ...(seed == null ? {} : { seed })
     })
   )

@@ -16,6 +16,8 @@ import {
   type MediaRenderState,
   RenderSubmissionRejected
 } from "./mediaRenderProvider";
+import { readProviderJson } from "./providerResponseBody";
+import { waitForInference } from "./sharedInference";
 
 const badRequest = 400;
 const unauthorized = 401;
@@ -53,6 +55,37 @@ const storageInitiate =
   "https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3";
 const uploadTimeoutMs = 120_000;
 
+const cancelUploadBody = async (response: Response, signal: AbortSignal) => {
+  try {
+    await response.body?.cancel();
+  } catch (error) {
+    // Fetch may already have errored the stream when its signal was aborted.
+    signal.throwIfAborted();
+    throw error;
+  }
+};
+
+const waitForLookup = <T>(
+  lookup: () => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> => {
+  if (!signal) return lookup();
+  signal.throwIfAborted();
+  // Install the abort wait before calling even a non-cooperative lookup.
+  return waitForInference(
+    Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return lookup();
+    }),
+    signal
+  );
+};
+
+const combineSignals = (origin?: AbortSignal, caller?: AbortSignal) =>
+  origin && caller && origin !== caller
+    ? AbortSignal.any([origin, caller])
+    : (origin ?? caller);
+
 const uploadToFal = async (
   key: string,
   file: Blob,
@@ -63,6 +96,7 @@ const uploadToFal = async (
   const signal = callerSignal
     ? AbortSignal.any([callerSignal, timeout])
     : timeout;
+  signal.throwIfAborted();
   const contentType = file.type || "application/octet-stream";
   const initiated = await fetch(storageInitiate, {
     method: "POST",
@@ -74,11 +108,14 @@ const uploadToFal = async (
     },
     body: JSON.stringify({ file_name: name, content_type: contentType })
   });
-  if (!initiated.ok) {
-    await initiated.body?.cancel();
+  if (signal.aborted || !initiated.ok) {
+    await cancelUploadBody(initiated, signal);
+    signal.throwIfAborted();
     throw new Error(`fal upload initiation returned HTTP ${initiated.status}`);
   }
-  const parsed = uploadResponse.safeParse(await initiated.json());
+  const response = await readProviderJson(initiated, signal);
+  signal.throwIfAborted();
+  const parsed = uploadResponse.safeParse(response);
   if (!parsed.success) throw new Error("fal returned invalid upload URLs");
   const uploaded = await fetch(parsed.data.upload_url, {
     method: "PUT",
@@ -87,7 +124,8 @@ const uploadToFal = async (
     headers: { "Content-Type": contentType },
     body: file
   });
-  await uploaded.body?.cancel();
+  await cancelUploadBody(uploaded, signal);
+  signal.throwIfAborted();
   if (!uploaded.ok)
     throw new Error(`fal upload returned HTTP ${uploaded.status}`);
   return parsed.data.file_url;
@@ -122,21 +160,27 @@ const outputFrom = (
 
 export class FalRenderProvider implements MediaRenderProvider {
   constructor(
-    private readonly getConfig: () => Promise<FalProviderConfig | null>,
+    private readonly getConfig: (
+      signal?: AbortSignal
+    ) => Promise<FalProviderConfig | null>,
     private readonly readKey = readExternalProviderKey
   ) {}
 
-  async prepareSubmission(endpoint: string) {
+  async prepareSubmission(endpoint: string, origin?: AbortSignal) {
     assertFalEndpoint(endpoint);
-    const config = await this.getConfig();
+    const config = await waitForLookup(() => this.getConfig(origin), origin);
+    origin?.throwIfAborted();
     if (!config) throw new Error("Configure the fal Keychain account first");
-    const key = await this.readKey(config.keychainAccount);
+    const key = await this.key(config.keychainAccount, origin);
+    origin?.throwIfAborted();
     const client = new FalQueueClient(key);
     return {
       keychainAccount: config.keychainAccount,
-      upload: (file: Blob, name: string, signal?: AbortSignal) =>
-        uploadToFal(key, file, name, signal),
-      submit: async (input: Record<string, unknown>, signal?: AbortSignal) => {
+      upload: (file: Blob, name: string, caller?: AbortSignal) =>
+        uploadToFal(key, file, name, combineSignals(origin, caller)),
+      submit: async (input: Record<string, unknown>, caller?: AbortSignal) => {
+        const signal = combineSignals(origin, caller);
+        signal?.throwIfAborted();
         try {
           return await client.submit(endpoint, input, signal);
         } catch (error) {
@@ -151,19 +195,40 @@ export class FalRenderProvider implements MediaRenderProvider {
     };
   }
 
+  async assertOutputAccess(
+    { keychainAccount }: MediaRenderRequest,
+    signal?: AbortSignal
+  ) {
+    const configured = await waitForLookup(
+      () => this.getConfig(signal),
+      signal
+    );
+    signal?.throwIfAborted();
+    if (!configured || configured.keychainAccount !== keychainAccount)
+      throw new Error(
+        "Restore the fal Keychain account used for this render in Settings → Providers, then resume the plan."
+      );
+  }
+
   async refresh(
-    { endpoint, requestId, keychainAccount }: MediaRenderRequest,
+    request: MediaRenderRequest,
     kind: MediaRenderKind,
     signal?: AbortSignal
   ): Promise<MediaRenderState> {
-    const client = await this.client(keychainAccount);
+    const { endpoint, requestId, keychainAccount } = request;
+    await this.assertOutputAccess(request, signal);
+    const key = await this.key(keychainAccount, signal);
+    signal?.throwIfAborted();
+    const client = new FalQueueClient(key);
     const status = await client.status(endpoint, requestId, signal);
+    signal?.throwIfAborted();
     if (status.status !== "COMPLETED") return { status: "PENDING" };
 
     let output: unknown;
     try {
       output = await client.result(endpoint, requestId, signal);
     } catch (error) {
+      signal?.throwIfAborted();
       if (!(error instanceof FalQueueHttpError)) throw error;
       if (error.status === renderCancelled) return { status: "CANCELLED" };
       if (
@@ -174,17 +239,23 @@ export class FalRenderProvider implements MediaRenderProvider {
         return { status: "FAILED", error: error.message };
       throw error;
     }
+    signal?.throwIfAborted();
     if (status.error || status.error_type)
       return { status: "FAILED", error: "fal reported that the render failed" };
     return { status: "OUTPUT_READY", outputJson: outputFrom(kind, output) };
   }
 
-  async cancel(
-    { endpoint, requestId, keychainAccount }: MediaRenderRequest,
-    signal?: AbortSignal
-  ) {
-    const client = await this.client(keychainAccount);
-    const result = await client.cancel(endpoint, requestId, signal);
+  async cancel(request: MediaRenderRequest, signal?: AbortSignal) {
+    const { endpoint, requestId, keychainAccount } = request;
+    await this.assertOutputAccess(request, signal);
+    const key = await this.key(keychainAccount, signal);
+    signal?.throwIfAborted();
+    const result = await new FalQueueClient(key).cancel(
+      endpoint,
+      requestId,
+      signal
+    );
+    signal?.throwIfAborted();
     if (result === "OK") return "CANCELLED";
     if (result === "CANCELLATION_REQUESTED") return result;
     if (result === "NOT_FOUND")
@@ -192,7 +263,7 @@ export class FalRenderProvider implements MediaRenderProvider {
     return "UNCHANGED";
   }
 
-  private async client(keychainAccount: string): Promise<FalQueueClient> {
-    return new FalQueueClient(await this.readKey(keychainAccount));
+  private key(keychainAccount: string, signal?: AbortSignal): Promise<string> {
+    return waitForLookup(() => this.readKey(keychainAccount, signal), signal);
   }
 }

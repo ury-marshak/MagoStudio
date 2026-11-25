@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, readFile, stat, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -18,6 +18,7 @@ import {
 import { parseAllowedCloudStorageUrl } from "../cloudStorage/parseAllowedCloudStorageUrl";
 import { LibraryWorkSession } from "../libraryWorkSession";
 import { createImageThumbnail } from "../media/imageThumbnail";
+import type { ProfileIoDrain } from "../providers/profileIoDrain";
 import { atomicWriteFile, publishFile } from "../storage/atomicFile";
 import { storedObject } from "../storage/storedJson";
 
@@ -128,6 +129,10 @@ type LocalizedMedia = { url: string; isImage: boolean };
 export class ScriptProjectSnapshotRepository {
   readonly libraryWork = new LibraryWorkSession(() => ({
     downloads: new Map<string, Promise<LocalizedMedia>>(),
+    profileDownloads: new WeakMap<
+      AbortSignal,
+      Map<string, Promise<LocalizedMedia>>
+    >(),
     thumbnailJobs: new Map<string, Promise<string | null>>(),
     pendingThumbnailStarts: [] as Array<() => void>,
     activeThumbnailBuilds: 0,
@@ -137,6 +142,14 @@ export class ScriptProjectSnapshotRepository {
   }));
   private get downloads() {
     return this.libraryWork.state.downloads;
+  }
+  private getProfileDownloads(profile: AbortSignal) {
+    const profiles = this.libraryWork.state.profileDownloads;
+    const existing = profiles.get(profile);
+    if (existing) return existing;
+    const downloads = new Map<string, Promise<LocalizedMedia>>();
+    profiles.set(profile, downloads);
+    return downloads;
   }
   private get thumbnailJobs() {
     return this.libraryWork.state.thumbnailJobs;
@@ -168,7 +181,8 @@ export class ScriptProjectSnapshotRepository {
     private readonly getLibraryRoot: () => Promise<string>,
     private readonly cloudStorage: CloudStorageAccess = {
       allowedHosts: resolveCloudConfig().cloudStorageHosts
-    }
+    },
+    private readonly profileIo?: ProfileIoDrain
   ) {
     // Own complete repository/media work independently of Director callers.
     // cacheMedia also drains sibling transfers when localization Promise.all
@@ -211,11 +225,27 @@ export class ScriptProjectSnapshotRepository {
     this.writeSnapshot = owned.writeSnapshot;
   }
 
-  async put(input: LocalScriptProjectSnapshotInput): Promise<void> {
+  private runProfileIo<T>(
+    profile: AbortSignal | undefined,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    this.libraryWork.capture();
+    profile?.throwIfAborted();
+    return this.profileIo?.run(profile, operation) ?? operation();
+  }
+
+  async put(
+    input: LocalScriptProjectSnapshotInput,
+    profile?: AbortSignal
+  ): Promise<void> {
+    const importProfile = input.intent === "cloud-import" ? profile : undefined;
+    importProfile?.throwIfAborted();
     const projectRowAcceptsSnapshot = await this.ensureProject(
       input.projectId,
-      input.project
+      input.project,
+      importProfile
     );
+    importProfile?.throwIfAborted();
     if (!projectRowAcceptsSnapshot) return;
 
     // Cloud mirrors persist metadata immediately and schedule media separately.
@@ -223,20 +253,29 @@ export class ScriptProjectSnapshotRepository {
     // Other callers retain the durable, fully localized write behavior.
     if (
       !input.metadataOnly &&
+      !profile?.aborted &&
       (hasRemoteMedia(input.state) || hasRemoteMedia(input.cut))
     ) {
-      await this.localizeSnapshotMedia(input);
-      return;
+      try {
+        await this.localizeSnapshotMedia(input, profile, importProfile);
+        return;
+      } catch (error) {
+        // Only local edits can fall back to their original URLs on retirement.
+        importProfile?.throwIfAborted();
+        if (!profile?.aborted || this.libraryWork.signal.aborted) throw error;
+      }
     }
 
     const snapshotValues = this.snapshotValues(input);
     if (Object.keys(snapshotValues).length > 0) {
-      await this.writeSnapshot(input.projectId, snapshotValues);
+      await this.writeSnapshot(input.projectId, snapshotValues, importProfile);
     }
   }
 
   private async localizeSnapshotMedia(
-    input: LocalScriptProjectSnapshotInput
+    input: LocalScriptProjectSnapshotInput,
+    profile: AbortSignal | undefined,
+    importProfile: AbortSignal | undefined
   ): Promise<void> {
     const localizedValues: Record<string, string | null> = {};
     let previewUrl: string | null = null;
@@ -253,13 +292,15 @@ export class ScriptProjectSnapshotRepository {
         value,
         (media) => {
           if (!previewUrl && media.isImage) previewUrl = media.url;
-        }
+        },
+        profile
       );
       localizedValues[columnKey] = JSON.stringify(localized);
     }
+    profile?.throwIfAborted();
     if (previewUrl) localizedValues.previewUrl = previewUrl;
     if (Object.keys(localizedValues).length > 0) {
-      await this.writeSnapshot(input.projectId, localizedValues);
+      await this.writeSnapshot(input.projectId, localizedValues, importProfile);
     }
   }
 
@@ -350,8 +391,10 @@ export class ScriptProjectSnapshotRepository {
   /** Downloads one HTTPS media file into the project, as snapshots do. */
   async cacheScheduledMedia(
     projectId: string,
-    sourceUrl: string
+    sourceUrl: string,
+    profile?: AbortSignal
   ): Promise<void> {
+    profile?.throwIfAborted();
     const key = JSON.stringify([projectId, stableMediaUrl(sourceUrl)]);
     const controller = new AbortController();
     const controllers =
@@ -362,19 +405,25 @@ export class ScriptProjectSnapshotRepository {
       const media = await this.cacheMedia(
         projectId,
         sourceUrl,
-        controller.signal
+        controller.signal,
+        profile
       );
+      profile?.throwIfAborted();
       if (media.isImage) {
-        await this.manager
-          .get()
-          .update(scriptProjectSnapshots)
-          .set({ previewUrl: media.url })
-          .where(
-            and(
-              eq(scriptProjectSnapshots.projectId, projectId),
-              isNull(scriptProjectSnapshots.previewUrl)
+        await this.runProfileIo(profile, () =>
+          this.manager
+            .get()
+            .update(scriptProjectSnapshots)
+            .set({ previewUrl: media.url })
+            .where(
+              and(
+                eq(scriptProjectSnapshots.projectId, projectId),
+                isNull(scriptProjectSnapshots.previewUrl)
+              )
             )
-          );
+            .run()
+        );
+        profile?.throwIfAborted();
       }
     } finally {
       controllers.delete(controller);
@@ -396,9 +445,16 @@ export class ScriptProjectSnapshotRepository {
   /** Downloads one HTTPS media file into the project, as snapshots do. */
   async storeRemoteMedia(
     projectId: string,
-    sourceUrl: string
+    sourceUrl: string,
+    profile?: AbortSignal
   ): Promise<{ id: string; url: string; isImage: boolean }> {
-    const media = await this.cacheMedia(projectId, sourceUrl);
+    const media = await this.cacheMedia(
+      projectId,
+      sourceUrl,
+      undefined,
+      profile
+    );
+    profile?.throwIfAborted();
     return { ...media, id: media.url.replace(/^.*\//, "") };
   }
 
@@ -433,8 +489,35 @@ export class ScriptProjectSnapshotRepository {
   async putPlan(
     projectId: string,
     planId: string,
-    plan: Record<string, unknown>
+    plan: Record<string, unknown>,
+    profile?: AbortSignal
   ): Promise<void> {
+    if (profile) {
+      // A Cloud submission checkpoint only updates an existing snapshot.
+      // Unlike put(), this path has no awaits between authority and the write.
+      profile.throwIfAborted();
+      const database = this.manager.get();
+      const [snapshot] = await database
+        .select()
+        .from(scriptProjectSnapshots)
+        .where(eq(scriptProjectSnapshots.projectId, projectId))
+        .limit(1);
+      if (!snapshot) throw new Error("Local script project snapshot not found");
+      const current = this.validateSnapshot(snapshot);
+      const planDetailsJson = JSON.stringify({
+        ...current.planDetails,
+        [planId]: plan
+      });
+      this.libraryWork.capture();
+      profile.throwIfAborted();
+      await database
+        .update(scriptProjectSnapshots)
+        .set({ planDetailsJson, updatedAt: new Date() })
+        .where(eq(scriptProjectSnapshots.projectId, projectId))
+        .run();
+      return;
+    }
+
     const current = await this.get(projectId);
     await this.put({
       projectId,
@@ -695,7 +778,8 @@ export class ScriptProjectSnapshotRepository {
 
   private async ensureProject(
     projectId: string,
-    project: Record<string, unknown> | undefined
+    project: Record<string, unknown> | undefined,
+    profile?: AbortSignal
   ): Promise<boolean> {
     const now = new Date();
     const database = this.manager.get();
@@ -704,6 +788,7 @@ export class ScriptProjectSnapshotRepository {
       .from(projects)
       .where(eq(projects.id, projectId))
       .limit(1);
+    profile?.throwIfAborted();
     const existingSettings = parseJson(existing?.settingsJson ?? null) ?? {};
     const existingRowIsLocalProject =
       !!existing && existingSettings.origin !== "cloud";
@@ -733,24 +818,23 @@ export class ScriptProjectSnapshotRepository {
       createdAt,
       updatedAt: createdAt
     };
-    if (!project) {
-      await database.insert(projects).values(values).onConflictDoNothing();
-      return true;
-    }
-    await database
-      .insert(projects)
-      .values(values)
-      .onConflictDoUpdate({
-        target: projects.id,
-        set: {
-          name: values.name,
-          description: values.description,
-          active: values.active,
-          settingsJson: values.settingsJson,
-          createdAt: values.createdAt,
-          updatedAt: values.updatedAt
-        }
-      });
+    await this.runProfileIo(profile, () => {
+      const insert = database.insert(projects).values(values);
+      if (!project) return insert.onConflictDoNothing().run();
+      return insert
+        .onConflictDoUpdate({
+          target: projects.id,
+          set: {
+            name: values.name,
+            description: values.description,
+            active: values.active,
+            settingsJson: values.settingsJson,
+            createdAt: values.createdAt,
+            updatedAt: values.updatedAt
+          }
+        })
+        .run();
+    });
     return true;
   }
 
@@ -789,7 +873,8 @@ export class ScriptProjectSnapshotRepository {
 
   private async writeSnapshot(
     projectId: string,
-    values: Record<string, string | null>
+    values: Record<string, string | null>,
+    profile?: AbortSignal
   ): Promise<void> {
     const [existing] = await this.manager
       .get()
@@ -799,24 +884,31 @@ export class ScriptProjectSnapshotRepository {
       .limit(1);
     if (existing) this.validateSnapshot(existing);
     const now = new Date();
-    await this.manager
-      .get()
-      .insert(scriptProjectSnapshots)
-      .values({ projectId, ...values, createdAt: now, updatedAt: now })
-      .onConflictDoUpdate({
-        target: scriptProjectSnapshots.projectId,
-        set: { ...values, updatedAt: now }
-      });
+    await this.runProfileIo(profile, () =>
+      this.manager
+        .get()
+        .insert(scriptProjectSnapshots)
+        .values({ projectId, ...values, createdAt: now, updatedAt: now })
+        .onConflictDoUpdate({
+          target: scriptProjectSnapshots.projectId,
+          set: { ...values, updatedAt: now }
+        })
+        .run()
+    );
+    profile?.throwIfAborted();
   }
 
   private async localizeMedia(
     projectId: string,
     value: unknown,
-    onMedia: (media: LocalizedMedia) => void
+    onMedia: (media: LocalizedMedia) => void,
+    profile?: AbortSignal
   ): Promise<unknown> {
     if (Array.isArray(value)) {
       return Promise.all(
-        value.map((member) => this.localizeMedia(projectId, member, onMedia))
+        value.map((member) =>
+          this.localizeMedia(projectId, member, onMedia, profile)
+        )
       );
     }
     if (!value || typeof value !== "object") return value;
@@ -829,19 +921,26 @@ export class ScriptProjectSnapshotRepository {
           member.startsWith("https://")
         ) {
           try {
-            const media = await this.cacheMedia(projectId, member);
+            const media = await this.cacheMedia(
+              projectId,
+              member,
+              undefined,
+              profile
+            );
             this.libraryWork.capture();
+            profile?.throwIfAborted();
             onMedia(media);
             return [key, media.url] as const;
           } catch (error) {
             this.libraryWork.capture();
+            profile?.throwIfAborted();
             console.warn("Failed to cache script-project media", error);
             return [key, member] as const;
           }
         }
         return [
           key,
-          await this.localizeMedia(projectId, member, onMedia)
+          await this.localizeMedia(projectId, member, onMedia, profile)
         ] as const;
       })
     );
@@ -851,7 +950,8 @@ export class ScriptProjectSnapshotRepository {
   private cacheMedia(
     projectId: string,
     sourceUrl: string,
-    cancelBeforeTransferStarts?: AbortSignal
+    cancelBeforeTransferStarts?: AbortSignal,
+    profile?: AbortSignal
   ): Promise<LocalizedMedia> {
     const parsedUrl = parseAllowedCloudStorageUrl(
       sourceUrl,
@@ -863,25 +963,28 @@ export class ScriptProjectSnapshotRepository {
     const mediaId = createHash("sha256")
       .update(`${projectId}\0${stableSource}`)
       .digest("hex");
-    const existingDownload = this.downloads.get(mediaId);
+    profile?.throwIfAborted();
+    const downloads = profile
+      ? this.getProfileDownloads(profile)
+      : this.downloads;
+    const existingDownload = downloads.get(mediaId);
     if (existingDownload) return existingDownload;
     const download = this.withDownloadSlot(() =>
       this.performMediaDownload(
         projectId,
         mediaId,
         sourceUrl,
-        cancelBeforeTransferStarts
+        cancelBeforeTransferStarts,
+        profile
       )
     );
-    this.downloads.set(mediaId, download);
+    downloads.set(mediaId, download);
     void download.then(
       () => {
-        if (this.downloads.get(mediaId) === download)
-          this.downloads.delete(mediaId);
+        if (downloads.get(mediaId) === download) downloads.delete(mediaId);
       },
       () => {
-        if (this.downloads.get(mediaId) === download)
-          this.downloads.delete(mediaId);
+        if (downloads.get(mediaId) === download) downloads.delete(mediaId);
       }
     );
     return download;
@@ -914,9 +1017,12 @@ export class ScriptProjectSnapshotRepository {
     projectId: string,
     mediaId: string,
     sourceUrl: string,
-    cancelBeforeTransferStarts?: AbortSignal
+    cancelBeforeTransferStarts?: AbortSignal,
+    profile?: AbortSignal
   ): Promise<LocalizedMedia> {
-    const signal = this.libraryWork.capture();
+    const library = this.libraryWork.capture();
+    const signal = profile ? AbortSignal.any([library, profile]) : library;
+    signal.throwIfAborted();
     const database = this.manager.get();
     const [cached] = await database
       .select()
@@ -930,6 +1036,7 @@ export class ScriptProjectSnapshotRepository {
       try {
         const existingFile = await stat(existingPath);
         if (existingFile.isFile() && existingFile.size > 0) {
+          signal.throwIfAborted();
           return {
             url: `mago-media://script-project/${cached.id}`,
             isImage: /\.(?:jpe?g|png|webp)$/i.test(existingPath)
@@ -942,65 +1049,69 @@ export class ScriptProjectSnapshotRepository {
 
     const url = new URL(sourceUrl);
     cancelBeforeTransferStarts?.throwIfAborted();
-    return withCloudStorageDownload(
-      {
-        ...this.cloudStorage,
-        url: sourceUrl,
-        signal
-      },
-      async (download) => {
-        const contentType = download.headers.get("content-type") ?? undefined;
-        const extension = mediaExtension(contentType, url);
-        const projectDirectory = createHash("sha256")
-          .update(projectId)
-          .digest("hex")
-          .slice(0, PROJECT_DIRECTORY_HASH_LENGTH);
-        const relativePath = path.join(
-          "script-projects",
-          projectDirectory,
-          `${mediaId}.${extension}`
-        );
-        const destination = path.join(libraryRoot, relativePath);
-        const temporary = `${destination}.partial`;
-        await mkdir(path.dirname(destination), { recursive: true });
-        await unlink(temporary).catch(() => {});
-        try {
-          signal.throwIfAborted();
-          await pipeline(download.body, createWriteStream(temporary), {
-            signal
-          });
-          signal.throwIfAborted();
-          if ((await stat(temporary)).size === 0) {
-            throw new Error("Downloaded script-project media was empty");
+    signal.throwIfAborted();
+    const transfer = () =>
+      withCloudStorageDownload(
+        {
+          ...this.cloudStorage,
+          url: sourceUrl,
+          signal
+        },
+        async (download) => {
+          const contentType = download.headers.get("content-type") ?? undefined;
+          const extension = mediaExtension(contentType, url);
+          const projectDirectory = createHash("sha256")
+            .update(projectId)
+            .digest("hex")
+            .slice(0, PROJECT_DIRECTORY_HASH_LENGTH);
+          const relativePath = path.join(
+            "script-projects",
+            projectDirectory,
+            `${mediaId}.${extension}`
+          );
+          const destination = path.join(libraryRoot, relativePath);
+          const temporary = `${destination}.${randomUUID()}.partial`;
+          await mkdir(path.dirname(destination), { recursive: true });
+          try {
+            signal.throwIfAborted();
+            await pipeline(download.body, createWriteStream(temporary), {
+              signal
+            });
+            signal.throwIfAborted();
+            if ((await stat(temporary)).size === 0) {
+              throw new Error("Downloaded script-project media was empty");
+            }
+            signal.throwIfAborted();
+            await publishFile(temporary, destination, signal);
+            signal.throwIfAborted();
+          } catch (error) {
+            await unlink(temporary).catch(() => {});
+            throw error;
           }
-          signal.throwIfAborted();
-          await publishFile(temporary, destination);
-          signal.throwIfAborted();
-        } catch (error) {
-          await unlink(temporary).catch(() => {});
-          throw error;
-        }
 
-        const now = new Date();
-        await database
-          .insert(scriptProjectMedia)
-          .values({
-            id: mediaId,
-            projectId,
-            sourceUrl,
-            relativePath,
-            createdAt: now,
-            updatedAt: now
-          })
-          .onConflictDoUpdate({
-            target: scriptProjectMedia.id,
-            set: { sourceUrl, relativePath, updatedAt: now }
-          });
-        return {
-          url: `mago-media://script-project/${mediaId}`,
-          isImage: /^(?:jpg|jpeg|png|webp)$/.test(extension)
-        };
-      }
-    );
+          signal.throwIfAborted();
+          const now = new Date();
+          await database
+            .insert(scriptProjectMedia)
+            .values({
+              id: mediaId,
+              projectId,
+              sourceUrl,
+              relativePath,
+              createdAt: now,
+              updatedAt: now
+            })
+            .onConflictDoUpdate({
+              target: scriptProjectMedia.id,
+              set: { sourceUrl, relativePath, updatedAt: now }
+            })
+            .run();
+          return {
+            url: `mago-media://script-project/${mediaId}`,
+            isImage: /^(?:jpg|jpeg|png|webp)$/.test(extension)
+          };
+        }
+      );
+    return this.runProfileIo(profile, transfer);
   }
 }

@@ -1,3 +1,4 @@
+import { rendererCloudBackgroundWork } from "@domains/cloud/rendererCloudBackgroundWork";
 import { writeScriptProjectSnapshot } from "@domains/scriptProject/scriptProjectSnapshot";
 import { syncCloudProjectMetadata } from "@domains/scriptProject/syncCloudScriptProjects";
 import { Project, ProjectSchema } from "@schemas/project";
@@ -65,11 +66,12 @@ export const updateProject = async (
     !localProject ||
     (localProject.origin === "cloud" && desktop.account.mode === "cloud")
   ) {
+    const cloudWork = desktop ? rendererCloudBackgroundWork(work) : work;
     const { settingsToPut, settingsToCache } = await resolveCloudPutSettings(
       params,
-      work
+      cloudWork
     );
-    const response = await runRendererLibraryRequest(work, (signal) =>
+    const response = await runRendererLibraryRequest(cloudWork, (signal) =>
       backendApiClient.put(
         `/projects/${projectId}`,
         {
@@ -80,19 +82,20 @@ export const updateProject = async (
         { signal }
       )
     );
-    work.check();
+    cloudWork.check();
     if (localProject?.type === "script_to_shots") {
       await writeScriptProjectSnapshot(
         {
           projectId,
+          intent: "cloud-import",
           project: response.data as Record<string, unknown>
         },
-        work
+        cloudWork
       );
     } else if (localProject?.origin === "cloud") {
-      await syncCloudProjectMetadata(projectId, work);
+      await syncCloudProjectMetadata(projectId, cloudWork);
     }
-    work.check();
+    cloudWork.check();
     return settingsToCache as Project["settings"] | undefined;
   }
   const storedLocalProjectSettings =

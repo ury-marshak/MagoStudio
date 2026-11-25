@@ -30,6 +30,7 @@ export const downloadSetupRequirementIntoFolder = async (
   const packDirectory = path.join(folder, filename.replace(/\.zip$/, ""));
   const hasExistingNodePack =
     isNode && Boolean(await stat(packDirectory).catch(() => null));
+  signal?.throwIfAborted();
   if (hasExistingNodePack && !replaceExistingNodePack)
     throw new NodePackAlreadyInstalledError(packDirectory);
   if (isNode && !requirement.downloadSha256)
@@ -40,6 +41,7 @@ export const downloadSetupRequirementIntoFolder = async (
       : null;
   const isCachedNodePackArchiveTrusted =
     cachedNodePackArchiveSha256 === requirement.downloadSha256;
+  signal?.throwIfAborted();
   if (cachedNodePackArchiveSha256 !== null && !isCachedNodePackArchiveTrusted)
     await rename(destination, destination + ".invalid-" + randomUUID());
   if (!isCachedNodePackArchiveTrusted)
@@ -67,11 +69,13 @@ export const downloadSetupRequirementIntoFolder = async (
       await extractNodePack(
         destination,
         extractionTarget,
-        requirement.archiveStripRoot
+        requirement.archiveStripRoot,
+        signal
       );
     } catch (error) {
       if (hasExistingNodePack)
         await rm(stagedNodePack, { recursive: true, force: true });
+      signal?.throwIfAborted();
       if (
         error instanceof Error &&
         /CRC|Invalid ZIP|ZIP entry size/.test(error.message)
@@ -92,11 +96,13 @@ export const downloadSetupRequirementIntoFolder = async (
           replacedNodePack: path.join(
             backupsFolder,
             `${path.basename(packDirectory)}-${Date.now()}`
-          )
+          ),
+          signal
         });
       } finally {
         await rm(stagedNodePack, { recursive: true, force: true });
       }
+    signal?.throwIfAborted();
     return packDirectory;
   }
   return destination;

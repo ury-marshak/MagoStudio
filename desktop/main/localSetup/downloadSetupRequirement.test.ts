@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCAL_SCRIPT_MODEL_FILES } from "../scriptProjects/comfyScriptProjectClient";
 
 import { downloadSetupRequirement } from "./downloadSetupRequirement";
+import { deferred } from "./setupTestUtils";
 const { picker } = vi.hoisted(() => ({ picker: vi.fn() }));
 vi.mock("electron", () => ({ dialog: { showOpenDialog: picker } }));
 const settings = {
@@ -55,6 +56,21 @@ describe("requirement downloads", () => {
       "model bytes"
     );
   });
+  it("ignores a folder picker approval that arrives after profile retirement", async () => {
+    const profile = new AbortController();
+    const choice = deferred<unknown>();
+    picker.mockReturnValueOnce(choice.promise);
+    const old = expect(
+      downloadSetupRequirement(window, settings, filename, profile.signal)
+    ).rejects.toThrow();
+    await vi.waitFor(() => expect(picker).toHaveBeenCalledOnce());
+    profile.abort();
+    choice.resolve({ canceled: false, filePaths: [directory] });
+    await old;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(await readdir(directory)).toEqual([]);
+  });
+
   it("does not download when the picker is canceled", async () => {
     picker.mockResolvedValue({ canceled: true, filePaths: [] });
     expect(

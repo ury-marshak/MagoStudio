@@ -160,7 +160,8 @@ const request = (rewrite = "raw", timelineIds = ["shot-2"]) => ({
 const waitPlan = async (planId: string, status: string) => {
   await vi.waitFor(
     async () => {
-      expect(await director.getPlan(planId)).toMatchObject({ status });
+      const plan = await director.getPlan(planId);
+      expect(plan?.status, JSON.stringify(plan?.error)).toBe(status);
     },
     { timeout: 10000, interval: 20 }
   );
@@ -307,6 +308,185 @@ afterEach(async () => {
   await rm(directory, { recursive: true, force: true });
   expect(unexpected).toEqual([]);
   expect(getComfyEndpoint).not.toHaveBeenCalled();
+});
+
+const openingPin = { mode: "last_frame", opening_frame: "pin" };
+const pinRequest = (
+  rewrite = "raw",
+  timelineIds = ["shot-2"],
+  aspect = "4:3"
+) => ({
+  ...request(rewrite, timelineIds),
+  videoSettings: {
+    ...request(rewrite).videoSettings,
+    provider_settings: { aspect_ratio: aspect }
+  }
+});
+const savedOpener = (plan: Row) =>
+  parsePreparedFalShot(row(plan.local_prepared_shots)["shot-2"]).opening_frame!;
+
+describe("fal pinned opening frames", () => {
+  it("uploads the exact frozen final frame separately and saves the request sent to fal", async () => {
+    await seed(openingPin);
+    const expected = await media.extractLastFrame(source.path);
+    expect(expected).not.toEqual(png);
+    const putPlan = snapshots.putPlan.bind(snapshots);
+    let repinned = false;
+    vi.spyOn(snapshots, "putPlan").mockImplementation(
+      async (project, id, plan) => {
+        await putPlan(project, id, plan);
+        if (!repinned && rows(plan.local_targets ?? []).length) {
+          repinned = true;
+          const cut = (await snapshots.get(projectId))!.cut!;
+          Object.assign(rows(cut.shots)[0]!, {
+            pinned_asset_id: "another-pin",
+            asset_id: "another-pin"
+          });
+          await snapshots.put({ projectId, cut });
+        }
+      }
+    );
+    external.mockImplementation(async ({ userPrompt }) => {
+      expect(userPrompt).toContain("unnumbered opening frame");
+      expect(userPrompt).toContain("locked off, holding the opening frame");
+      expect(
+        userPrompt.split("## Label table")[1]?.split("## Task types")[0]
+      ).not.toContain("{{ref:prev_shot}}");
+      return {
+        model: "mock/composer",
+        text: JSON.stringify({
+          subject_definitions:
+            "{{subject:hero}} is the courier in {{ref:hero}}.",
+          summary:
+            "[reference generation + keyframe completion] The courier keeps walking.",
+          retention_analysis:
+            "{{ref:hero}}: weak_reference - courier appearance.",
+          detailed_description:
+            "[Shot 1] Open on the preceding frame and hold camera while the courier walks.",
+          overall_soundscape: "Room tone.",
+          non_diegetic_music: "N/A"
+        })
+      };
+    });
+    const result = await director.generateShots(pinRequest("mago"));
+    const plan = await waitPlan(String(result.plan_id), "COMPLETED");
+    const opener = savedOpener(plan);
+    const job = await jobFor(plan);
+    expect(repinned).toBe(true);
+    expect(opener).toMatchObject({
+      predecessor_asset_id: source.id,
+      width: 64,
+      height: 48,
+      aspect_ratio: "4:3"
+    });
+    expect(uploaded.get(opener.asset_id)).toEqual(expected);
+    expect(uploadIds).toEqual([hero.id, opener.asset_id]);
+    expect(job.inputAssetIds).toEqual(uploadIds);
+    expect(job.requestJson).toEqual(submissions[0]!.body);
+    expect(job.requestJson).toMatchObject({
+      image_url: cdn + "/input/" + opener.asset_id + ".png",
+      reference_image_urls: [cdn + "/input/" + hero.id + ".png"]
+    });
+    expect(job.requestJson).not.toHaveProperty("aspect_ratio");
+    expect(job.requestJson.prompt).not.toContain("Image 2");
+    expect((await version()).input_settings).toMatchObject({
+      aspect_ratio: "4:3"
+    });
+  });
+
+  it("rejects the decoded mismatch before text composition, upload or submit", async () => {
+    await seed(openingPin);
+    const result = await director.generateShots(
+      pinRequest("mago", ["shot-2"], "16:9")
+    );
+    const plan = await waitPlan(String(result.plan_id), "PAUSED");
+    expect(plan).toMatchObject({
+      error: { message: expect.stringContaining("64×48") }
+    });
+    expect(plan.local_prepared_shots).toBeUndefined();
+    expect(external).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("retries only the frozen preparation and preflights a missing opener before uploading any reference", async () => {
+    await seed(openingPin);
+    const extract = vi.spyOn(media, "extractLastFrame");
+    fetchMock.mockRejectedValueOnce(new Error("upload unavailable"));
+    const result = await director.generateShots(pinRequest());
+    const planId = String(result.plan_id);
+    const paused = await waitPlan(planId, "PAUSED");
+    const frozen = structuredClone(row(paused.local_prepared_shots)["shot-2"]);
+    const opener = savedOpener(paused);
+    expect(step(paused, "submit_video_render").local_preparation_digest).toBe(
+      row(frozen).digest
+    );
+    expect(await jobFor(paused)).toBeNull();
+    const openerPath = (await snapshots.resolveMediaPath(
+      opener.asset_id,
+      projectId
+    ))!;
+    const bytes = await readFile(openerPath);
+    await rm(openerPath);
+    await rm(source.path);
+    const before = fetchMock.mock.calls.length;
+    await director.resumePlan(planId);
+    await waitPlan(planId, "PAUSED");
+    expect(fetchMock).toHaveBeenCalledTimes(before);
+    expect(submissions).toEqual([]);
+    await writeFile(openerPath, bytes);
+    await director.resumePlan(planId);
+    const completed = await waitPlan(planId, "COMPLETED");
+    expect(row(completed.local_prepared_shots)["shot-2"]).toEqual(frozen);
+    expect(extract).toHaveBeenCalledTimes(1);
+    expect(submissions).toHaveLength(1);
+  });
+
+  it("resumes an accepted opener-only request with both local inputs removed", async () => {
+    await seed(openingPin);
+    const state = (await snapshots.get(projectId))!.state!;
+    Object.assign(rows(state.shots)[1]!, {
+      references: {},
+      tags: {},
+      video_prompt: "The courier keeps walking."
+    });
+    await snapshots.put({ projectId, state });
+    const extract = vi.spyOn(media, "extractLastFrame");
+    offline = true;
+    const result = await director.generateShots(pinRequest());
+    const planId = String(result.plan_id);
+    const paused = await waitPlan(planId, "PAUSED");
+    const accepted = await jobFor(paused);
+    const opener = savedOpener(paused);
+    expect(accepted.inputAssetIds).toEqual([opener.asset_id]);
+    expect(accepted.requestJson).not.toHaveProperty("reference_image_urls");
+    expect(accepted.requestJson).toEqual(submissions[0]!.body);
+    row(row(paused.local_request).videoSettings).provider_settings = {
+      aspect_ratio: "invalid"
+    };
+    await snapshots.putPlan(projectId, planId, paused);
+    for (const id of [source.id, opener.asset_id])
+      await rm((await snapshots.resolveMediaPath(id, projectId))!);
+    const before = fetchMock.mock.calls.length;
+    manager.close();
+    await manager.open(directory);
+    director = makeDirector();
+    offline = false;
+    await director.resumePlan(planId);
+    const completed = await waitPlan(planId, "COMPLETED");
+    expect(savedOpener(completed)).toEqual(opener);
+    expect(await jobFor(completed)).toMatchObject({
+      status: "INGESTED",
+      requestId: accepted.requestId,
+      requestJson: accepted.requestJson
+    });
+    expect(
+      fetchMock.mock.calls
+        .slice(before)
+        .every(([, options]) => !options?.method || options.method === "GET")
+    ).toBe(true);
+    expect(extract).toHaveBeenCalledTimes(1);
+    expect(submissions).toHaveLength(1);
+  });
 });
 
 describe("fal sequential frame integration", () => {
@@ -767,64 +947,85 @@ describe("fal sequential frame integration", () => {
     });
   });
 
-  it("continues from the same-run poll result even when its finished predecessor is repinned to the old source", async () => {
-    await seed({ mode: "last_frame", opening_frame: "off" });
-    const snapshot = (await snapshots.get(projectId))!;
-    rows(snapshot.state!.shots)[0]!.duration_s = 5;
-    await snapshots.put({ projectId, state: snapshot.state! });
-    const extract = vi.spyOn(media, "extractLastFrame");
-    const putPlan = snapshots.putPlan.bind(snapshots);
-    let repinned = false;
-    let predecessorId: string | undefined;
-    vi.spyOn(snapshots, "putPlan").mockImplementation(
-      async (project, id, plan) => {
-        await putPlan(project, id, plan);
-        const completed = step(plan, "poll_video_render", "shot-1");
-        if (!repinned && completed?.status === "COMPLETED") {
-          repinned = true;
-          predecessorId = String(row(completed.result).render_asset_id);
-          // Simulate a user changing the cut pin after this run finishes shot 1,
-          // but before it prepares the sequential reference for shot 2.
-          const current = (await snapshots.get(projectId))!;
-          const predecessor = rows(current.cut!.shots)[0]!;
-          predecessor.pinned_asset_id = source.id;
-          predecessor.asset_id = source.id;
-          predecessor.url = source.url;
-          await snapshots.put({ projectId, cut: current.cut! });
+  it.each(["off", "pin"])(
+    "continues last_frame/%s from the same-run result even after repinning",
+    async (opening_frame) => {
+      await seed({ mode: "last_frame", opening_frame });
+      const snapshot = (await snapshots.get(projectId))!;
+      rows(snapshot.state!.shots)[0]!.duration_s = 5;
+      await snapshots.put({ projectId, state: snapshot.state! });
+      const extract = vi.spyOn(media, "extractLastFrame");
+      const putPlan = snapshots.putPlan.bind(snapshots);
+      let repinned = false;
+      let predecessorId: string | undefined;
+      vi.spyOn(snapshots, "putPlan").mockImplementation(
+        async (project, id, plan) => {
+          await putPlan(project, id, plan);
+          const completed = step(plan, "poll_video_render", "shot-1");
+          if (!repinned && completed?.status === "COMPLETED") {
+            repinned = true;
+            predecessorId = String(row(completed.result).render_asset_id);
+            // Simulate a user changing the cut pin after this run finishes shot 1,
+            // but before it prepares the sequential reference for shot 2.
+            const current = (await snapshots.get(projectId))!;
+            const predecessor = rows(current.cut!.shots)[0]!;
+            predecessor.pinned_asset_id = source.id;
+            predecessor.asset_id = source.id;
+            predecessor.url = source.url;
+            await snapshots.put({ projectId, cut: current.cut! });
+          }
         }
+      );
+      const generated = await director.generateShots(
+        pinRequest("raw", ["shot-1", "shot-2"])
+      );
+      const plan = await waitPlan(String(generated.plan_id), "COMPLETED");
+      if (opening_frame === "pin") {
+        expect(savedOpener(plan).predecessor_asset_id).toBe(predecessorId);
+        const cut = (await snapshots.get(projectId))!.cut!;
+        Object.assign(rows(cut.shots)[0]!, {
+          pinned_asset_id: predecessorId,
+          asset_id: predecessorId
+        });
+        await snapshots.put({ projectId, cut });
+        expect(
+          (await director.generateShots({ ...pinRequest(), isDryRun: true }))
+            .would_run_timeline_ids
+        ).toEqual([]);
+        Object.assign(rows(cut.shots)[0]!, {
+          pinned_asset_id: source.id,
+          asset_id: source.id
+        });
+        await snapshots.put({ projectId, cut });
       }
-    );
-    const generated = await director.generateShots(
-      request("raw", ["shot-1", "shot-2"])
-    );
-    const plan = await waitPlan(String(generated.plan_id), "COMPLETED");
-    expect(repinned).toBe(true);
-    expect(predecessorId).toBeTruthy();
-    expect(predecessorId).not.toBe(source.id);
-    expect(
-      row(step(plan, "poll_video_render", "shot-1").result).render_asset_id
-    ).toBe(predecessorId);
-    expect((await cutShots())[0]).toMatchObject({
-      asset_id: source.id,
-      pinned_asset_id: source.id
-    });
-    expect(extract).toHaveBeenCalledExactlyOnceWith(
-      await snapshots.resolveMediaPath(predecessorId!, projectId),
-      expect.any(AbortSignal)
-    );
-    expect(
-      row(step(plan, "use_provided_reference_frame").result)
-    ).toMatchObject({
-      continues_from: { asset_id: predecessorId, timeline_id: "shot-1" }
-    });
-    const current = await version();
-    expect(current).toMatchObject({
-      continues_from: { asset_id: predecessorId, timeline_id: "shot-1" },
-      render_spec: { sequential: { prev_asset_id: predecessorId } }
-    });
-    expect(current.fingerprint).toBe(fingerprint(row(current.render_spec)));
-    expect(submissions).toHaveLength(2);
-  });
+      expect(repinned).toBe(true);
+      expect(predecessorId).toBeTruthy();
+      expect(predecessorId).not.toBe(source.id);
+      expect(
+        row(step(plan, "poll_video_render", "shot-1").result).render_asset_id
+      ).toBe(predecessorId);
+      expect((await cutShots())[0]).toMatchObject({
+        asset_id: source.id,
+        pinned_asset_id: source.id
+      });
+      expect(extract).toHaveBeenCalledExactlyOnceWith(
+        await snapshots.resolveMediaPath(predecessorId!, projectId),
+        expect.any(AbortSignal)
+      );
+      expect(
+        row(step(plan, "use_provided_reference_frame").result)
+      ).toMatchObject({
+        continues_from: { asset_id: predecessorId, timeline_id: "shot-1" }
+      });
+      const current = await version();
+      expect(current).toMatchObject({
+        continues_from: { asset_id: predecessorId, timeline_id: "shot-1" },
+        render_spec: { sequential: { prev_asset_id: predecessorId } }
+      });
+      expect(current.fingerprint).toBe(fingerprint(row(current.render_spec)));
+      expect(submissions).toHaveLength(2);
+    }
+  );
 
   const nineReferences = async () => ({
     characters: [{ token: "hero", asset_id: hero.id }],

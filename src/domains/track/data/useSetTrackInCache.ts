@@ -2,9 +2,12 @@ import { Layer } from "@schemas/layer";
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 export const useSetTrackInCache = () => {
+  const { work } = useRendererLibraryWork();
   const queryClient = useQueryClient();
   const setTrackInCache = ({
     modifiedTrack,
@@ -15,7 +18,7 @@ export const useSetTrackInCache = () => {
     selectedProjectId?: string;
     selectedShotId?: string;
   }) => {
-    if (!selectedProjectId) {
+    if (work.signal.aborted || !selectedProjectId) {
       return;
     }
 
@@ -24,7 +27,7 @@ export const useSetTrackInCache = () => {
     }
 
     return queryClient.setQueryData(
-      queryKeys.project.byId(selectedProjectId),
+      libraryQueryKey(queryKeys.project.byId(selectedProjectId)),
       (oldProject: Project) => {
         if (!oldProject) {
           return oldProject;

@@ -15,6 +15,7 @@ import { clearLibraryIssue, reportLibraryIssue } from "./libraryHealth";
 import { LibrarySettings } from "./librarySettings";
 import { LibraryWorkSession } from "./libraryWorkSession";
 import { libraryMediaStream } from "./media/libraryMediaStream";
+import type { ProfileIoDrain } from "./providers/profileIoDrain";
 
 const HTTP_OK = 200;
 const HTTP_PARTIAL_CONTENT = 206;
@@ -138,7 +139,9 @@ export const registerMediaProtocol = (
   repository: ProjectRepository,
   scriptProjects: ScriptProjectSnapshotRepository,
   settings: LibrarySettings,
-  work = new LibraryWorkSession(() => undefined)
+  work = new LibraryWorkSession(() => undefined),
+  captureAccountProfile?: () => AbortSignal,
+  profileIo?: ProfileIoDrain
 ): void => {
   const cloudStorageHosts = resolveCloudConfig().cloudStorageHosts;
   const projects = work.guard(repository);
@@ -146,33 +149,50 @@ export const registerMediaProtocol = (
   protocol.handle("mago-media", async (originalRequest) => {
     let signal: AbortSignal | undefined;
     try {
-      signal = AbortSignal.any([work.capture(), originalRequest.signal]);
+      const cloud =
+        new URL(originalRequest.url).hostname === CLOUD_STORAGE_PROTOCOL_HOST;
+      const profile = cloud ? captureAccountProfile?.() : undefined;
+      signal = AbortSignal.any([
+        work.capture(),
+        originalRequest.signal,
+        ...(profile ? [profile] : [])
+      ]);
       const request = new Request(originalRequest, { signal });
       return await work.run(async () => {
         signal!.throwIfAborted();
         const url = new URL(request.url);
         const kind = url.hostname;
         if (kind === CLOUD_STORAGE_PROTOCOL_HOST) {
-          const response = await work.boundary(async () => {
-            const upstream = await cloudStorageProtocolResponse(
-              request,
-              cloudStorageHosts,
-              undefined,
-              () => requireCloudAccount(settings)
-            );
-            // Even an abort-ignoring headers callback must release its body.
-            if (request.signal.aborted) {
-              await upstream.body?.cancel(request.signal.reason);
-              request.signal.throwIfAborted();
-            }
-            return upstream;
-          });
-          return new Response(
-            response.body
-              ? libraryMediaStream(response.body, work, request.signal)
-              : null,
-            { status: response.status, headers: response.headers }
-          );
+          const handle = () =>
+            work.boundary(async () => {
+              const upstream = await cloudStorageProtocolResponse(
+                request,
+                cloudStorageHosts,
+                undefined,
+                () => requireCloudAccount(settings, profile)
+              );
+              // Even an abort-ignoring headers callback must release its body.
+              if (request.signal.aborted) {
+                await upstream.body?.cancel(request.signal.reason);
+                request.signal.throwIfAborted();
+              }
+              return new Response(
+                upstream.body
+                  ? libraryMediaStream(
+                      upstream.body,
+                      work,
+                      request.signal,
+                      (closed) => {
+                        void profileIo
+                          ?.run(profile, () => closed)
+                          .catch(() => {});
+                      }
+                    )
+                  : null,
+                { status: upstream.status, headers: upstream.headers }
+              );
+            });
+          return profileIo ? profileIo.run(profile, handle) : handle();
         }
         if (
           kind !== "asset" &&

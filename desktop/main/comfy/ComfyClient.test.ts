@@ -60,7 +60,9 @@ describe("ComfyClient", () => {
   it("names uploads by content so different files never collide", async () => {
     const uploadedNames: string[] = [];
     stubFetch(async (_url, init) => {
-      const form = init?.body as FormData;
+      const form = await new Response(init?.body, {
+        headers: init?.headers
+      }).formData();
       const file = form.get("image") as File;
       uploadedNames.push(file.name);
       return Response.json({

@@ -46,13 +46,15 @@ export const ImageToVideoRenderActions: React.FC<
 
   return (
     <div className="flex items-center gap-1">
-      <GhostButton
-        onPress={reuseSettings}
-        colorScheme="white"
-        className="flex-1"
-      >
-        {t("projectTimeline.imageToVideo.reuseSettings.label")}
-      </GhostButton>
+      {track.data.ordinaryFal !== true && (
+        <GhostButton
+          onPress={reuseSettings}
+          colorScheme="white"
+          className="flex-1"
+        >
+          {t("projectTimeline.imageToVideo.reuseSettings.label")}
+        </GhostButton>
+      )}
       {canPromote && (
         <GhostButton
           onPress={handleUseAsInputVideo}

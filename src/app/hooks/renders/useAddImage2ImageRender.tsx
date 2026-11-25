@@ -7,9 +7,15 @@ import {
 } from "@models/img2img/types";
 import { Project } from "@schemas/project";
 import { Shot } from "@schemas/shot";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
+import {
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
 import { mergeImg2ImgLayerIntoProject } from "./utils/mergeImg2ImgLayerIntoProject";
@@ -26,16 +32,23 @@ interface Img2ImgRenderParams {
 }
 
 const addImage2ImageRender = async (
-  params: Img2ImgRenderParams
+  params: Img2ImgRenderParams,
+  work: RendererLibraryWork
 ): Promise<Img2ImgRenderResponse> => {
   const { renderMode, render_model, settings, ...restParams } = params;
 
-  const response = await backendApiClient.post(`/assets/img2img/render`, {
-    ...restParams,
-    settings,
-    render_mode: renderMode,
-    render_model
-  });
+  const response = await runRendererLibraryRequest(work, (signal) =>
+    backendApiClient.post(
+      `/assets/img2img/render`,
+      {
+        ...restParams,
+        settings,
+        render_mode: renderMode,
+        render_model
+      },
+      { signal }
+    )
+  );
   return response.data;
 };
 
@@ -43,11 +56,8 @@ export const useAddImage2ImageRender = () => {
   const queryClient = useQueryClient();
   const selectedProjectId = useSelectedProjectId();
 
-  return useMutation({
-    mutationFn: (params: Img2ImgRenderParams) => {
-      return addImage2ImageRender(params);
-    },
-    mutationKey: ["addImage2ImageRender"],
+  return useRendererLibraryMutation({
+    mutationFn: addImage2ImageRender,
     onSuccess: async (response) => {
       if ("error" in response) {
         console.error("Server returned error:", response.error);
@@ -59,7 +69,7 @@ export const useAddImage2ImageRender = () => {
       });
 
       queryClient.setQueryData(
-        queryKeys.project.byId(selectedProjectId),
+        libraryQueryKey(queryKeys.project.byId(selectedProjectId)),
         (project: Project | undefined) =>
           mergeImg2ImgLayerIntoProject(project, response)
       );

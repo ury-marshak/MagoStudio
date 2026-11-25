@@ -2,6 +2,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { readComfyRestartStatus } from "./readComfyRestartStatus";
 
+const deferred = <T>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
+
 const endpoint = "http://127.0.0.1:8188";
 const launcherWith = ({
   isLaunchedByMago,
@@ -98,5 +108,28 @@ describe("readComfyRestartStatus", () => {
       restartMethod: null,
       runningOrQueuedRenderCount: null
     });
+  });
+
+  it("suppresses a late queue result without checking launchability or Manager", async () => {
+    const queue = deferred<Response>();
+    const fetchMock = vi.fn(() => queue.promise);
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    const launcher = launcherWith({ isLaunchedByMago: false, canLaunch: true });
+    const canLaunch = vi.spyOn(launcher, "canLaunch");
+    const status = readComfyRestartStatus({
+      launcher,
+      endpoint,
+      signal: controller.signal
+    });
+    const rejected = expect(status).rejects.toHaveProperty(
+      "name",
+      "AbortError"
+    );
+    controller.abort();
+    queue.resolve(Response.json({ queue_running: [], queue_pending: [] }));
+    await rejected;
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(canLaunch).not.toHaveBeenCalled();
   });
 });

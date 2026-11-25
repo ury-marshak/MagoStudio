@@ -12,6 +12,14 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ProfileIoDrain } from "../providers/profileIoDrain";
+
+const heldPut = vi.hoisted(() => vi.fn());
+vi.mock("node:https", async (importOriginal) => {
+  const https = await importOriginal<typeof import("node:https")>();
+  return { ...https, default: { ...https, request: heldPut } };
+});
+
 import { UploadService } from "./uploadService";
 
 const ffmpegInvocations = vi.hoisted(() => [] as string[][]);
@@ -62,6 +70,68 @@ afterEach(async () => {
 });
 
 const makeUploadService = () => new UploadService(async () => libraryRoot);
+
+it.each(["file", "bytes"] as const)(
+  "drains the retired %s PUT through request close",
+  async (kind) => {
+    const { Writable } = await import("node:stream");
+    const account = new AbortController();
+    const tracker = new ProfileIoDrain();
+    const service = new UploadService(async () => libraryRoot, tracker);
+    let close!: () => void;
+    const closing = new Promise<void>((resolve) => {
+      close = resolve;
+    });
+    const destroy = vi.fn(
+      (error: Error | null, callback: (error?: Error | null) => void) => {
+        void closing.then(() => callback(error));
+      }
+    );
+    heldPut.mockReturnValueOnce(
+      new Writable({
+        autoDestroy: false,
+        write(_chunk, _enc, callback) {
+          callback();
+        },
+        destroy
+      })
+    );
+    const common = {
+      profile: account.signal,
+      contentType: "video/mp4",
+      presignedUrl: "https://upload.invalid/object",
+      assertAccess: async () => {}
+    };
+    const upload =
+      kind === "file"
+        ? service.upload({ ...common, filePath: sourcePath })
+        : service.uploadBytes(
+            {},
+            { ...common, uploadId: "same-id", bytes: Buffer.from([1, 2]) }
+          );
+    const outcome = expect(upload).rejects.toThrow("cancelled");
+    let drained = false;
+    try {
+      await vi.waitFor(() => expect(heldPut).toHaveBeenCalled());
+      account.abort();
+      const drain = tracker.drainRetired().then(() => {
+        drained = true;
+      });
+      try {
+        await vi.waitFor(() => expect(destroy).toHaveBeenCalledOnce());
+        expect(drained).toBe(false);
+      } finally {
+        close();
+        await drain;
+      }
+      await outcome;
+    } finally {
+      close();
+      await Promise.allSettled([outcome, upload]);
+      heldPut.mockReset();
+    }
+  }
+);
 
 describe("UploadService.prepare", () => {
   it("encodes a second trim of the same asset instead of reusing the first trim's encode", async () => {

@@ -2,6 +2,7 @@ import { useVideoAsset } from "@domains/asset/useVideoAsset";
 import { useVlmStatus } from "@domains/prompt/useVlmStatus";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
 import { queryKeys } from "@/queryKeys";
 
 import { getAssetPrompt } from "../api/getAssetPrompt";
@@ -34,30 +35,37 @@ export const useGetVideoAssetPrompt = ({
   const assetExistingPrompt =
     videoAsset && "asset" in videoAsset ? videoAsset.asset?.data?.prompt : null;
 
+  const scope = useRendererLibraryQueryScope();
   return useQuery({
-    queryKey: queryKeys.assetPrompt.byId(assetId),
-    queryFn: async ({ signal }) => {
-      if (assetExistingPrompt) {
-        return {
-          prompt: assetExistingPrompt
-        };
-      }
-      const response = await getAssetPrompt(assetId, signal);
-      // A newly generated caption also lands on the asset row, and AutoPrompt's
-      // `motionDescription` reads it off the *track's* asset rather than off
-      // this query. Without refreshing the asset the video2video AutoPrompt
-      // would stay disabled until the next app start.
-      if (response.prompt) {
-        void queryClient.invalidateQueries({
-          queryKey: queryKeys.videoAsset.byId(assetId)
-        });
-      }
-      return response;
-    },
+    queryKey: scope.key(queryKeys.assetPrompt.byId(assetId)),
+    queryFn: ({ signal }) =>
+      scope.run(async () => {
+        if (assetExistingPrompt) {
+          return {
+            prompt: assetExistingPrompt
+          };
+        }
+        const response = await getAssetPrompt(
+          assetId,
+          AbortSignal.any([signal, scope.work.signal])
+        );
+        scope.work.check();
+        // A newly generated caption also lands on the asset row, and AutoPrompt's
+        // `motionDescription` reads it off the *track's* asset rather than off
+        // this query. Without refreshing the asset the video2video AutoPrompt
+        // would stay disabled until the next app start.
+        if (response.prompt) {
+          void queryClient.invalidateQueries({
+            queryKey: queryKeys.videoAsset.byId(assetId)
+          });
+        }
+        return response;
+      }),
     select: selectPromptWithFormattedText,
     // A cached prompt is a free read; generating one locally is a multi-minute
     // ComfyUI job, so only run when Qwen3-VL is actually reachable.
     enabled:
+      scope.active &&
       !!assetId &&
       enabled &&
       !isVideoAssetLoading &&

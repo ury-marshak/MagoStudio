@@ -1,6 +1,7 @@
-import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import path from "node:path";
+
+import { runSetupProcess } from "./runSetupProcess";
 
 export type PythonProcessRunner = (
   python: string,
@@ -10,15 +11,7 @@ export type PythonProcessRunner = (
 
 const PIP_ERROR_TAIL_LINES = 6;
 
-export const runPythonProcess: PythonProcessRunner = (python, args, signal) =>
-  new Promise((resolve, reject) => {
-    const child = spawn(python, args, { windowsHide: true, signal });
-    let output = "";
-    child.stdout.on("data", (chunk: Buffer) => (output += chunk.toString()));
-    child.stderr.on("data", (chunk: Buffer) => (output += chunk.toString()));
-    child.once("error", reject);
-    child.once("close", (exitCode) => resolve({ exitCode, output }));
-  });
+export const runPythonProcess: PythonProcessRunner = runSetupProcess;
 
 export const requirementsFileOfNodePack = (nodePackDirectory: string) =>
   path.join(nodePackDirectory, "requirements.txt");
@@ -46,12 +39,14 @@ export const installNodePackRequirements = async ({
   const hasRequirementsFile = await stat(requirementsFile)
     .then((info) => info.isFile())
     .catch(() => false);
+  signal?.throwIfAborted();
   if (!hasRequirementsFile) return "no-requirements";
   const { exitCode, output } = await runPython(
     python,
     ["-s", "-m", "pip", "install", "-r", requirementsFile],
     signal
   );
+  signal?.throwIfAborted();
   log(`pip install for ${path.basename(nodePackDirectory)}:\n${output}`);
   if (exitCode === 0) return "installed";
   const lastLines = output

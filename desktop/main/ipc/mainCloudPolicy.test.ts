@@ -57,6 +57,7 @@ import type { ProjectRepository } from "../database/projectRepository";
 import type { ScriptProjectSnapshotRepository } from "../database/scriptProjectSnapshotRepository";
 import { LibrarySettings } from "../librarySettings";
 import { LibraryWorkSession } from "../libraryWorkSession";
+import { ProfileIoDrain } from "../providers/profileIoDrain";
 import { registerMediaProtocol } from "../rendererProtocol";
 import type { LocalScriptChatService } from "../scriptProjects/localScriptChatService";
 import type { LocalScriptProjectService } from "../scriptProjects/localScriptProjectService";
@@ -76,6 +77,8 @@ const invoke = (channel: string, ...args: unknown[]) =>
   state.handlers.get(channel)!(event, ...args);
 let settings: LibrarySettings;
 let imageSession: AbortController;
+let renderAccount: AbortController;
+let profileIoDrain: ProfileIoDrain;
 let renderWork: LibraryWorkSession<undefined>;
 let uploads: UploadService;
 const effects = {
@@ -108,6 +111,9 @@ beforeEach(async () => {
   state.profile = await mkdtemp(path.join(tmpdir(), "mago-cloud-policy-"));
   settings = new LibrarySettings();
   imageSession = new AbortController();
+  renderAccount = new AbortController();
+  profileIoDrain = new ProfileIoDrain();
+  effects.complete.mockResolvedValue(undefined);
   renderWork = new LibraryWorkSession(() => undefined);
   effects.root.mockResolvedValue(state.profile);
   effects.resolve.mockResolvedValue("/fixture/input.mp4");
@@ -151,9 +157,31 @@ beforeEach(async () => {
       complete: effects.complete,
       fail: effects.fail
     } as unknown as CloudRenderSubmitService,
-    databaseManager: {} as DatabaseManager,
+    databaseManager: {
+      isOpen: () => true,
+      get: () => ({
+        select: () => ({
+          from: () => ({
+            where: () => ({
+              limit: async () => [
+                {
+                  id: "asset",
+                  name: "Fixture",
+                  sourcePath: "/fixture/input.webp",
+                  type: "IMAGE",
+                  width: 16,
+                  height: 9
+                }
+              ]
+            })
+          })
+        })
+      })
+    } as unknown as DatabaseManager,
     getLibraryRoot: effects.root,
     settings,
+    captureAccountProfile: () => renderAccount.signal,
+    profileIoDrain,
     captureImageDescriptionSession: () => imageSession.signal
   });
   registerProjectHandlers(
@@ -178,7 +206,10 @@ beforeEach(async () => {
     databaseManager: { isOpen: () => true } as DatabaseManager,
     settings
   });
-  registerCloudStorageHandlers(settings);
+  registerCloudStorageHandlers(settings, {
+    libraryWork: new LibraryWorkSession(() => undefined),
+    assertLibraryAvailable: () => {}
+  });
   registerMediaProtocol(
     { resolveMediaPath: effects.resolve } as unknown as ProjectRepository,
     {} as ScriptProjectSnapshotRepository,
@@ -324,10 +355,83 @@ describe("trusted main cloud boundary", () => {
     const pending = invoke(IPC_CHANNELS.cloudUploadPrepared, ...requests[1][1]);
     const rejected = expect(pending).rejects.toThrow("explicit cloud account");
     await vi.waitFor(() => expect(release).toBeDefined());
+    expect(effects.prepare).toHaveBeenCalledWith(
+      expect.objectContaining({ profile: renderAccount.signal })
+    );
     await settings.clearAppMode();
     release({ filePath: "/fixture/prepared.mp4" });
     await rejected;
     expect(effects.upload).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    IPC_CHANNELS.cloudPrepareUpload,
+    IPC_CHANNELS.cloudUploadPrepared
+  ])(
+    "%s refuses to prepare video after retirement during path lookup",
+    async (channel) => {
+      await settings.setAppMode("cloud");
+      let release!: (sourcePath: string) => void;
+      effects.resolve.mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            release = resolve;
+          })
+      );
+      const pending = invoke(channel, {
+        assetId: "asset",
+        presignedUrl: "https://upload.invalid/"
+      });
+      const rejected = expect(pending).rejects.toMatchObject({
+        name: "AbortError"
+      });
+      await vi.waitFor(() => expect(release).toBeDefined());
+      renderAccount.abort();
+      renderAccount = new AbortController(); // A new cloud profile is active.
+      release("/fixture/input.mp4");
+      await rejected;
+      expect(effects.prepare).not.toHaveBeenCalled();
+      expect(effects.upload).not.toHaveBeenCalled();
+    }
+  );
+
+  test("refuses to prepare an image after retirement during the library root lookup", async () => {
+    await settings.setAppMode("cloud");
+    const prepareImage = vi.spyOn(uploads, "prepareImage");
+    let release!: (root: string) => void;
+    effects.root.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          release = resolve;
+        })
+    );
+    const pending = invoke(IPC_CHANNELS.cloudUploadAsset, {
+      assetId: "asset",
+      presignedUrl: "https://upload.invalid/"
+    });
+    const rejected = expect(pending).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await vi.waitFor(() => expect(release).toBeDefined());
+    renderAccount.abort();
+    renderAccount = new AbortController();
+    release(state.profile);
+    await rejected;
+    expect(prepareImage).not.toHaveBeenCalled();
+    expect(effects.upload).not.toHaveBeenCalled();
+  });
+
+  test("asset info and explicit byte cancellation remain account-free", async () => {
+    renderAccount.abort();
+    await expect(
+      invoke(IPC_CHANNELS.cloudAssetInfo, "asset")
+    ).resolves.toMatchObject({
+      id: "asset",
+      extension: "webp"
+    });
+    await expect(
+      invoke(IPC_CHANNELS.cloudCancelUploadBytes, "upload")
+    ).resolves.toBeUndefined();
   });
 
   test("historical link and queue metadata remains accessible without a cloud account", async () => {
@@ -346,17 +450,23 @@ describe("trusted main cloud boundary", () => {
       cut: { saved: true }
     };
     await invoke(IPC_CHANNELS.scriptProjectsPut, snapshot);
-    expect(effects.snapshot).toHaveBeenCalledWith({
-      ...snapshot,
-      metadataOnly: true
-    });
+    expect(effects.snapshot).toHaveBeenCalledWith(
+      {
+        ...snapshot,
+        metadataOnly: true
+      },
+      undefined
+    );
     expect(effects.cacheMedia).not.toHaveBeenCalled();
     await settings.setAppMode("cloud");
     await invoke(IPC_CHANNELS.scriptProjectsPut, snapshot);
-    expect(effects.snapshot).toHaveBeenLastCalledWith({
-      ...snapshot,
-      metadataOnly: false
-    });
+    expect(effects.snapshot).toHaveBeenLastCalledWith(
+      {
+        ...snapshot,
+        metadataOnly: true
+      },
+      undefined
+    );
   });
 
   test("account-free historical protocol URL is forbidden without transport", async () => {
@@ -554,7 +664,8 @@ test("cloud-finish IPC captures description ownership before the account/root/do
   await pending;
   expect(effects.complete).toHaveBeenCalledExactlyOnceWith(
     { jobId: "job", relativePath: "output.mp4", sizeBytes: 3 },
-    old.signal
+    old.signal,
+    renderAccount.signal
   );
   vi.restoreAllMocks();
 });
@@ -590,6 +701,51 @@ test.each([
     ])
       expect(effect).not.toHaveBeenCalled();
     vi.restoreAllMocks();
+  }
+);
+
+test.each([
+  [IPC_CHANNELS.cloudRenderRegister, effects.register],
+  [IPC_CHANNELS.cloudImageRenderRegister, effects.registerImage],
+  [IPC_CHANNELS.cloudRenderFinish, effects.complete],
+  [IPC_CHANNELS.cloudRenderFinish, state.download]
+] as const)(
+  "%s drains issued account-owned render work before persistence",
+  async (channel, operation) => {
+    await settings.setAppMode("cloud");
+    let release!: () => void;
+    operation.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        })
+    );
+    const args = requests.find(([name]) => name === channel)![1];
+    const pending = invoke(channel, ...args);
+    const rejected = expect(pending).rejects.toThrow("fixture account retired");
+    await vi.waitFor(() => expect(release).toBeDefined());
+    const origin = renderAccount.signal;
+    renderAccount.abort(new Error("fixture account retired"));
+    renderAccount = new AbortController();
+    const persist = vi.fn();
+    const switching = profileIoDrain.drainRetired().then(persist);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const persistedBeforeRelease = persist.mock.calls.length;
+    release();
+    await switching;
+    await rejected;
+    expect(persistedBeforeRelease).toBe(0);
+    expect(persist).toHaveBeenCalledOnce();
+    if (operation === state.download) {
+      const { signal, onProgress } = state.download.mock.lastCall![0];
+      event.sender.send.mockClear();
+      onProgress(0.9);
+      expect(signal.aborted).toBe(true);
+      expect(event.sender.send).not.toHaveBeenCalled();
+      expect(effects.complete).not.toHaveBeenCalled();
+    } else {
+      expect(operation.mock.lastCall?.at(-1)).toBe(origin);
+    }
   }
 );
 

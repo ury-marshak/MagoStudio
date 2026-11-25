@@ -4,6 +4,8 @@ import { applyProjectUpdateToCache } from "@domains/project/utils/applyProjectUp
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { buildProjectSettingsPatch } from "./utils/buildProjectSettingsPatch";
@@ -11,6 +13,7 @@ import { buildProjectSettingsPatch } from "./utils/buildProjectSettingsPatch";
 /** Every settings write on the Script tab goes through this, not a `project` value captured at
  * render time, so two quick writes cannot race each other back to stale settings. */
 export const useSaveProjectSettingsPatch = (projectId: string | undefined) => {
+  const { work } = useRendererLibraryWork();
   const { data: project } = useProject(projectId);
   const queryClient = useQueryClient();
 
@@ -21,16 +24,16 @@ export const useSaveProjectSettingsPatch = (projectId: string | undefined) => {
   } = useUpdateProject({
     onMutate: async (variables, work) => {
       await queryClient.cancelQueries({
-        queryKey: queryKeys.project.byId(variables.projectId)
+        queryKey: libraryQueryKey(queryKeys.project.byId(variables.projectId))
       });
       work.check();
 
       const previousProject = queryClient.getQueryData<Project>(
-        queryKeys.project.byId(variables.projectId)
+        libraryQueryKey(queryKeys.project.byId(variables.projectId))
       );
 
       queryClient.setQueryData(
-        queryKeys.project.byId(variables.projectId),
+        libraryQueryKey(queryKeys.project.byId(variables.projectId)),
         (oldProject: Project | undefined) =>
           applyProjectUpdateToCache(oldProject, variables)
       );
@@ -41,7 +44,7 @@ export const useSaveProjectSettingsPatch = (projectId: string | undefined) => {
       const previousProject = context?.previousProject;
 
       queryClient.setQueryData(
-        queryKeys.project.byId(variables.projectId),
+        libraryQueryKey(queryKeys.project.byId(variables.projectId)),
         previousProject
       );
     }
@@ -51,9 +54,12 @@ export const useSaveProjectSettingsPatch = (projectId: string | undefined) => {
     patch: Partial<Project["settings"]>,
     projectOverride?: Project
   ) => {
+    if (work.signal.aborted) return undefined;
     const freshestProject =
       projectOverride ??
-      queryClient.getQueryData<Project>(queryKeys.project.byId(projectId)) ??
+      queryClient.getQueryData<Project>(
+        libraryQueryKey(queryKeys.project.byId(projectId))
+      ) ??
       project;
     const targetProjectId = projectOverride?.id ?? projectId;
     if (!targetProjectId || !freshestProject) return undefined;
@@ -72,7 +78,7 @@ export const useSaveProjectSettingsPatch = (projectId: string | undefined) => {
     projectOverride?: Project
   ): void => {
     const variables = buildUpdateVariables(patch, projectOverride);
-    if (variables) updateProject(variables);
+    if (variables) updateProject(variables, work);
   };
 
   const saveProjectSettingsPatchAsync = (
@@ -80,7 +86,7 @@ export const useSaveProjectSettingsPatch = (projectId: string | undefined) => {
     projectOverride?: Project
   ) => {
     const variables = buildUpdateVariables(patch, projectOverride);
-    return variables ? updateProjectAsync(variables) : undefined;
+    return variables ? updateProjectAsync(variables, work) : undefined;
   };
 
   return {

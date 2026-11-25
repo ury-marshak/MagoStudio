@@ -102,7 +102,7 @@ afterEach(async () => {
 });
 
 describe("persistent fal queue jobs", () => {
-  it("snapshots the endpoint before submission and fetches the original job after reopening the library", async () => {
+  it("preserves accepted jobs but gates polling and downloads on the configured account after reopening", async () => {
     fetchMock.mockImplementationOnce(async () => {
       expect(await jobs.get(input.id)).toMatchObject({
         status: "SUBMITTING",
@@ -132,7 +132,10 @@ describe("persistent fal queue jobs", () => {
     manager.close();
     await manager.open(directory);
     const reopened = new ExternalRenderJobRepository(manager);
-    const currentConfig = vi.fn(async () => ({ keychainAccount: "fal-new" }));
+    let account: string | undefined = "fal-new";
+    const currentConfig = vi.fn(async () =>
+      account ? { keychainAccount: account } : null
+    );
     service = new ExternalRenderJobService(
       reopened,
       new Map([["fal", new FalRenderProvider(currentConfig, readKey)]]),
@@ -152,6 +155,26 @@ describe("persistent fal queue jobs", () => {
         Response.json({ images: [{ url: "https://v3.fal.media/output.png" }] })
       );
 
+    const denied = async (action: () => Promise<unknown>) => {
+      const keyCalls = readKey.mock.calls.length;
+      const requests = fetchMock.mock.calls.length;
+      await expect(action()).rejects.toThrow(
+        /fal Keychain account used for this render/
+      );
+      expect(readKey).toHaveBeenCalledTimes(keyCalls);
+      expect(fetchMock).toHaveBeenCalledTimes(requests);
+    };
+    for (const unavailable of ["fal-new", undefined]) {
+      account = unavailable;
+      await denied(() => service.refresh(input.id));
+      await denied(() => service.cancel(input.id));
+    }
+    expect(await reopened.get(input.id)).toMatchObject({
+      requestId,
+      status: "SUBMITTED",
+      requestJson: input.requestJson
+    });
+    account = "fal-original";
     expect(await reopened.listRecoverable()).toMatchObject([{ requestId }]);
     await expect(service.refresh(input.id)).resolves.toMatchObject({
       status: "SUBMITTED"
@@ -161,11 +184,25 @@ describe("persistent fal queue jobs", () => {
       endpoint,
       outputJson: { urls: ["https://v3.fal.media/output.png"] }
     });
-    expect(currentConfig).not.toHaveBeenCalled();
+    for (const unavailable of ["fal-new", undefined]) {
+      account = unavailable;
+      await denied(() => service.ingest(input.id));
+    }
+    expect(await reopened.get(input.id)).toMatchObject({
+      requestId,
+      status: "OUTPUT_READY",
+      requestJson: input.requestJson
+    });
+    account = "fal-original";
+    fetchMock.mockResolvedValueOnce(new Response("synthetic image"));
+    await expect(service.ingest(input.id)).resolves.toMatchObject({
+      requestId,
+      status: "INGESTED"
+    });
     expect(readKey.mock.calls).toEqual([
-      ["fal-original"],
-      ["fal-original"],
-      ["fal-original"]
+      ["fal-original", expect.any(AbortSignal)],
+      ["fal-original", expect.any(AbortSignal)],
+      ["fal-original", expect.any(AbortSignal)]
     ]);
     expect(
       fetchMock.mock.calls.map(([target, options]) => [target, options?.method])
@@ -173,7 +210,8 @@ describe("persistent fal queue jobs", () => {
       [`https://queue.fal.run/${endpoint}`, "POST"],
       [`${url}/status`, "GET"],
       [`${url}/status`, "GET"],
-      [url, "GET"]
+      [url, "GET"],
+      ["https://v3.fal.media/output.png", undefined]
     ]);
   });
 
@@ -562,6 +600,91 @@ describe("external render asset transfer", () => {
       redirect: "error",
       signal: expect.any(AbortSignal)
     });
+  });
+
+  it("recovers the same accepted job after A → B → A while its old URL renewal is held", async () => {
+    const renewed = "https://v3.fal.media/current.png";
+    let account = "fal-original";
+    service = new ExternalRenderJobService(
+      jobs,
+      new Map([
+        [
+          "fal",
+          new FalRenderProvider(
+            async () => ({ keychainAccount: account }),
+            readKey
+          )
+        ]
+      ]),
+      transfer
+    );
+    let started!: (signal: AbortSignal) => void;
+    const reading = new Promise<AbortSignal>((resolve) => {
+      started = resolve;
+    });
+    let release!: (response: Response) => void;
+    const held = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    fetchMock
+      .mockResolvedValueOnce(queued())
+      .mockResolvedValueOnce(completed())
+      .mockResolvedValueOnce(result([outputUrl]))
+      .mockResolvedValueOnce(new Response(null, { status: 403 }))
+      .mockImplementationOnce(async (_, init) => {
+        started(init!.signal!);
+        return held;
+      });
+    await service.submit(input);
+    await service.refresh(input.id);
+    const first = new AbortController();
+    const old = service
+      .ingest(input.id, first.signal)
+      .catch((error: unknown) => error);
+    let replacement: Promise<unknown> | undefined;
+    try {
+      const retiredTransport = await reading;
+      first.abort(new Error("The app profile changed"));
+      account = "fal-new";
+      account = "fal-original";
+      expect(retiredTransport.aborted).toBe(true);
+      fetchMock
+        .mockResolvedValueOnce(new Response(null, { status: 403 }))
+        .mockResolvedValueOnce(completed())
+        .mockResolvedValueOnce(result([renewed]))
+        .mockResolvedValueOnce(new Response("recovered image"));
+      replacement = service.ingest(input.id);
+      const settled = vi.fn();
+      void replacement.then(settled, settled);
+      await vi.waitFor(
+        () =>
+          expect(settled).toHaveBeenCalledWith(
+            expect.objectContaining({ status: "INGESTED", requestId })
+          ),
+        { timeout: 500 }
+      );
+      expect(await old).toMatchObject({ message: "The app profile changed" });
+    } finally {
+      release(completed());
+      await Promise.allSettled([old, replacement]);
+    }
+    expect(await jobs.get(input.id)).toMatchObject({
+      requestId,
+      status: "INGESTED",
+      outputJson: { urls: [renewed] }
+    });
+    expect(
+      fetchMock.mock.calls
+        .map(([target, init]) => [target, init?.method ?? "GET"])
+        .slice(3)
+    ).toEqual([
+      [outputUrl, "GET"],
+      [`${url}/status`, "GET"],
+      [outputUrl, "GET"],
+      [`${url}/status`, "GET"],
+      [url, "GET"],
+      [renewed, "GET"]
+    ]);
   });
 });
 

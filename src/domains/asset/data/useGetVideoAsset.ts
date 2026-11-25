@@ -1,6 +1,9 @@
 import { useAuth } from "@platform/identity";
 import { useQuery } from "@tanstack/react-query";
 
+import { isLocalApp } from "@/platform/localDesktop";
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
+import { releaseRendererObjectUrl } from "@/platform/rendererObjectUrl";
 import { queryKeys } from "@/queryKeys";
 
 import { getVideoAsset } from "../api/getVideoAsset";
@@ -30,93 +33,107 @@ export const useGetVideoAsset = ({
   enabled?: boolean;
   priority?: number;
 }) => {
-  const isEnabled = !!assetId && enabled;
+  const scope = useRendererLibraryQueryScope();
+  const isEnabled = scope.active && !!assetId && enabled;
   useAssetDownloadPriority(assetId, isEnabled, priority);
   const { getToken } = useAuth();
 
-  const queryFn = async () => {
-    if (!assetId) return;
+  const queryKey = scope.key(queryKeys.videoAsset.byId(assetId));
+  const queryFn = () =>
+    scope.run(async () => {
+      if (!assetId) return;
 
-    if (window.mago) {
-      const asset = await window.mago.assets.get(assetId);
-      if (asset) {
-        // A cloud video whose file has not been downloaded yet has no bytes
-        // behind its URL. Handing the URL out anyway makes the player and the
-        // frame extractor fail once and stay failed, so it stays unresolved
-        // (and is polled / invalidated) until the download lands.
-        const isAwaitingDownload =
-          asset.data?.cloudMirror === true && asset.data?.status !== "ingested";
-        // Something is mounted and waiting for this file, so fetch it sooner.
-        const playableUrl = isAwaitingDownload ? "" : asset.filepath;
-        return {
-          asset,
-          s3_url: playableUrl,
-          urlToUse: playableUrl
-        } as VideoAssetIngestionSuccess;
+      if (window.mago) {
+        const asset = await window.mago.assets.get(assetId);
+        scope.work.check();
+        if (asset) {
+          // A cloud video whose file has not been downloaded yet has no bytes
+          // behind its URL. Handing the URL out anyway makes the player and the
+          // frame extractor fail once and stay failed, so it stays unresolved
+          // (and is polled / invalidated) until the download lands.
+          const isAwaitingDownload =
+            asset.data?.cloudMirror === true &&
+            asset.data?.status !== "ingested";
+          // Something is mounted and waiting for this file, so fetch it sooner.
+          const playableUrl = isAwaitingDownload ? "" : asset.filepath;
+          return {
+            asset,
+            s3_url: playableUrl,
+            urlToUse: playableUrl
+          } as VideoAssetIngestionSuccess;
+        }
       }
-    }
 
-    let token: string | null;
-    try {
-      token = await getToken({ template: "basicToken" });
-    } catch {
-      return;
-    }
-    if (!token) return;
+      let token: string | null;
+      try {
+        token = await getToken({ template: "basicToken" });
+      } catch {
+        return;
+      }
+      scope.work.check();
+      if (!token) return;
 
-    const result = await getVideoAsset({
-      assetId,
-      selectedLayerId,
-      clerkToken: token
+      const result = await getVideoAsset({
+        assetId,
+        selectedLayerId,
+        clerkToken: token,
+        signal: isLocalApp ? scope.work.signal : undefined
+      });
+
+      scope.work.check();
+      if (result && "error_message" in result) {
+        const error = new Error(result.error_message) as Error & {
+          status?: number;
+        };
+        if ("status" in result && typeof result.status === "number") {
+          error.status = result.status;
+        }
+        throw error;
+      }
+
+      const hasS3Url =
+        result &&
+        typeof result === "object" &&
+        "s3_url" in result &&
+        assetId &&
+        !!result.s3_url;
+
+      if (hasS3Url) {
+        const { urlToUse } = await cacheVideoUrl(
+          result.s3_url,
+          assetId,
+          scope.work
+        );
+
+        scope.work.check();
+        const controlNets = (result as VideoAssetIngestionSuccess).asset
+          ?.manifest?.controlNets;
+        if (controlNets) {
+          controlNets.forEach((cn) => {
+            cacheVideoUrl(cn.video, cn.video, scope.work)
+              .then(({ urlToUse }) => {
+                releaseRendererObjectUrl(urlToUse);
+              })
+              .catch((error) => {
+                if (scope.work.signal.aborted) return;
+                console.warn("Failed to preload controlnet video:", error);
+              });
+          });
+        }
+
+        return { ...result, urlToUse };
+      }
+
+      return { ...result, urlToUse: "" };
     });
 
-    if (result && "error_message" in result) {
-      const error = new Error(result.error_message) as Error & {
-        status?: number;
-      };
-      if ("status" in result && typeof result.status === "number") {
-        error.status = result.status;
-      }
-      throw error;
-    }
-
-    const hasS3Url =
-      result &&
-      typeof result === "object" &&
-      "s3_url" in result &&
-      assetId &&
-      !!result.s3_url;
-
-    if (hasS3Url) {
-      const { urlToUse } = await cacheVideoUrl(result.s3_url, assetId);
-
-      const controlNets = (result as VideoAssetIngestionSuccess).asset?.manifest
-        ?.controlNets;
-      if (controlNets) {
-        controlNets.forEach((cn) => {
-          cacheVideoUrl(cn.video, cn.video)
-            .then(({ urlToUse }) => {
-              URL.revokeObjectURL(urlToUse);
-            })
-            .catch((error) => {
-              console.warn("Failed to preload controlnet video:", error);
-            });
-        });
-      }
-
-      return { ...result, urlToUse };
-    }
-
-    return { ...result, urlToUse: "" };
-  };
-
   const queryResult = useQuery<VideoAssetResponse | undefined, Error>({
-    queryKey: queryKeys.videoAsset.byId(assetId),
+    queryKey,
     queryFn,
     enabled: isEnabled,
     staleTime: Infinity,
-    gcTime: Infinity,
-    retry: (failureCount, error) => {
+    gcTime: isLocalApp ? undefined : Infinity,
+    retry: scope.retry(queryKey, (failureCount, error) => {
       const errorWithStatus = error as Error & { status?: number };
       if (
         errorWithStatus.status &&
@@ -125,7 +142,7 @@ export const useGetVideoAsset = ({
         return false;
       }
       return failureCount < MAX_RETRY_COUNT;
-    },
+    }),
     retryDelay: (attemptIndex) =>
       Math.min(1000 * 2 ** attemptIndex, MAX_RETRY_DELAY_MS),
     refetchOnMount: false,

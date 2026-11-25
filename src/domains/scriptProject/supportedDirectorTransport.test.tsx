@@ -211,6 +211,7 @@ const profile = {
   vision: visionConfig,
   fal: { keychainAccount: "fixture-fal-account" }
 };
+const replacementFal = { keychainAccount: "fixture-replacement-fal-account" };
 const storage =
   "https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3";
 const cdn = "https://v3.fal.media";
@@ -226,6 +227,7 @@ let completion: string;
 let providerStatus: number;
 let falStatus: number;
 let disconnected: boolean;
+let failVideoDownload: boolean;
 let view: ReturnType<typeof render> | undefined;
 let backendTransport: ReturnType<typeof vi.fn<AxiosAdapter>>;
 const nodeFetch = vi.fn<typeof fetch>();
@@ -239,6 +241,7 @@ const jsonBody = (options?: RequestInit): Row => {
 beforeEach(async () => {
   vi.resetModules();
   vi.clearAllMocks();
+  nodeFetch.mockReset();
   fixture.handlers.clear();
   fixture.appListeners.clear();
   fixture.rendererListeners.clear();
@@ -250,6 +253,7 @@ beforeEach(async () => {
   providerStatus = 200;
   falStatus = 200;
   disconnected = false;
+  failVideoDownload = false;
   root = await mkdtemp(path.join(tmpdir(), "mago-combined-transport-"));
   fixture.userData = path.join(root, "profile");
   library = path.join(root, "library");
@@ -269,7 +273,8 @@ beforeEach(async () => {
       ![
         textConfig.keychainAccount,
         visionConfig.keychainAccount,
-        profile.fal.keychainAccount
+        profile.fal.keychainAccount,
+        replacementFal.keychainAccount
       ].includes(account)
     )
       throw new Error("Unexpected fixture account");
@@ -361,8 +366,12 @@ beforeEach(async () => {
         return Response.json(
           video ? { video: { url: output } } : { images: [{ url: output }] }
         );
-      if (url === output && method === "GET")
+      if (url === output && method === "GET") {
+        // A transient failure keeps the provider's result checkpoint intact.
+        if (video && failVideoDownload)
+          return new Response(null, { status: 503 });
         return new Response(new Uint8Array(fixture.png));
+      }
     }
     fixture.forbidden(`Unexpected Node fetch ${method} ${url}`);
     throw new Error("Unreachable");
@@ -502,7 +511,24 @@ const chat = async () => {
   )!;
 };
 
-it("traces local chat/casting, fal reference/storyboard and prepared shot submission/recovery across renderer/preload/main", async () => {
+const readExternalJobs = async () => {
+  const { DatabaseManager } =
+    await import("../../../desktop/main/database/databaseManager");
+  const { externalRenderJobs } =
+    await import("../../../desktop/main/database/schema");
+  const manager = new DatabaseManager();
+  await manager.open(library);
+  try {
+    return await manager.get().select().from(externalRenderJobs);
+  } finally {
+    manager.close();
+  }
+};
+
+async function traceDirectorRecovery(
+  checkpoint: "SUBMITTED" | "OUTPUT_READY",
+  change: "replace" | "remove"
+) {
   await start();
   completion = JSON.stringify({
     function_call: { name: "reply", args: { message: "A mug in a studio." } }
@@ -588,7 +614,8 @@ it("traces local chat/casting, fal reference/storyboard and prepared shot submis
     overall_soundscape: "Room tone.",
     non_diegetic_music: "N/A"
   });
-  disconnected = true;
+  disconnected = checkpoint === "SUBMITTED";
+  failVideoDownload = checkpoint === "OUTPUT_READY";
   const { postGenerateProjectShots } =
     await import("@/domains/scriptProject/api/postGenerateProjectShots");
   const shots = await postGenerateProjectShots({
@@ -626,8 +653,20 @@ it("traces local chat/casting, fal reference/storyboard and prepared shot submis
     prompt: submissions[2].body.prompt
   });
   expect(submitted.local_preparation_digest).toBe(preparation.digest);
-  const beforeRecovery = trace.slice();
-  const keyReads = fixture.key.mock.calls.length;
+  const savedJob = (await readExternalJobs()).find(
+    (job) => job.id === submitted.id
+  )!;
+  const video = `${queue}minimax/h3-max`;
+  const requestUrl = `${video}/requests/fixture-3`;
+  const outputUrl = `${cdn}/output/fixture-3.mp4`;
+  expect(savedJob).toMatchObject({
+    status: checkpoint,
+    requestId: "fixture-3",
+    keychainAccount: profile.fal.keychainAccount,
+    outputJson: checkpoint === "OUTPUT_READY" ? { urls: [outputUrl] } : null
+  });
+  const beforeBlocked = trace.length;
+  const keysBeforeBlocked = fixture.key.mock.calls.length;
   // Accepted recovery must not resolve/re-upload these now-missing inputs.
   await rm(path.join(library, "renders", "external"), {
     recursive: true,
@@ -637,25 +676,62 @@ it("traces local chat/casting, fal reference/storyboard and prepared shot submis
     recursive: true,
     force: true
   });
-  disconnected = false;
-  await window.mago!.scriptProjects.resumePlan(shots.plan_id!);
-  await waitPlan(shots.plan_id!);
-  expect(submissions).toHaveLength(3);
+  const { fal } = window.mago!.externalProviders;
+  const resume = () => window.mago!.scriptProjects.resumePlan(shots.plan_id!);
+  await fal.save(change === "replace" ? replacementFal : null);
+  // Keep the transport fault armed so a regression still leaves a retryable
+  // checkpoint. The traffic/Keychain ledger below catches the unauthorized work.
+  await resume();
+  const blocked = await waitPlan(shots.plan_id!, "PAUSED");
+  expect
+    .soft({
+      keychainAccounts: fixture.key.mock.calls
+        .slice(keysBeforeBlocked)
+        .map(([account]) => account),
+      requests: trace.slice(beforeBlocked)
+    })
+    .toEqual({ keychainAccounts: [], requests: [] });
+  expect(blocked.local_request).toEqual(paused.local_request);
+  expect(blocked.local_prepared_shots).toEqual(paused.local_prepared_shots);
   expect(
-    trace.slice(beforeRecovery.length).every(([method]) => method === "GET")
-  ).toBe(true);
-  expect(fixture.key.mock.calls.slice(keyReads)).toEqual([
-    [profile.fal.keychainAccount]
+    (blocked.steps as Row[]).find((step) => step.id === submitted.id)
+  ).toEqual(submitted);
+  expect(
+    (await readExternalJobs()).find((job) => job.id === submitted.id)
+  ).toEqual(savedJob);
+
+  const beforeRecovery = trace.length;
+  const keysBeforeRecovery = fixture.key.mock.calls.length;
+  await fal.save(profile.fal);
+  disconnected = false;
+  failVideoDownload = false;
+  await resume();
+  const finished = await waitPlan(shots.plan_id!);
+  expect(finished.local_request).toEqual(paused.local_request);
+  expect(finished.local_prepared_shots).toEqual(paused.local_prepared_shots);
+  expect(submissions).toHaveLength(3);
+  expect(uploads).toHaveLength(4);
+  expect(trace.slice(beforeRecovery)).toEqual([
+    ...(checkpoint === "SUBMITTED"
+      ? [
+          ["GET", `${requestUrl}/status`],
+          ["GET", requestUrl]
+        ]
+      : []),
+    ["GET", outputUrl]
   ]);
-  const finished = await window.mago!.scriptProjects.getPlan(shots.plan_id!);
-  expect(finished!.local_prepared_shots).toEqual(paused.local_prepared_shots);
+  expect(fixture.key.mock.calls.slice(keysBeforeRecovery)).toEqual(
+    checkpoint === "SUBMITTED"
+      ? [[profile.fal.keychainAccount, expect.any(AbortSignal)]]
+      : []
+  );
+
   const text = `${textConfig.baseUrl}/chat/completions`;
   const vision = `${visionConfig.baseUrl}/chat/completions`;
   const image = `${queue}minimax/h3-image`;
-  const video = `${queue}minimax/h3-max`;
   // Exact ordered ledger: three text completions, one description, four typed
-  // uploads, three submissions, one failed status and GET-only recovery.
-  expect(trace).toEqual([
+  // uploads and three submissions up to the initial transport failure.
+  expect(trace.slice(0, beforeBlocked)).toEqual([
     ["POST", text],
     ["POST", text],
     ["POST", `${image}/text-to-image`],
@@ -677,43 +753,65 @@ it("traces local chat/casting, fal reference/storyboard and prepared shot submis
     ["POST", storage],
     ["PUT", `${cdn}/upload/fixture-upload-4`],
     ["POST", `${video}/reference-to-video`],
-    ["GET", `${video}/requests/fixture-3/status`],
-    ["GET", `${video}/requests/fixture-3/status`],
-    ["GET", `${video}/requests/fixture-3`],
-    ["GET", `${cdn}/output/fixture-3.mp4`]
+    ["GET", `${requestUrl}/status`],
+    ...(checkpoint === "OUTPUT_READY"
+      ? [
+          ["GET", requestUrl],
+          ["GET", outputUrl]
+        ]
+      : [])
   ]);
-  expect(fixture.key.mock.calls).toEqual([
-    [textConfig.keychainAccount],
-    [textConfig.keychainAccount],
-    [profile.fal.keychainAccount],
-    [profile.fal.keychainAccount],
-    [visionConfig.keychainAccount],
-    [profile.fal.keychainAccount],
-    [profile.fal.keychainAccount],
-    [textConfig.keychainAccount],
-    [profile.fal.keychainAccount],
-    [profile.fal.keychainAccount],
-    [profile.fal.keychainAccount]
+  expect(fixture.key.mock.calls.slice(0, keysBeforeBlocked)).toEqual([
+    [
+      textConfig.keychainAccount,
+      expect.objectContaining({ aborted: expect.any(Boolean) })
+    ],
+    [
+      textConfig.keychainAccount,
+      expect.objectContaining({ aborted: expect.any(Boolean) })
+    ],
+    [profile.fal.keychainAccount, expect.any(AbortSignal)],
+    [profile.fal.keychainAccount, expect.any(AbortSignal)],
+    [
+      visionConfig.keychainAccount,
+      expect.objectContaining({ aborted: expect.any(Boolean) })
+    ],
+    [profile.fal.keychainAccount, expect.any(AbortSignal)],
+    [profile.fal.keychainAccount, expect.any(AbortSignal)],
+    [
+      textConfig.keychainAccount,
+      expect.objectContaining({ aborted: expect.any(Boolean) })
+    ],
+    [profile.fal.keychainAccount, expect.any(AbortSignal)],
+    [profile.fal.keychainAccount, expect.any(AbortSignal)]
   ]);
-  const { DatabaseManager } =
-    await import("../../../desktop/main/database/databaseManager");
-  const { externalRenderJobs } =
-    await import("../../../desktop/main/database/schema");
-  const manager = new DatabaseManager();
-  await manager.open(library);
-  try {
-    expect(
-      (await manager.get().select().from(externalRenderJobs)).map(
-        (job) => job.status
-      )
-    ).toEqual(["INGESTED", "INGESTED", "INGESTED"]);
-    expect(await readFile(path.join(library, "mago.sqlite3"))).not.toHaveLength(
-      0
-    );
-  } finally {
-    manager.close();
-  }
-});
+  const jobs = await readExternalJobs();
+  expect(jobs.map((job) => job.status)).toEqual([
+    "INGESTED",
+    "INGESTED",
+    "INGESTED"
+  ]);
+  expect(jobs.find((job) => job.id === savedJob.id)).toMatchObject({
+    requestId: savedJob.requestId,
+    requestJson: savedJob.requestJson,
+    inputAssetIds: savedJob.inputAssetIds,
+    keychainAccount: savedJob.keychainAccount,
+    outputJson: { urls: [outputUrl] }
+  });
+  expect(await readFile(path.join(library, "mago.sqlite3"))).not.toHaveLength(
+    0
+  );
+}
+
+it.each([
+  ["SUBMITTED", "replace"],
+  ["SUBMITTED", "remove"],
+  ["OUTPUT_READY", "replace"],
+  ["OUTPUT_READY", "remove"]
+] as const)(
+  "traces Director across renderer/preload/main: %s saved shot recovery when you %s fal",
+  traceDirectorRecovery
+);
 
 it.each([
   {
@@ -767,7 +865,10 @@ it.each([
       ])
     );
     expect(fixture.key.mock.calls).toEqual(
-      Array.from({ length: calls }, () => [textConfig.keychainAccount])
+      Array.from({ length: calls }, () => [
+        textConfig.keychainAccount,
+        expect.objectContaining({ aborted: expect.any(Boolean) })
+      ])
     );
   }
 );
@@ -834,7 +935,12 @@ it.each(["network", "credential"])(
         ? [["POST", `${textConfig.baseUrl}/chat/completions`]]
         : []
     );
-    expect(fixture.key.mock.calls).toEqual([[textConfig.keychainAccount]]);
+    expect(fixture.key.mock.calls).toEqual([
+      [
+        textConfig.keychainAccount,
+        expect.objectContaining({ aborted: expect.any(Boolean) })
+      ]
+    ]);
   }
 );
 
@@ -869,6 +975,177 @@ it.each([401, 429])(
     expect(trace).toEqual([["POST", `${queue}minimax/h3-image/text-to-image`]]);
     expect(submissions).toEqual([]);
     expect(uploads).toEqual([]);
-    expect(fixture.key.mock.calls).toEqual([[profile.fal.keychainAccount]]);
+    expect(fixture.key.mock.calls).toEqual([
+      [profile.fal.keychainAccount, expect.any(AbortSignal)]
+    ]);
+  }
+);
+
+it.each(["resume", "export"] as const)(
+  "admits Director %s after a fal provider change interrupts a partial submission acknowledgement",
+  async (action) => {
+    await start();
+    const { postGenerateProjectSheets } =
+      await import("@/domains/scriptProject/api/postGenerateProjectSheets");
+    const { postProjectCutExport } =
+      await import("@/domains/scriptProject/api/postProjectCutExport");
+    const { resumePlan } = await import("@/domains/plan/resumePlan");
+    const { DatabaseManager } =
+      await import("../../../desktop/main/database/databaseManager");
+    const { ScriptProjectSnapshotRepository } =
+      await import("../../../desktop/main/database/scriptProjectSnapshotRepository");
+    const { scriptProjects, externalProviders } = window.mago!;
+    const manager = new DatabaseManager();
+    await manager.open(library);
+    const media = await (async () => {
+      try {
+        const snapshots = new ScriptProjectSnapshotRepository(
+          manager,
+          async () => library
+        );
+        return await snapshots.storeGeneratedMedia(
+          projectId,
+          Buffer.from("fixture pinned video"),
+          "mp4"
+        );
+      } finally {
+        manager.close();
+      }
+    })();
+    const timelineId = "fixture-timeline";
+    await scriptProjects.put({
+      projectId,
+      state: {
+        keys: [
+          {
+            token: "mug",
+            name: "Mug",
+            kind: "prop",
+            prompt: "A blue mug",
+            enabled: true
+          }
+        ],
+        shots: [{ timeline_id: timelineId, shot_index: 0, sequence_id: 1 }]
+      },
+      cut: { shots: [{ timeline_id: timelineId, asset_id: media.id }] }
+    });
+    const exportRequest = { projectId, isDryRun: false };
+    expect(
+      await postProjectCutExport({ ...exportRequest, isDryRun: true })
+    ).toMatchObject({ would_export: [1], refused: [] });
+    const concatenateVideos = vi
+      .spyOn(
+        await import("../../../desktop/main/scriptProjects/localScriptMedia"),
+        "concatenateVideos"
+      )
+      .mockResolvedValue(Buffer.from("fixture exported cut"));
+
+    const endpoint = `${queue}minimax/h3-image/text-to-image`;
+    const waitingForRest = vi.fn();
+    const cancelBody = vi.fn();
+    const partialAck = new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode('{"request_id":"fixture-partial",')
+            );
+          },
+          // There is no EOF or transport abort listener. With a zero
+          // high-water mark, pull runs when the reader asks for more bytes.
+          pull: waitingForRest,
+          cancel: cancelBody
+        },
+        { highWaterMark: 0 }
+      )
+    );
+    let submitSignal: AbortSignal | null | undefined;
+    nodeFetch.mockImplementationOnce(async (target, options) => {
+      expect(target).toBe(endpoint);
+      expect(options?.method).toBe("POST");
+      trace.push(["POST", endpoint]);
+      submitSignal = options?.signal;
+      return partialAck;
+    });
+    const { plan_id: planId } = await postGenerateProjectSheets({
+      projectId,
+      isDryRun: false,
+      settings: { render_model: "fal_minimax_h3_image" }
+    });
+    expect(planId).toBeTypeOf("string");
+    await vi.waitFor(() => expect(waitingForRest).toHaveBeenCalled());
+    expect(submitSignal?.aborted).toBe(false);
+    expect(await scriptProjects.getPlan(planId!)).toMatchObject({
+      status: "RUNNING"
+    });
+    const [submitting] = await readExternalJobs();
+    expect(submitting).toMatchObject({
+      projectId,
+      status: "SUBMITTING",
+      requestId: null,
+      keychainAccount: profile.fal.keychainAccount
+    });
+
+    await externalProviders.fal.save(replacementFal);
+    expect(submitSignal?.aborted).toBe(true);
+
+    // Retry only lock contention: publishing PAUSED and releasing the run
+    // need not be synchronous with the settings IPC reply.
+    const admit = async <T,>(dispatch: () => Promise<T>) => {
+      const result = await vi.waitFor(async () => {
+        try {
+          return { value: await dispatch() };
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            error.message ===
+              "This local script project already has a job running"
+          ) {
+            throw error;
+          }
+          return { error };
+        }
+      });
+      if ("error" in result) throw result.error;
+      return result.value;
+    };
+    if (action === "resume") {
+      expect(await admit(() => resumePlan(planId!))).toMatchObject({
+        id: planId,
+        status: "PENDING"
+      });
+      expect(await waitPlan(planId!, "PAUSED")).toMatchObject({
+        error: { message: expect.stringContaining("may have accepted") }
+      });
+    } else {
+      const dispatch = await admit(() => postProjectCutExport(exportRequest));
+      expect(dispatch).toMatchObject({ would_export: [1], refused: [] });
+      expect(dispatch.plan_id).toBeTypeOf("string");
+      await waitPlan(dispatch.plan_id!);
+      expect(concatenateVideos).toHaveBeenCalledExactlyOnceWith(
+        [media.path],
+        expect.any(AbortSignal)
+      );
+      expect((await scriptProjects.get(projectId))?.cut?.export).toMatchObject({
+        plan_id: dispatch.plan_id,
+        stale: false
+      });
+      await waitPlan(planId!, "PAUSED");
+    }
+
+    expect(cancelBody).toHaveBeenCalledOnce();
+    expect(trace).toEqual([["POST", endpoint]]);
+    expect(fixture.key.mock.calls).toEqual([
+      [profile.fal.keychainAccount, expect.any(AbortSignal)]
+    ]);
+    expect(await readExternalJobs()).toEqual([
+      expect.objectContaining({
+        id: submitting.id,
+        projectId,
+        status: "SUBMISSION_UNKNOWN",
+        requestId: null,
+        keychainAccount: profile.fal.keychainAccount
+      })
+    ]);
   }
 );

@@ -3,6 +3,7 @@ import { AxiosError, AxiosHeaders } from "axios";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import { RendererLibrarySession } from "@/platform/rendererLibraryWork";
 
 import { cancelCloudQueueItem } from "./cancelCloudQueueItem";
 import { QueueItem } from "./interface";
@@ -16,6 +17,7 @@ vi.mock("@/lib/backend-api-client", () => ({
 }));
 
 vi.mock("@/platform/localDesktop", () => ({
+  isLocalApp: false,
   getLocalDesktopApi: () => desktopApi
 }));
 
@@ -27,6 +29,9 @@ const notFoundError = () =>
     config: { headers: new AxiosHeaders() },
     data: {}
   });
+
+const work = new RendererLibrarySession().capture();
+const config = { signal: work.signal };
 
 const queueItem = (overrides: Partial<QueueItem> = {}): QueueItem =>
   ({
@@ -45,6 +50,7 @@ describe("cancelCloudQueueItem", () => {
 
   it("deletes the cloud queue item of a locally tracked render and cancels the local job", async () => {
     await cancelCloudQueueItem({
+      work,
       queueItem: queueItem({
         cloud_queue_item_id: "cloud-queue-1",
         cloud_output_layer_id: "cloud-layer-1"
@@ -54,7 +60,8 @@ describe("cancelCloudQueueItem", () => {
 
     expect(backendApiClient.delete).toHaveBeenCalledTimes(1);
     expect(backendApiClient.delete).toHaveBeenCalledWith(
-      "/queue/cloud-queue-1"
+      "/queue/cloud-queue-1",
+      config
     );
     expect(desktopApi.imageRenders.cancel).toHaveBeenCalledWith("local-job-1");
   });
@@ -72,14 +79,15 @@ describe("cancelCloudQueueItem", () => {
     });
 
     await cancelCloudQueueItem({
+      work,
       queueItem: queueItem(),
       shouldDeleteCloudOutputLayer: true
     });
 
-    expect(backendApiClient.get).toHaveBeenCalledWith("/queue");
+    expect(backendApiClient.get).toHaveBeenCalledWith("/queue", config);
     expect(vi.mocked(backendApiClient.delete).mock.calls).toEqual([
-      ["/queue/cloud-queue-1"],
-      ["/layers/cloud-layer-1"]
+      ["/queue/cloud-queue-1", config],
+      ["/layers/cloud-layer-1", config]
     ]);
     expect(desktopApi.imageRenders.cancel).toHaveBeenCalledWith("local-job-1");
   });
@@ -88,6 +96,7 @@ describe("cancelCloudQueueItem", () => {
     vi.mocked(backendApiClient.get).mockResolvedValue({ data: [] });
 
     await cancelCloudQueueItem({
+      work,
       queueItem: queueItem(),
       shouldDeleteCloudOutputLayer: true
     });
@@ -100,12 +109,13 @@ describe("cancelCloudQueueItem", () => {
     vi.mocked(backendApiClient.get).mockResolvedValue({ data: [] });
 
     await cancelCloudQueueItem({
+      work,
       queueItem: queueItem({ cloud_output_layer_id: "cloud-layer-stored" }),
       shouldDeleteCloudOutputLayer: true
     });
 
     expect(vi.mocked(backendApiClient.delete).mock.calls).toEqual([
-      ["/layers/cloud-layer-stored"]
+      ["/layers/cloud-layer-stored", config]
     ]);
     expect(desktopApi.imageRenders.cancel).toHaveBeenCalledWith("local-job-1");
   });
@@ -114,6 +124,7 @@ describe("cancelCloudQueueItem", () => {
     vi.mocked(backendApiClient.delete).mockRejectedValue(notFoundError());
 
     await cancelCloudQueueItem({
+      work,
       queueItem: queueItem({ cloud_queue_item_id: "cloud-queue-1" }),
       shouldDeleteCloudOutputLayer: false
     });
@@ -126,6 +137,7 @@ describe("cancelCloudQueueItem", () => {
 
     await expect(
       cancelCloudQueueItem({
+        work,
         queueItem: queueItem({ cloud_queue_item_id: "cloud-queue-1" }),
         shouldDeleteCloudOutputLayer: false
       })
@@ -135,6 +147,7 @@ describe("cancelCloudQueueItem", () => {
 
   it("deletes a backend-only render by its own id and leaves its layer to the track delete", async () => {
     await cancelCloudQueueItem({
+      work,
       queueItem: queueItem({
         id: "cloud-queue-2",
         layer_id: "cloud-layer-2",
@@ -145,8 +158,42 @@ describe("cancelCloudQueueItem", () => {
     });
 
     expect(vi.mocked(backendApiClient.delete).mock.calls).toEqual([
-      ["/queue/cloud-queue-2"]
+      ["/queue/cloud-queue-2", config]
     ]);
+    expect(desktopApi.imageRenders.cancel).not.toHaveBeenCalled();
+  });
+
+  it("does not start DELETE after an abort-ignoring queue lookup", async () => {
+    const session = new RendererLibrarySession();
+    const work = session.capture();
+    const lookedUp = Promise.withResolvers<{ data: unknown }>();
+    vi.mocked(backendApiClient.get).mockReturnValue(lookedUp.promise);
+    const cancelled = cancelCloudQueueItem({
+      queueItem: queueItem(),
+      shouldDeleteCloudOutputLayer: true,
+      work
+    });
+    const outcome = expect(cancelled).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await vi.waitFor(() =>
+      expect(backendApiClient.get).toHaveBeenCalledWith("/queue", {
+        signal: work.signal
+      })
+    );
+    await session.suspend();
+    session.reset();
+    lookedUp.resolve({
+      data: [
+        {
+          id: "cloud-queue-1",
+          asset_id: "cloud-asset-1",
+          layer_id: "cloud-layer-1"
+        }
+      ]
+    });
+    await outcome;
+    expect(backendApiClient.delete).not.toHaveBeenCalled();
     expect(desktopApi.imageRenders.cancel).not.toHaveBeenCalled();
   });
 });

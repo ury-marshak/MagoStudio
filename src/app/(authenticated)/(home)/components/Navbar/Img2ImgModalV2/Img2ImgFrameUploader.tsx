@@ -1,5 +1,6 @@
 import { FieldFileDropZone } from "@components/Form/Fields/FieldFileDropZone";
 import { ImageThumbnail } from "@components/ImageThumbnail";
+import { OrdinaryFalImagePicker } from "@components/OrdinaryFal/OrdinaryFalImagePicker";
 import { Text } from "@components/Text";
 import { useImageAssets } from "@domains/asset/useImageAssets";
 import { useImg2ImgHistoryClips } from "@domains/track/useImg2ImgHistoryClips";
@@ -14,7 +15,10 @@ import {
 import { getClipSourceFrame } from "./hooks/utils/getClipSourceFrame";
 import { Img2ImgType } from "./schemas";
 
-export const Img2ImgFrameUploader: React.FC = ({}) => {
+export const Img2ImgFrameUploader: React.FC<{
+  falProjectId?: string;
+  directFal?: boolean;
+}> = ({ falProjectId, directFal }) => {
   const { t } = useTranslation();
   const { setValue, trigger } = useFormContext<Img2ImgType>();
   const iteratedAssetId = useWatch<Img2ImgType, "iteratedAssetId">({
@@ -76,11 +80,23 @@ export const Img2ImgFrameUploader: React.FC = ({}) => {
   }
 
   const uploadedImageValue = uploadedImageId ? [uploadedImageId] : [];
+  const label = t("img2imgForms.common.drag_and_drop_stylized_frame.label");
+  if (directFal) {
+    return (
+      <OrdinaryFalImagePicker
+        projectId={falProjectId}
+        text={label}
+        maxFileUpload={1}
+        value={uploadedImageValue}
+        onChange={handleUploadChange}
+      />
+    );
+  }
 
   return (
     <FieldFileDropZone
       name="uploadedImageId"
-      text={t("img2imgForms.common.drag_and_drop_stylized_frame.label")}
+      text={label}
       maxFileUpload={1}
       value={uploadedImageValue}
       onChange={handleUploadChange}

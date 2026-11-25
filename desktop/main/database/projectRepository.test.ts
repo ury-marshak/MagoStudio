@@ -1,4 +1,11 @@
-import { access, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -8,6 +15,9 @@ vi.mock("electron", () => ({
   app: {
     isPackaged: false,
     getAppPath: () => process.cwd()
+  },
+  nativeImage: {
+    createFromBuffer: () => ({ getSize: () => ({ width: 1280, height: 720 }) })
   }
 }));
 
@@ -382,6 +392,34 @@ describe("ProjectRepository", () => {
       await readdir(path.join(libraryRoot, "thumbnails", "assets"))
     ).toHaveLength(2);
     reopenedManager.close();
+  });
+
+  test("materializes a prepared frame in the library as a project input", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "mago-prepared-frame-"));
+    temporaryDirectories.push(root);
+    const manager = new DatabaseManager();
+    managers.push(manager);
+    await manager.open(root);
+    const repository = new ProjectRepository(manager, async () => root);
+    const project = await repository.create({
+      name: "Timeline",
+      description: "",
+      settings: { type: "timeline" }
+    });
+    const imported = await repository.importImage({
+      projectId: project.id,
+      name: "Frame",
+      width: 1,
+      height: 1,
+      dataUrl: "data:image/jpeg;base64,/9j/2Q=="
+    });
+    expect(imported.project_ids).toEqual([project.id]);
+    expect(imported.data.size).toEqual([1280, 720]);
+    const file = path.join(root, "assets", "prepared", `${imported.id}.jpg`);
+    expect(await readFile(file)).toEqual(Buffer.from("/9j/2Q==", "base64"));
+    expect(await repository.resolveMediaPath("asset", imported.id)).toEqual(
+      file
+    );
   });
 
   test("persists imported images as uploaded project assets without copying the source", async () => {

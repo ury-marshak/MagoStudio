@@ -26,6 +26,7 @@ const desktopProjects = [
 vi.mock("@/platform/localDesktop", () => ({
   isLocalApp: true,
   getLocalDesktopApi: () => ({
+    library: { onWillChange: async () => {}, onDidChange: () => {} },
     projects: { list: async () => desktopProjects }
   })
 }));

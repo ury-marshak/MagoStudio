@@ -15,6 +15,7 @@ import { app } from "electron";
 
 import {
   LOCAL_SCRIPT_TEXT_MODELS,
+  type ComfySettings,
   type LocalScriptTextModel,
   type LocalTextModelProvider,
   type LocalVlmBackend
@@ -112,10 +113,17 @@ export class LibrarySettings {
     return configuredRoot ? path.resolve(configuredRoot) : null;
   }
 
-  async hasCompletedLocalSetup(): Promise<boolean> {
+  async hasCompletedLocalSetup(options?: {
+    allowNetwork?: boolean;
+    signal?: AbortSignal;
+  }): Promise<boolean> {
     const settings = await this.readSettings();
+    options?.signal?.throwIfAborted();
     if (typeof settings.localSetupCompleted === "boolean")
       return settings.localSetupCompleted;
+    // Passive status and scoped installer preflight are observations, not a
+    // migration. In particular an unavailable/retired endpoint is not a flag.
+    if (options) return detectPriorSetup(settings, options);
     if (!this.setupBackfill) {
       this.setupBackfill = (async () => {
         const detected = await detectPriorSetup(settings);
@@ -132,8 +140,8 @@ export class LibrarySettings {
     return this.setupBackfill;
   }
 
-  async markLocalSetupCompleted(): Promise<void> {
-    await this.updateSettings({ localSetupCompleted: true });
+  async markLocalSetupCompleted(signal?: AbortSignal): Promise<void> {
+    await this.updateSettings({ localSetupCompleted: true }, signal);
   }
 
   async getAcceptedModelLicenseRepos(): Promise<string[]> {
@@ -161,17 +169,22 @@ export class LibrarySettings {
 
   recordInstalledModelGroup(
     groupId: LocalModelGroupId,
-    installedItemSha256s: string[]
+    installedItemSha256s: string[],
+    signal?: AbortSignal
   ): Promise<void> {
     return this.runSettingsWriteInOrder(async () => {
+      signal?.throwIfAborted();
       const settings = await this.readSettings();
-      await this.writeSettings({
-        ...settings,
-        installedModelGroups: {
-          ...this.readValidInstalledModelGroups(settings),
-          [groupId]: [...new Set(installedItemSha256s)]
-        }
-      });
+      await this.writeSettings(
+        {
+          ...settings,
+          installedModelGroups: {
+            ...this.readValidInstalledModelGroups(settings),
+            [groupId]: [...new Set(installedItemSha256s)]
+          }
+        },
+        signal
+      );
     });
   }
 
@@ -191,10 +204,16 @@ export class LibrarySettings {
     );
   }
 
-  async setLocalModelsRoot(localModelsRoot: string): Promise<void> {
-    await this.updateSettings({
-      localModelsRoot: path.resolve(localModelsRoot)
-    });
+  async setLocalModelsRoot(
+    localModelsRoot: string,
+    signal?: AbortSignal
+  ): Promise<void> {
+    await this.updateSettings(
+      {
+        localModelsRoot: path.resolve(localModelsRoot)
+      },
+      signal
+    );
   }
 
   async getInferredComfyInstall(): Promise<{
@@ -206,11 +225,13 @@ export class LibrarySettings {
 
   async setInferredComfyInstall(
     endpoint: string,
-    directory: string
+    directory: string,
+    signal?: AbortSignal
   ): Promise<void> {
-    await this.updateSettings({
-      inferredComfyInstall: { endpoint, directory }
-    });
+    await this.updateSettings(
+      { inferredComfyInstall: { endpoint, directory } },
+      signal
+    );
   }
 
   /**
@@ -241,6 +262,30 @@ export class LibrarySettings {
     await this.updateSettings({ comfyEndpoint: endpoint });
   }
 
+  saveComfyConfiguration({
+    endpoint,
+    vlmBackend,
+    scriptTextModel,
+    textModelProvider
+  }: Omit<ComfySettings, "textModelProvider"> & {
+    textModelProvider?: LocalTextModelProvider;
+  }): Promise<void> {
+    return this.runSettingsWriteInOrder(async () => {
+      const settings = await this.readSettings();
+      await this.writeSettings({
+        ...settings,
+        comfyEndpoint: endpoint,
+        vlmBackend,
+        scriptTextModel: undefined,
+        selectedModelGroupVariants: {
+          ...this.readValidSelectedModelGroupVariants(settings),
+          [SCRIPT_TEXT_MODEL_GROUP_ID]: scriptTextModel
+        },
+        ...(textModelProvider === undefined ? {} : { textModelProvider })
+      });
+    });
+  }
+
   async getVlmBackend(): Promise<LocalVlmBackend> {
     const backend = (await this.readSettings()).vlmBackend;
     return backend === "qwen3-vl-4b-heretic-int8"
@@ -248,8 +293,11 @@ export class LibrarySettings {
       : DEFAULT_VLM_BACKEND;
   }
 
-  async setVlmBackend(vlmBackend: LocalVlmBackend): Promise<void> {
-    await this.updateSettings({ vlmBackend });
+  async setVlmBackend(
+    vlmBackend: LocalVlmBackend,
+    signal?: AbortSignal
+  ): Promise<void> {
+    await this.updateSettings({ vlmBackend }, signal);
   }
 
   async getScriptTextModel(): Promise<LocalScriptTextModel> {
@@ -276,18 +324,23 @@ export class LibrarySettings {
 
   setSelectedModelGroupVariant(
     groupId: LocalModelGroupId,
-    variantId: LocalModelGroupVariantId
+    variantId: LocalModelGroupVariantId,
+    signal?: AbortSignal
   ): Promise<void> {
     return this.runSettingsWriteInOrder(async () => {
+      signal?.throwIfAborted();
       const settings = await this.readSettings();
-      await this.writeSettings({
-        ...settings,
-        scriptTextModel: undefined,
-        selectedModelGroupVariants: {
-          ...this.readValidSelectedModelGroupVariants(settings),
-          [groupId]: variantId
-        }
-      });
+      await this.writeSettings(
+        {
+          ...settings,
+          scriptTextModel: undefined,
+          selectedModelGroupVariants: {
+            ...this.readValidSelectedModelGroupVariants(settings),
+            [groupId]: variantId
+          }
+        },
+        signal
+      );
     });
   }
 
@@ -373,10 +426,14 @@ export class LibrarySettings {
     }
   }
 
-  private updateSettings(update: Partial<StoredSettings>): Promise<void> {
+  private updateSettings(
+    update: Partial<StoredSettings>,
+    signal?: AbortSignal
+  ): Promise<void> {
     return this.runSettingsWriteInOrder(async () => {
+      signal?.throwIfAborted();
       const settings = { ...(await this.readSettings()), ...update };
-      await this.writeSettings(settings);
+      await this.writeSettings(settings, signal);
     });
   }
 
@@ -386,7 +443,11 @@ export class LibrarySettings {
     return queuedWrite;
   }
 
-  private async writeSettings(settings: StoredSettings): Promise<void> {
+  private async writeSettings(
+    settings: StoredSettings,
+    signal?: AbortSignal
+  ): Promise<void> {
+    signal?.throwIfAborted();
     const settingsPath = this.getSettingsPath();
     await mkdir(path.dirname(settingsPath), { recursive: true });
     const temporaryPath = `${settingsPath}.${randomUUID()}.tmp`;
@@ -396,6 +457,7 @@ export class LibrarySettings {
         mode: 0o600,
         flush: true
       });
+      signal?.throwIfAborted();
       await rename(temporaryPath, settingsPath);
     } finally {
       await unlink(temporaryPath).catch(() => {});

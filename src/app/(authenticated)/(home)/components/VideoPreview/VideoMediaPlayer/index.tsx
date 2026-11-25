@@ -25,6 +25,8 @@ import { isFrameWithinPlayableRange } from "@utils";
 import { useAtomValue, useSetAtom } from "jotai";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 const VIDEO_ERROR_MESSAGES = {
   1: "Video loading was aborted",
   2: "Network error occurred while loading video",
@@ -134,14 +136,19 @@ export const VideoMediaPlayer: React.FC<Props> = ({
 
   const cachedOverrideVideoSrc = useCachedVideoUrl(overrideVideoSrc);
 
-  const videoSrc = cachedOverrideVideoSrc || urlToUse;
+  const { work } = useRendererLibraryWork();
+  const videoSrc = work.signal.aborted
+    ? undefined
+    : cachedOverrideVideoSrc || urlToUse;
 
   useEffect(() => {
-    if (!videoSrc) return;
+    if (!videoSrc || work.signal.aborted) return;
+
+    const source = { url: videoSrc, signal: work.signal };
 
     setCurrentVideoSrc((prev) => ({
       ...prev,
-      [selectedLayer.id]: videoSrc
+      [selectedLayer.id]: source
     }));
 
     setVideoElementRefs((prev) => ({
@@ -150,13 +157,25 @@ export const VideoMediaPlayer: React.FC<Props> = ({
     }));
 
     return () => {
+      setCurrentVideoSrc((prev) => {
+        if (prev[selectedLayer.id] !== source) return prev;
+        const updated = { ...prev };
+        delete updated[selectedLayer.id];
+        return updated;
+      });
       setVideoElementRefs((prev) => {
         const updated = { ...prev };
         delete updated[selectedLayer.id];
         return updated;
       });
     };
-  }, [videoSrc, selectedLayer.id, setCurrentVideoSrc, setVideoElementRefs]);
+  }, [
+    videoSrc,
+    work,
+    selectedLayer.id,
+    setCurrentVideoSrc,
+    setVideoElementRefs
+  ]);
 
   useEffect(() => {
     videoElement.current?.load();

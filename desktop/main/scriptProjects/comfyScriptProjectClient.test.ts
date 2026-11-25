@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ComfyClient } from "../comfy/ComfyClient";
+import { ComfyClient, createProfileComfyClient } from "../comfy/ComfyClient";
 import { ComfyQwenClient } from "../imageRenders/comfyQwenClient";
 
 import {
@@ -52,6 +52,71 @@ describe("ComfyScriptProjectClient", () => {
         seed: 7
       })
     );
+  });
+
+  it("polls an accepted shot without uploading or submitting again", async () => {
+    const endpoint = "http://comfy.invalid:8188";
+    const comfy = new ComfyClient(endpoint, offlineProgressMonitor);
+    const upload = vi.spyOn(comfy, "uploadFile");
+    const submit = vi.spyOn(comfy, "submitGraph");
+    const poll = vi.spyOn(comfy, "waitForPrompt").mockResolvedValue({
+      kind: "finished",
+      outputs: { "17": { videos: [{ filename: "shot.mp4" }] } }
+    });
+    vi.spyOn(comfy, "downloadBuffer").mockResolvedValue(Buffer.from("shot"));
+    const client = new ComfyScriptProjectClient(endpoint, undefined, comfy);
+    const beforeSubmit = vi.fn();
+    const onSubmitted = vi.fn();
+    await expect(
+      client.runVideo({
+        prompt: "",
+        referencePaths: [],
+        submission: { promptId: "known-shot", beforeSubmit, onSubmitted }
+      })
+    ).resolves.toEqual(Buffer.from("shot"));
+    expect(poll).toHaveBeenCalledWith(
+      "known-shot",
+      expect.objectContaining({ timeoutMs: expect.any(Number) })
+    );
+    expect(upload).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(beforeSubmit).not.toHaveBeenCalled();
+    expect(onSubmitted).not.toHaveBeenCalled();
+  });
+
+  it("abandons model inventory body reads before casting dispatch on retirement", async () => {
+    const endpoint = "http://comfy.invalid:8188";
+    const profile = new AbortController();
+    const cancelled = vi.fn();
+    let started!: () => void;
+    const reading = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const fetch = vi.fn(async (url: string | URL) => {
+      if (String(url).endsWith("/experiment/models")) {
+        return new Response(
+          new ReadableStream({ pull: started, cancel: cancelled })
+        );
+      }
+      if (String(url).endsWith("/models/clip_gguf"))
+        return Response.json([LOCAL_SCRIPT_MODEL_FILES.llmQ3]);
+      throw new Error("Unexpected request: " + String(url));
+    });
+    vi.stubGlobal("fetch", fetch);
+    const client = new ComfyScriptProjectClient(
+      endpoint,
+      "qwen38-27b-q3",
+      createProfileComfyClient(endpoint, profile.signal),
+      profile.signal
+    );
+    const operation = expect(client.runCasting("script")).rejects.toMatchObject(
+      { name: "AbortError" }
+    );
+    await reading;
+    profile.abort();
+    await operation;
+    expect(cancelled).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("busts ComfyUI's text-output cache for repeated casting requests", async () => {

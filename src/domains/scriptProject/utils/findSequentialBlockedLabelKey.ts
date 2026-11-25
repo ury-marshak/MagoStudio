@@ -21,6 +21,10 @@ export const findSequentialBlockedLabelKey = (
   );
 
   switch (blockedEntry?.reason_code) {
+    case "fal_opening_frame_aspect_mismatch":
+      return "script_project.shot_blocked_fal_opening_frame_aspect.label";
+    case "fal_opening_frame_numbered_reference":
+      return "script_project.shot_blocked_fal_opening_frame_number.label";
     case "fal_video_tail_invalid":
       return "script_project.shot_blocked_fal_video_tail.label";
     case "fal_sequential_unsupported":

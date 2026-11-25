@@ -1,4 +1,4 @@
-import { ipcMain } from "electron";
+import { ipcMain, type WebContents } from "electron";
 
 import {
   IPC_CHANNELS,
@@ -15,6 +15,7 @@ import { DatabaseManager } from "../database/databaseManager";
 import { ProjectRepository } from "../database/projectRepository";
 import { LibrarySettings } from "../librarySettings";
 import { LibraryWorkSession } from "../libraryWorkSession";
+import type { ProfileIoDrain } from "../providers/profileIoDrain";
 
 import { requireTrustedSender } from "./trustedSender";
 
@@ -102,7 +103,10 @@ export const registerProjectHandlers = (
     LibraryWorkSession<unknown>,
     "run" | "boundary" | "capture"
   > = new LibraryWorkSession(() => undefined),
-  mediaWork = importWork
+  mediaWork = importWork,
+  captureAccountProfile?: (sender: WebContents) => AbortSignal,
+  assertLibraryAvailable?: () => void,
+  profileIo?: Pick<ProfileIoDrain, "run">
 ): void => {
   const cloudWork = cloudProjects.libraryWork;
   const handleCloud = (
@@ -114,29 +118,50 @@ export const registerProjectHandlers = (
       return cloudWork.run(async () => handler(event, ...args));
     });
   };
-  const ensureCloudDatabase = async (): Promise<void> => {
+  const ensureCloudDatabase = async (profile?: AbortSignal): Promise<void> => {
     cloudWork.capture();
+    profile?.throwIfAborted();
     if (databaseManager.isOpen()) return;
     const root = await cloudWork.boundary(() => settings.getLibraryRoot());
+    profile?.throwIfAborted();
     if (!root) throw new Error("Choose a Mago library folder first");
-    await cloudWork.boundary(() => databaseManager.open(root));
+    await cloudWork.boundary(() => {
+      profile?.throwIfAborted();
+      const open = () => databaseManager.open(root);
+      return profileIo?.run(profile, open) ?? open();
+    });
   };
+
+  // Own lazy DB admission and each complete repository call, including reads
+  // that migrate a setting and therefore issue follow-up writes.
+  const handleLocal = (
+    channel: string,
+    handler: (...args: unknown[]) => Promise<unknown>
+  ) =>
+    ipcMain.handle(channel, async (event, ...args: unknown[]) => {
+      requireTrustedSender(event);
+      assertLibraryAvailable?.();
+      return importWork.run(() => handler(...args));
+    });
+  const local = <T>(operation: () => Promise<T>) =>
+    importWork.boundary(operation);
 
   const ensureDatabase = async (required = false): Promise<boolean> => {
     if (databaseManager.isOpen()) return true;
-    const libraryRoot = await settings.getLibraryRoot();
+    const libraryRoot = await importWork.boundary(() =>
+      settings.getLibraryRoot()
+    );
     if (!libraryRoot) {
       if (required) throw new Error("Choose a Mago library folder first");
       return false;
     }
-    await databaseManager.open(libraryRoot);
+    await importWork.boundary(() => databaseManager.open(libraryRoot));
     return true;
   };
 
-  ipcMain.handle(IPC_CHANNELS.assetsGet, async (event, assetId: unknown) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.assetsGet, async (assetId: unknown) => {
     if (!(await ensureDatabase())) return null;
-    return repository.getAsset(requireString(assetId, "assetId"));
+    return local(() => repository.getAsset(requireString(assetId, "assetId")));
   });
   ipcMain.handle(
     IPC_CHANNELS.assetsImportImage,
@@ -164,56 +189,70 @@ export const registerProjectHandlers = (
           }
           return candidate;
         };
+        const common = {
+          projectId: requireString(input.projectId, "projectId"),
+          name: requireString(input.name, "name"),
+          width: number("width"),
+          height: number("height")
+        };
+        const requireThumbnail = () =>
+          requireString(input.thumbnailDataUrl, "thumbnailDataUrl");
+        const prepared = input.dataUrl !== undefined;
+        if (prepared && input.sourcePath !== undefined)
+          throw new Error("Choose either a file or prepared image bytes");
+        const image: LocalImageImport = prepared
+          ? {
+              ...common,
+              dataUrl: requireString(input.dataUrl, "dataUrl"),
+              thumbnailDataUrl:
+                input.thumbnailDataUrl === undefined
+                  ? undefined
+                  : requireThumbnail()
+            }
+          : {
+              ...common,
+              sourcePath: requireString(input.sourcePath, "sourcePath"),
+              thumbnailDataUrl: requireThumbnail()
+            };
         const asset = await importWork.boundary(() =>
-          repository.importImage({
-            projectId: requireString(input.projectId, "projectId"),
-            sourcePath: requireString(input.sourcePath, "sourcePath"),
-            name: requireString(input.name, "name"),
-            width: number("width"),
-            height: number("height"),
-            thumbnailDataUrl: requireString(
-              input.thumbnailDataUrl,
-              "thumbnailDataUrl"
-            )
-          } satisfies LocalImageImport)
+          repository.importImage(image)
         );
         importWork.capture();
-        onImageImported?.(asset.id);
+        if (!prepared) onImageImported?.(asset.id);
         return asset;
       });
     }
   );
 
-  ipcMain.handle(IPC_CHANNELS.projectsList, async (event) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.projectsList, async () => {
     if (!(await ensureDatabase())) return [];
-    return repository.list();
+    return local(() => repository.list());
   });
-  ipcMain.handle(IPC_CHANNELS.projectsListAll, async (event) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.projectsListAll, async () => {
     if (!(await ensureDatabase())) return [];
-    return repository.listAll();
+    return local(() => repository.listAll());
   });
-  ipcMain.handle(
-    IPC_CHANNELS.projectsGet,
-    async (event, projectId: unknown) => {
-      requireTrustedSender(event);
-      if (!(await ensureDatabase())) return null;
-      return repository.get(requireString(projectId, "projectId"));
-    }
-  );
+  handleLocal(IPC_CHANNELS.projectsGet, async (projectId: unknown) => {
+    if (!(await ensureDatabase())) return null;
+    return local(() => repository.get(requireString(projectId, "projectId")));
+  });
   handleCloud(
     IPC_CHANNELS.projectsMirrorCloud,
     async (event, value: unknown) => {
       requireTrustedSender(event);
-      await requireCloudAccount(settings);
-      await ensureCloudDatabase();
+      const profile = captureAccountProfile?.(event.sender);
+      await requireCloudAccount(settings, profile);
+      await ensureCloudDatabase(profile);
+      profile?.throwIfAborted();
       const input = requireRecord(value);
       const project = requireRecord(input.project);
-      return cloudProjects.put({
-        project,
-        includeContent: input.includeContent === true
-      });
+      return cloudProjects.put(
+        {
+          project,
+          includeContent: input.includeContent === true
+        },
+        profile
+      );
     }
   );
   handleCloud(
@@ -227,22 +266,27 @@ export const registerProjectHandlers = (
     IPC_CHANNELS.projectsCacheCloudAsset,
     async (event, value: unknown) => {
       requireTrustedSender(event);
-      await requireCloudAccount(settings);
-      await ensureCloudDatabase();
+      const profile = captureAccountProfile?.(event.sender);
+      await requireCloudAccount(settings, profile);
+      await ensureCloudDatabase(profile);
+      profile?.throwIfAborted();
       const input = requireRecord(value);
-      return cloudProjects.cacheAsset({
-        projectId: requireString(input.projectId, "projectId"),
-        assetId: requireString(input.assetId, "assetId"),
-        isImage: input.isImage === true,
-        urls: {
-          sourceUrl:
-            typeof input.sourceUrl === "string" ? input.sourceUrl : undefined,
-          thumbnailUrl:
-            typeof input.thumbnailUrl === "string"
-              ? input.thumbnailUrl
-              : undefined
-        }
-      });
+      return cloudProjects.cacheAsset(
+        {
+          projectId: requireString(input.projectId, "projectId"),
+          assetId: requireString(input.assetId, "assetId"),
+          isImage: input.isImage === true,
+          urls: {
+            sourceUrl:
+              typeof input.sourceUrl === "string" ? input.sourceUrl : undefined,
+            thumbnailUrl:
+              typeof input.thumbnailUrl === "string"
+                ? input.thumbnailUrl
+                : undefined
+          }
+        },
+        profile
+      );
     }
   );
   handleCloud(
@@ -255,37 +299,35 @@ export const registerProjectHandlers = (
       );
     }
   );
-  ipcMain.handle(IPC_CHANNELS.projectsCreate, async (event, value: unknown) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.projectsCreate, async (value: unknown) => {
     await ensureDatabase(true);
     const input = requireRecord(value);
-    return repository.create({
-      name: requireString(input.name, "name"),
-      description:
-        typeof input.description === "string" ? input.description : "",
-      settings: requireRecord(input.settings)
-    });
+    return local(() =>
+      repository.create({
+        name: requireString(input.name, "name"),
+        description:
+          typeof input.description === "string" ? input.description : "",
+        settings: requireRecord(input.settings)
+      })
+    );
   });
-  ipcMain.handle(IPC_CHANNELS.projectsUpdate, async (event, value: unknown) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.projectsUpdate, async (value: unknown) => {
     await ensureDatabase(true);
     const input = requireRecord(value);
-    return repository.update({
-      projectId: requireString(input.projectId, "projectId"),
-      name: requireString(input.name, "name"),
-      description:
-        typeof input.description === "string" ? input.description : "",
-      settings: requireRecord(input.settings)
-    });
+    return local(() =>
+      repository.update({
+        projectId: requireString(input.projectId, "projectId"),
+        name: requireString(input.name, "name"),
+        description:
+          typeof input.description === "string" ? input.description : "",
+        settings: requireRecord(input.settings)
+      })
+    );
   });
-  ipcMain.handle(
-    IPC_CHANNELS.projectsDelete,
-    async (event, projectId: unknown) => {
-      requireTrustedSender(event);
-      await ensureDatabase(true);
-      await repository.delete(requireString(projectId, "projectId"));
-    }
-  );
+  handleLocal(IPC_CHANNELS.projectsDelete, async (projectId: unknown) => {
+    await ensureDatabase(true);
+    await local(() => repository.delete(requireString(projectId, "projectId")));
+  });
   ipcMain.handle(
     IPC_CHANNELS.projectsImportVideos,
     async (event, value: unknown) => {
@@ -313,8 +355,7 @@ export const registerProjectHandlers = (
       });
     }
   );
-  ipcMain.handle(IPC_CHANNELS.tracksCreate, async (event, value: unknown) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.tracksCreate, async (value: unknown) => {
     await ensureDatabase(true);
     const input = requireRecord(value);
     const parentTrackOrder = input.parentTrackOrder;
@@ -324,77 +365,79 @@ export const registerProjectHandlers = (
     ) {
       throw new Error("parentTrackOrder must be an integer");
     }
-    return repository.createTrack({
-      shotId: requireString(input.shotId, "shotId"),
-      name: requireString(input.name, "name"),
-      type: requireString(input.type, "type"),
-      data: requireRecord(input.data),
-      parentTrackOrder
-    } satisfies LocalTrackCreateInput);
+    return local(() =>
+      repository.createTrack({
+        shotId: requireString(input.shotId, "shotId"),
+        name: requireString(input.name, "name"),
+        type: requireString(input.type, "type"),
+        data: requireRecord(input.data),
+        parentTrackOrder
+      } satisfies LocalTrackCreateInput)
+    );
   });
-  ipcMain.handle(IPC_CHANNELS.tracksUpdate, async (event, value: unknown) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.tracksUpdate, async (value: unknown) => {
     await ensureDatabase(true);
     const input = requireRecord(value);
-    return repository.updateTrack({
-      trackId: requireString(input.trackId, "trackId"),
-      name: requireString(input.name, "name"),
-      data: requireRecord(input.data),
-      rating: optionalRating(input.rating)
-    } satisfies LocalTrackUpdateInput);
+    return local(() =>
+      repository.updateTrack({
+        trackId: requireString(input.trackId, "trackId"),
+        name: requireString(input.name, "name"),
+        data: requireRecord(input.data),
+        rating: optionalRating(input.rating)
+      } satisfies LocalTrackUpdateInput)
+    );
   });
-  ipcMain.handle(IPC_CHANNELS.tracksDelete, async (event, trackId: unknown) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.tracksDelete, async (trackId: unknown) => {
     await ensureDatabase(true);
-    await repository.deleteTrack(requireString(trackId, "trackId"));
+    await local(() =>
+      repository.deleteTrack(requireString(trackId, "trackId"))
+    );
   });
-  ipcMain.handle(IPC_CHANNELS.shotsCreate, async (event, value: unknown) => {
-    requireTrustedSender(event);
-    await ensureDatabase(true);
-    const input = requireRecord(value);
-    return repository.createShot({
-      projectId: requireString(input.projectId, "projectId"),
-      name: requireString(input.name, "name")
-    } satisfies LocalShotCreateInput);
-  });
-  ipcMain.handle(IPC_CHANNELS.shotsUpdate, async (event, value: unknown) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.shotsCreate, async (value: unknown) => {
     await ensureDatabase(true);
     const input = requireRecord(value);
-    return repository.updateShot({
-      shotId: requireString(input.shotId, "shotId"),
-      name: requireString(input.name, "name"),
-      settings: requireRecord(input.settings)
-    } satisfies LocalShotUpdateInput);
+    return local(() =>
+      repository.createShot({
+        projectId: requireString(input.projectId, "projectId"),
+        name: requireString(input.name, "name")
+      } satisfies LocalShotCreateInput)
+    );
   });
-  ipcMain.handle(IPC_CHANNELS.shotsDelete, async (event, shotId: unknown) => {
-    requireTrustedSender(event);
-    await ensureDatabase(true);
-    await repository.deleteShot(requireString(shotId, "shotId"));
-  });
-  ipcMain.handle(IPC_CHANNELS.assetsUpdate, async (event, value: unknown) => {
-    requireTrustedSender(event);
+  handleLocal(IPC_CHANNELS.shotsUpdate, async (value: unknown) => {
     await ensureDatabase(true);
     const input = requireRecord(value);
-    return repository.updateAsset({
-      assetId: requireString(input.assetId, "assetId"),
-      rate: requireRate(input.rate)
-    });
+    return local(() =>
+      repository.updateShot({
+        shotId: requireString(input.shotId, "shotId"),
+        name: requireString(input.name, "name"),
+        settings: requireRecord(input.settings)
+      } satisfies LocalShotUpdateInput)
+    );
   });
-  ipcMain.handle(
-    IPC_CHANNELS.projectsListShots,
-    async (event, projectId: unknown) => {
-      requireTrustedSender(event);
-      if (!(await ensureDatabase())) return [];
-      return repository.listShots(requireString(projectId, "projectId"));
-    }
-  );
-  ipcMain.handle(
-    IPC_CHANNELS.projectsStats,
-    async (event, projectId: unknown) => {
-      requireTrustedSender(event);
-      await ensureDatabase(true);
-      return repository.projectStats(requireString(projectId, "projectId"));
-    }
-  );
+  handleLocal(IPC_CHANNELS.shotsDelete, async (shotId: unknown) => {
+    await ensureDatabase(true);
+    await local(() => repository.deleteShot(requireString(shotId, "shotId")));
+  });
+  handleLocal(IPC_CHANNELS.assetsUpdate, async (value: unknown) => {
+    await ensureDatabase(true);
+    const input = requireRecord(value);
+    return local(() =>
+      repository.updateAsset({
+        assetId: requireString(input.assetId, "assetId"),
+        rate: requireRate(input.rate)
+      })
+    );
+  });
+  handleLocal(IPC_CHANNELS.projectsListShots, async (projectId: unknown) => {
+    if (!(await ensureDatabase())) return [];
+    return local(() =>
+      repository.listShots(requireString(projectId, "projectId"))
+    );
+  });
+  handleLocal(IPC_CHANNELS.projectsStats, async (projectId: unknown) => {
+    await ensureDatabase(true);
+    return local(() =>
+      repository.projectStats(requireString(projectId, "projectId"))
+    );
+  });
 };

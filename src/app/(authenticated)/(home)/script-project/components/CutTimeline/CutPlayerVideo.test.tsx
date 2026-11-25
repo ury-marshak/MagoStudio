@@ -1,6 +1,8 @@
 import type { CutTimelineClip } from "@domains/scriptProject/utils/buildCutTimelineClips";
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 const mocks = vi.hoisted(() => ({
   playableVideoUrl: undefined as string | undefined
@@ -11,7 +13,7 @@ vi.mock("@domains/asset/useCachedVideoPreview", () => ({
 import { CutPlayerVideo } from "./CutPlayerVideo";
 
 describe("cut playback during synchronization", () => {
-  it("waits for the scheduled video before mounting and registering the player", () => {
+  it("waits for scheduled media and drops a playback pin when the library changes", async () => {
     mocks.playableVideoUrl = undefined;
     const register = vi.fn();
     const clip: CutTimelineClip = {
@@ -46,5 +48,26 @@ describe("cut playback during synchronization", () => {
       "blob:downloaded-video"
     );
     expect(register).toHaveBeenCalledWith(container.querySelector("video"));
+
+    fireEvent.play(container.querySelector("video")!);
+    mocks.playableVideoUrl = undefined;
+    rerender(<CutPlayerVideo {...props} />);
+    expect(container.querySelector("video")?.getAttribute("src")).toBe(
+      "blob:downloaded-video"
+    );
+
+    await act(async () => {
+      await rendererLibrary.suspend();
+    });
+    expect(container.querySelector("video")).toBeNull();
+    await act(async () => {
+      rendererLibrary.reset();
+    });
+    expect(container.querySelector("video")).toBeNull();
+    mocks.playableVideoUrl = "blob:replacement-video";
+    rerender(<CutPlayerVideo {...props} />);
+    expect(container.querySelector("video")?.getAttribute("src")).toBe(
+      "blob:replacement-video"
+    );
   });
 });

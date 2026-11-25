@@ -3,8 +3,15 @@ import { FieldSwitcher } from "@components/Form/Fields/FieldSwitcher";
 import { Form } from "@components/Form/Form";
 import { Icon } from "@components/Icon";
 import { IconActionButton } from "@components/IconActionButton";
+import {
+  OrdinaryFalRouteSelect,
+  useOrdinaryFalRoute
+} from "@components/OrdinaryFal/OrdinaryFalRouteSelect";
+import { OrdinaryFalStatus } from "@components/OrdinaryFal/OrdinaryFalStatus";
 import { Text } from "@components/Text";
 import { useIsOnboardingActive } from "@domains/onboarding/useIsOnboardingActive";
+import { useSelectedProjectId } from "@domains/project/useSelectedProjectId";
+import { useSelectedShotId } from "@domains/shot/useSelectedShotId";
 import { useInputTrack } from "@domains/track/useInputTrack";
 import { frameRangeOf } from "@domains/track/utils/frameCoordinates";
 import { clampFrameToRange } from "@domains/videoPlayer/utils/validateFrameInRange";
@@ -19,6 +26,7 @@ import { useHotkeys } from "react-hotkeys-hook";
 import { useTranslation } from "react-i18next";
 
 import { CopyPasteReset } from "./CopyPasteReset";
+import { DirectFalImg2ImgForm } from "./DirectFalImg2ImgForm";
 import { drawMaskActiveAtom } from "./DrawMask/drawMaskAtom";
 import { DrawMaskOverlay } from "./DrawMask/DrawMaskOverlay";
 import { GenerateButton } from "./GenerateButton";
@@ -35,11 +43,15 @@ import { SwitchModelForms } from "./SwitchModelForms";
 type Img2ImgFrameTypeContentProps = {
   currentFrame: number;
   setCurrentFrame: (frame: number) => void;
+  directFal: boolean;
+  projectId?: string;
 };
 
 const Img2ImgFrameTypeContent: React.FC<Img2ImgFrameTypeContentProps> = ({
   currentFrame,
-  setCurrentFrame
+  setCurrentFrame,
+  directFal,
+  projectId
 }) => {
   const frameType = useWatch<Img2ImgType, "frameType">({ name: "frameType" });
 
@@ -48,11 +60,14 @@ const Img2ImgFrameTypeContent: React.FC<Img2ImgFrameTypeContentProps> = ({
       <Img2ImgFrameSelector
         currentFrame={currentFrame}
         setCurrentFrame={setCurrentFrame}
+        allowMask={!directFal}
       />
     );
   }
 
-  return <Img2ImgFrameUploader />;
+  return (
+    <Img2ImgFrameUploader directFal={directFal} falProjectId={projectId} />
+  );
 };
 
 export const Img2ImgTool: React.FC = () => {
@@ -61,6 +76,11 @@ export const Img2ImgTool: React.FC = () => {
   const setDrawMaskActive = useSetAtom(drawMaskActiveAtom);
   const isDrawMaskActive = useAtomValue(drawMaskActiveAtom);
   const formRef = useRef<HTMLFormElement>(null);
+  const projectId = useSelectedProjectId();
+  const { selectedShotId } = useSelectedShotId();
+  const falRoute = useOrdinaryFalRoute(projectId);
+  const isOnboardingActive = useIsOnboardingActive();
+  const directFal = falRoute.selected;
 
   useMountEffect(() => {
     setActiveScope("Img2ImgView");
@@ -77,14 +97,13 @@ export const Img2ImgTool: React.FC = () => {
     () => formRef.current?.requestSubmit(),
     {
       preventDefault: true,
-      enabled: isImg2ImgScopeActive && !isDrawMaskActive
+      enabled: isImg2ImgScopeActive && !isDrawMaskActive && !directFal
     },
-    [isImg2ImgScopeActive, isDrawMaskActive]
+    [isImg2ImgScopeActive, isDrawMaskActive, directFal]
   );
   const currentVideoFrame = useAtomValue(currentVideoFrameAtom);
   const setCurrentVideoFrame = useSetAtom(currentVideoFrameAtom);
   const { inputTrack } = useInputTrack();
-  const isOnboardingActive = useIsOnboardingActive();
   const [minFrame, maxFrame] = inputTrack ? frameRangeOf(inputTrack) : [0, 0];
   const clampedFrame = isOnboardingActive
     ? minFrame
@@ -115,7 +134,7 @@ export const Img2ImgTool: React.FC = () => {
       key={storageKey}
       formSchema={Img2ImgSchema}
       defaultValues={defaultValues}
-      onSubmit={submitRender}
+      onSubmit={directFal ? () => {} : submitRender}
       className="flex w-full h-full min-h-0 overflow-hidden bg-surface-secondary max-h-[var(--height-full-minus-img2img-navbar)]"
       data-testid="img2img-modal"
       ref={formRef}
@@ -123,6 +142,14 @@ export const Img2ImgTool: React.FC = () => {
       <Img2ImgFormPersistence settingsAtom={settingsAtom} />
       <div className="w-img2img-settings flex flex-col flex-shrink-0">
         <div className="flex-1 border-r border-glyph-invert-main overflow-y-auto scrollbar-custom">
+          {!isOnboardingActive && (falRoute.available || directFal) && (
+            <div className="p-3">
+              <OrdinaryFalRouteSelect
+                {...falRoute}
+                disabled={isDrawMaskActive}
+              />
+            </div>
+          )}
           {!isOnboardingActive && (
             <div className="p-3">
               <FieldSwitcher
@@ -145,31 +172,47 @@ export const Img2ImgTool: React.FC = () => {
           )}
           <div className="flex flex-col gap-4 p-3">
             <Img2ImgFrameTypeContent
+              key={directFal ? falRoute.scope : undefined}
               currentFrame={clampedFrame}
               setCurrentFrame={handleSetFrame}
+              directFal={directFal}
+              projectId={projectId}
             />
           </div>
           {!isOnboardingActive && (
             <Divider className="!bg-glyph-stroke !my-2" />
           )}
           <div className="px-3 pb-3 flex flex-col gap-3">
-            {!isOnboardingActive && (
+            {directFal ? (
+              <DirectFalImg2ImgForm
+                key={`${falRoute.scope}:${selectedShotId}`}
+                projectId={projectId}
+                shotId={selectedShotId}
+                currentFrame={clampedFrame}
+              />
+            ) : (
               <>
-                <Text component="h3" variant="sm" color="glyph-primary">
-                  {t("titles.render_settings.label")}
-                </Text>
-                <CopyPasteReset />
+                {!isOnboardingActive && (
+                  <>
+                    <Text component="h3" variant="sm" color="glyph-primary">
+                      {t("titles.render_settings.label")}
+                    </Text>
+                    <CopyPasteReset />
+                  </>
+                )}
+                <div className="flex flex-col gap-4">
+                  {!isOnboardingActive && <ModelSelector />}
+                  <SwitchModelForms />
+                </div>
               </>
             )}
-            <div className="flex flex-col gap-4">
-              {!isOnboardingActive && <ModelSelector />}
-              <SwitchModelForms />
-            </div>
           </div>
         </div>
-        <div className="flex items-end justify-between gap-2 h-16 py-3 pl-3 pr-5 bg-surface-secondary border-t border-r border-glyph-invert-main backdrop-blur-[10px]">
-          <GenerateButton currentFrame={clampedFrame} />
-        </div>
+        {!directFal && (
+          <div className="flex items-end justify-between gap-2 h-16 py-3 pl-3 pr-5 bg-surface-secondary border-t border-r border-glyph-invert-main backdrop-blur-[10px]">
+            <GenerateButton currentFrame={clampedFrame} />
+          </div>
+        )}
       </div>
       {!isDrawMaskActive && (
         <div
@@ -212,12 +255,21 @@ export const Img2ImgTool: React.FC = () => {
           </div>
         </div>
       )}
-      <div className="flex-1 min-w-0 min-h-0 overflow-hidden">
-        {isDrawMaskActive ? (
-          <DrawMaskOverlay frameIdx={clampedFrame} />
-        ) : (
-          <Img2ImgRenders />
+      <div className="flex flex-1 flex-col min-w-0 min-h-0 overflow-hidden">
+        {falRoute.available && selectedShotId && (
+          <OrdinaryFalStatus
+            projectId={projectId}
+            shotId={selectedShotId}
+            kind="image-edit"
+          />
         )}
+        <div className="min-h-0 flex-1 overflow-hidden">
+          {isDrawMaskActive ? (
+            <DrawMaskOverlay frameIdx={clampedFrame} />
+          ) : (
+            <Img2ImgRenders />
+          )}
+        </div>
       </div>
     </Form>
   );

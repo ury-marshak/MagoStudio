@@ -8,6 +8,8 @@ import {
 } from "../cloud/cloudLinkRepository";
 import { CloudRenderJobRepository } from "../cloud/cloudRenderJobRepository";
 import {
+  type CloudImageRenderRegistration,
+  type CloudRenderRegistration,
   CloudRenderSubmitService,
   IMAGE_OUTPUT_EXTENSION,
   isImageJobRequest
@@ -25,6 +27,7 @@ import { DatabaseManager } from "../database/databaseManager";
 import { ProjectRepository } from "../database/projectRepository";
 import { LibrarySettings } from "../librarySettings";
 import type { LibraryWorkSession } from "../libraryWorkSession";
+import type { ProfileIoDrain } from "../providers/profileIoDrain";
 
 import { requireTrustedSender } from "./trustedSender";
 
@@ -82,11 +85,23 @@ export const registerCloudHandlers = (options: {
   databaseManager: DatabaseManager;
   getLibraryRoot: () => Promise<string | null>;
   settings: LibrarySettings;
+  captureAccountProfile?: (sender: IpcMainInvokeEvent["sender"]) => AbortSignal;
+  profileIoDrain?: Pick<ProfileIoDrain, "run">;
   captureImageDescriptionSession?: () => AbortSignal;
 }): void => {
   const { links, uploads, repository, renderJobs } = options;
   const renderWork = options.renderSubmits.libraryWork;
   const renderSubmits = renderWork.guard(options.renderSubmits, false);
+  const runRenderIo = async <T>(
+    profile: AbortSignal | undefined,
+    operation: () => Promise<T>
+  ): Promise<T> => {
+    profile?.throwIfAborted();
+    const result = await (options.profileIoDrain?.run(profile, operation) ??
+      operation());
+    profile?.throwIfAborted();
+    return result;
+  };
   const handleRender = (
     channel: string,
     handler: Parameters<typeof ipcMain.handle>[1]
@@ -153,9 +168,9 @@ export const registerCloudHandlers = (options: {
     handler: Parameters<typeof ipcMain.handle>[1]
   ) => handleLocal(uploadWork, channel, handler);
 
-  const assertUploadAccess = async () => {
+  const assertUploadAccess = (profile?: AbortSignal) => async () => {
     uploadWork.capture();
-    await requireCloudAccount(options.settings);
+    await requireCloudAccount(options.settings, profile);
     uploadWork.capture();
   };
   const getUploadRoot = () => uploadWork.boundary(options.getLibraryRoot);
@@ -171,17 +186,21 @@ export const registerCloudHandlers = (options: {
   const prepareVideo = async (
     value: Record<string, unknown>,
     assetId: string,
+    profile: AbortSignal | undefined,
     force?: boolean
   ) => {
+    profile?.throwIfAborted();
     // Resolved here rather than passed in, so native paths stay in main.
     const sourcePath = await uploadRepository.resolveMediaPath(
       "asset",
       assetId
     );
+    profile?.throwIfAborted();
     if (!sourcePath) throw new Error("The local asset could not be found");
     return uploads.prepare({
       assetId,
       sourcePath,
+      profile,
       trimStartSeconds: optionalSeconds(
         value.trimStartSeconds,
         "trimStartSeconds"
@@ -191,27 +210,32 @@ export const registerCloudHandlers = (options: {
     });
   };
 
-  handleUpload(IPC_CHANNELS.cloudPrepareUpload, async (_event, input) => {
-    await assertUploadAccess();
+  handleUpload(IPC_CHANNELS.cloudPrepareUpload, async (event, input) => {
+    const profile = options.captureAccountProfile?.(event.sender);
+    await assertUploadAccess(profile)();
     const value = (input ?? {}) as Record<string, unknown>;
     const prepared = await prepareVideo(
       value,
       requireId(value.assetId, "assetId"),
+      profile,
       value.force === true
     );
+    profile?.throwIfAborted();
     return { sizeBytes: prepared.sizeBytes, encoded: prepared.encoded };
   });
 
   handleUpload(IPC_CHANNELS.cloudUploadPrepared, async (event, input) => {
-    await assertUploadAccess();
+    const profile = options.captureAccountProfile?.(event.sender);
+    await assertUploadAccess(profile)();
     const value = (input ?? {}) as Record<string, unknown>;
     const assetId = requireId(value.assetId, "assetId");
     const presignedUrl = requireId(value.presignedUrl, "presignedUrl");
     // Reuses the cached encode rather than re-encoding for the upload.
-    const prepared = await prepareVideo(value, assetId);
-    await assertUploadAccess();
+    const prepared = await prepareVideo(value, assetId, profile);
+    await assertUploadAccess(profile)();
     await uploads.upload({
-      assertAccess: assertUploadAccess,
+      profile,
+      assertAccess: assertUploadAccess(profile),
       filePath: prepared.filePath,
       presignedUrl,
       onProgress: progressFor(event, assetId)
@@ -234,6 +258,7 @@ export const registerCloudHandlers = (options: {
   });
 
   handleUpload(IPC_CHANNELS.cloudUploadBytes, async (event, input) => {
+    const profile = options.captureAccountProfile?.(event.sender);
     const value = (input ?? {}) as Record<string, unknown>;
     const uploadId = requireId(value.uploadId, "uploadId");
     await uploads.uploadBytes(event.sender, {
@@ -241,7 +266,8 @@ export const registerCloudHandlers = (options: {
       bytes: requireBytes(value.bytes),
       presignedUrl: requireId(value.presignedUrl, "presignedUrl"),
       contentType: requireId(value.contentType, "contentType"),
-      assertAccess: assertUploadAccess,
+      profile,
+      assertAccess: assertUploadAccess(profile),
       onProgress: progressFor(event, uploadId)
     });
   });
@@ -251,18 +277,26 @@ export const registerCloudHandlers = (options: {
   });
 
   handleUpload(IPC_CHANNELS.cloudUploadAsset, async (event, input) => {
-    await assertUploadAccess();
+    const profile = options.captureAccountProfile?.(event.sender);
+    await assertUploadAccess(profile)();
     const value = (input ?? {}) as Record<string, unknown>;
     const assetId = requireId(value.assetId, "assetId");
     const presignedUrl = requireId(value.presignedUrl, "presignedUrl");
-    const signal = uploadWork.signal;
-    // Drain each issued sibling even if the other read rejects first.
-    const [libraryPath, info] = await Promise.all([
-      uploadRepository.resolveMediaPath("asset", assetId),
+    const signal = profile
+      ? AbortSignal.any([uploadWork.signal, profile])
+      : uploadWork.signal;
+    signal.throwIfAborted();
+    const readInfo = () =>
       uploadWork.boundary(() =>
         readLocalAssetInfo(options.databaseManager, assetId, { signal })
-      )
+      );
+    // Metadata lookup can start a probe child. Track its close even if the
+    // sibling path lookup rejects first.
+    const [libraryPath, info] = await Promise.all([
+      uploadRepository.resolveMediaPath("asset", assetId),
+      options.profileIoDrain?.run(profile, readInfo) ?? readInfo()
     ]);
+    signal.throwIfAborted();
     const libraryRoot = libraryPath ? null : await getUploadRoot();
     const sourcePath =
       libraryPath ??
@@ -276,6 +310,7 @@ export const registerCloudHandlers = (options: {
             )
           )
         : null);
+    signal.throwIfAborted();
     if (!sourcePath || !info) {
       throw new Error("The local asset could not be found");
     }
@@ -283,20 +318,23 @@ export const registerCloudHandlers = (options: {
       info.type.toUpperCase() === "IMAGE"
         ? (libraryRoot ?? (await getUploadRoot()))
         : null;
+    signal.throwIfAborted();
     const uploadFile = imageLibraryRoot
       ? await uploads.prepareImage({
           assetId,
           sourcePath,
           extension: info.extension,
+          profile,
           libraryRoot: imageLibraryRoot
         })
       : {
           filePath: sourcePath,
           contentType: contentTypeForExtension(info.extension)
         };
-    await assertUploadAccess();
+    await assertUploadAccess(profile)();
     await uploads.upload({
-      assertAccess: assertUploadAccess,
+      profile,
+      assertAccess: assertUploadAccess(profile),
       filePath: uploadFile.filePath,
       presignedUrl,
       contentType: uploadFile.contentType,
@@ -306,7 +344,8 @@ export const registerCloudHandlers = (options: {
 
   handleRender(IPC_CHANNELS.cloudRenderRegister, async (event, input) => {
     requireTrustedSender(event);
-    await requireCloudAccount(options.settings);
+    const profile = options.captureAccountProfile?.(event.sender);
+    await requireCloudAccount(options.settings, profile);
     const value = (input ?? {}) as Record<string, unknown>;
     const range = value.frameRange;
     if (
@@ -320,7 +359,7 @@ export const registerCloudHandlers = (options: {
     if (typeof fps !== "number" || !Number.isFinite(fps) || fps <= 0) {
       throw new Error("fps must be a positive number");
     }
-    return renderSubmits.register({
+    const registration: CloudRenderRegistration = {
       outputTrackId: requireId(value.outputTrackId, "outputTrackId"),
       sourceAssetId: requireId(value.sourceAssetId, "sourceAssetId"),
       model: requireId(value.model, "model"),
@@ -345,18 +384,22 @@ export const registerCloudHandlers = (options: {
           : undefined,
       width: typeof value.width === "number" ? value.width : undefined,
       height: typeof value.height === "number" ? value.height : undefined
-    });
+    };
+    return runRenderIo(profile, () =>
+      renderSubmits.register(registration, profile)
+    );
   });
 
   handleRender(IPC_CHANNELS.cloudImageRenderRegister, async (event, input) => {
     requireTrustedSender(event);
-    await requireCloudAccount(options.settings);
+    const profile = options.captureAccountProfile?.(event.sender);
+    await requireCloudAccount(options.settings, profile);
     const value = (input ?? {}) as Record<string, unknown>;
     const frame = value.frame;
     if (typeof frame !== "number" || !Number.isInteger(frame) || frame < 0) {
       throw new Error("frame must be a non-negative integer");
     }
-    return renderSubmits.registerImage({
+    const registration: CloudImageRenderRegistration = {
       projectId: requireId(value.projectId, "projectId"),
       shotId: requireId(value.shotId, "shotId"),
       sourceAssetId: requireId(value.sourceAssetId, "sourceAssetId"),
@@ -369,7 +412,10 @@ export const registerCloudHandlers = (options: {
         value.settings && typeof value.settings === "object"
           ? (value.settings as Record<string, unknown>)
           : {}
-    });
+    };
+    return runRenderIo(profile, () =>
+      renderSubmits.registerImage(registration, profile)
+    );
   });
 
   handleLocal(
@@ -423,48 +469,62 @@ export const registerCloudHandlers = (options: {
   handleRender(IPC_CHANNELS.cloudRenderFinish, async (event, input) => {
     requireTrustedSender(event);
     const descriptionSession = options.captureImageDescriptionSession?.();
-    await requireCloudAccount(options.settings);
+    const profile = options.captureAccountProfile?.(event.sender);
+    await requireCloudAccount(options.settings, profile);
     const value = (input ?? {}) as Record<string, unknown>;
     const jobId = requireId(value.jobId, "jobId");
     const url = requireId(value.url, "url");
     const libraryRoot = await renderWork.boundary(options.getLibraryRoot);
+    profile?.throwIfAborted();
     if (!libraryRoot) throw new Error("Choose a Mago library folder first");
 
     // An img2img output is a still, so it must not land under a .mp4 name.
     const job = await renderWork.guard(renderJobs).get(jobId);
+    profile?.throwIfAborted();
     const extension = isImageJobRequest(job?.request)
       ? toCloudImageOutputExtension(url, IMAGE_OUTPUT_EXTENSION)
       : undefined;
 
-    const signal = renderWork.signal;
-    const downloaded = await renderWork.boundary(() =>
-      downloadRenderOutput({
-        signal,
-        cloudStorage: {
-          allowedHosts: resolveCloudConfig().cloudStorageHosts,
-          assertAccess: () => requireCloudAccount(options.settings)
-        },
-        url,
-        libraryRoot,
-        jobId,
-        extension,
-        onProgress: (fraction) => {
-          if (!signal.aborted && !event.sender.isDestroyed()) {
-            event.sender.send(IPC_CHANNELS.cloudUploadProgress, {
-              assetId: jobId,
-              fraction
-            });
+    const signal = profile
+      ? AbortSignal.any([renderWork.signal, profile])
+      : renderWork.signal;
+    // Drain the issued transport through body close and partial-file cleanup,
+    // not the upstream render job. Finish local ingestion as a separate stage.
+    const downloaded = await runRenderIo(profile, () =>
+      renderWork.boundary(() =>
+        downloadRenderOutput({
+          signal,
+          origin: profile,
+          cloudStorage: {
+            allowedHosts: resolveCloudConfig().cloudStorageHosts,
+            assertAccess: () => requireCloudAccount(options.settings, profile)
+          },
+          url,
+          libraryRoot,
+          jobId,
+          extension,
+          onProgress: (fraction) => {
+            if (!signal.aborted && !event.sender.isDestroyed()) {
+              event.sender.send(IPC_CHANNELS.cloudUploadProgress, {
+                assetId: jobId,
+                fraction
+              });
+            }
           }
-        }
-      })
+        })
+      )
     );
-    await renderSubmits.complete(
-      {
-        jobId,
-        relativePath: downloaded.relativePath,
-        sizeBytes: downloaded.sizeBytes
-      },
-      descriptionSession
+    signal.throwIfAborted();
+    await runRenderIo(profile, () =>
+      renderSubmits.complete(
+        {
+          jobId,
+          relativePath: downloaded.relativePath,
+          sizeBytes: downloaded.sizeBytes
+        },
+        descriptionSession,
+        profile
+      )
     );
   });
 

@@ -6,6 +6,7 @@ import {
   screen,
   waitFor
 } from "@testing-library/react";
+import type { WebContents } from "electron";
 import {
   afterAll,
   afterEach,
@@ -17,12 +18,97 @@ import {
   vi
 } from "vitest";
 
+import {
+  createAccountLifecycle,
+  registerAccountHandlers
+} from "../../desktop/main/ipc/registerAccountHandlers";
+import { ProfileLifetime } from "../../desktop/main/providers/profileLifetime";
+import {
+  IPC_CHANNELS,
+  type MagoDesktopApi
+} from "../../desktop/shared/contracts";
+
+const desktop = vi.hoisted(() => {
+  type Listener = (...args: unknown[]) => unknown;
+  const handlers = new Map<string, Listener>();
+  const mainListeners = new Map<string, Listener>();
+  const listeners = new Map<string, Set<Listener>>();
+  const makeSender = () => ({
+    isDestroyed: vi.fn(() => false),
+    mainFrame: { url: "http://localhost:3000/" },
+    on: vi.fn(),
+    once: vi.fn(),
+    removeListener: vi.fn(),
+    send: vi.fn((channel: string, ...args: unknown[]) =>
+      listeners.get(channel)?.forEach((listener) => listener({}, ...args))
+    )
+  });
+  const sender = makeSender();
+  return {
+    handlers,
+    mainListeners,
+    listeners,
+    makeSender,
+    sender,
+    event: (origin = sender) => ({
+      sender: origin,
+      senderFrame: origin.mainFrame,
+      returnValue: false
+    }),
+    api: null as unknown as MagoDesktopApi
+  };
+});
+
+vi.mock("electron", () => ({
+  app: { isPackaged: false },
+  ipcMain: {
+    handle: (
+      channel: string,
+      handler: Parameters<typeof desktop.handlers.set>[1]
+    ) => desktop.handlers.set(channel, handler),
+    on: (
+      channel: string,
+      listener: Parameters<typeof desktop.mainListeners.set>[1]
+    ) => desktop.mainListeners.set(channel, listener)
+  },
+  ipcRenderer: {
+    invoke: async (channel: string, ...args: unknown[]) =>
+      desktop.handlers.get(channel)!(desktop.event(), ...args),
+    send: (channel: string, ...args: unknown[]) =>
+      desktop.mainListeners.get(channel)?.(desktop.event(), ...args),
+    sendSync: (channel: string) => {
+      const event = desktop.event();
+      desktop.mainListeners.get(channel)?.(event);
+      return event.returnValue;
+    },
+    on: (
+      channel: string,
+      listener: Parameters<typeof desktop.handlers.set>[1]
+    ) => {
+      if (!desktop.listeners.has(channel))
+        desktop.listeners.set(channel, new Set());
+      desktop.listeners.get(channel)?.add(listener);
+    },
+    removeListener: (
+      channel: string,
+      listener: Parameters<typeof desktop.handlers.set>[1]
+    ) => desktop.listeners.get(channel)?.delete(listener)
+  },
+  contextBridge: {
+    exposeInMainWorld: (_name: string, api: MagoDesktopApi) => {
+      desktop.api = api;
+    }
+  },
+  webUtils: {}
+}));
+
 const mocks = vi.hoisted(() => ({
   getToken: vi.fn(),
   authPost: vi.fn(),
   push: vi.fn(),
   setApiKey: vi.fn(),
   rejectKey: vi.fn(),
+  unauthorized: vi.fn<(handler: () => void) => void>(),
   init: vi.fn(),
   add: vi.fn(),
   identify: vi.fn(),
@@ -70,7 +156,7 @@ vi.mock("axios", async (original) => {
 vi.mock("@/lib/backend-api-client", () => ({
   API_URL: "https://backend.invalid/v02",
   initializeBackendApiClient: vi.fn(),
-  registerUnauthorizedHandler: vi.fn(),
+  registerUnauthorizedHandler: mocks.unauthorized,
   setApiKey: mocks.setApiKey,
   rejectApiKeyInitialization: mocks.rejectKey
 }));
@@ -284,7 +370,10 @@ describe("optional renderer network entry points", () => {
     expect(mocks.authPost).toHaveBeenCalledWith(
       "https://backend.invalid/auth",
       {},
-      { headers: { Authorization: "Bearer synthetic-token" } }
+      {
+        signal: expect.any(AbortSignal),
+        headers: { Authorization: "Bearer synthetic-token" }
+      }
     );
   });
   it("refuses late auth dispatch after sign-out while token lookup was pending", async () => {
@@ -326,6 +415,318 @@ describe("optional renderer network entry points", () => {
     await act(async () => release({ data: { api_key: "old-key" } }));
     expect(mocks.setApiKey).not.toHaveBeenCalled();
   });
+  const accountFixture = async (
+    rebuildWindow = vi.fn(async () => {}),
+    drainRetired = vi.fn(async () => {})
+  ) => {
+    desktop.listeners.clear();
+    vi.resetModules();
+    await import("../../desktop/preload/preload");
+    const account = { ...desktop.api.account, mode: "cloud" as const };
+    Object.defineProperty(window, "mago", {
+      configurable: true,
+      value: { account }
+    });
+    const profiles = new ProfileLifetime();
+    const lifecycle = createAccountLifecycle(profiles, { drainRetired });
+    const bindWindow = () => {
+      const sender = desktop.makeSender();
+      sender.send.mockImplementation((channel) => {
+        if (channel === IPC_CHANNELS.accountRetired) {
+          desktop.mainListeners.get(IPC_CHANNELS.accountRetiredAck)?.(
+            desktop.event(sender)
+          );
+        }
+      });
+      lifecycle.bindWindow(sender as unknown as WebContents);
+      return sender;
+    };
+    const notifyRenderer = (channel: string, ...args: unknown[]) =>
+      desktop.listeners
+        .get(channel)
+        ?.forEach((listener) => listener({}, ...args));
+    desktop.sender.send.mockReset().mockImplementation(notifyRenderer);
+    lifecycle.bindWindow(desktop.sender as unknown as WebContents);
+    let persistedMode: "cloud" | "offline" | null = "cloud";
+    const settings = {
+      setAppMode: vi.fn(async (mode: "cloud" | "offline") => {
+        persistedMode = mode;
+      }),
+      clearAppMode: vi.fn(async () => {
+        persistedMode = null;
+      })
+    };
+    registerAccountHandlers({ settings, lifecycle, rebuildWindow });
+    return {
+      account,
+      settings,
+      profiles,
+      lifecycle,
+      bindWindow,
+      notifyRenderer,
+      mode: () => persistedMode
+    };
+  };
+
+  it.each(["success", "failure"])(
+    "drops old /auth %s during a deferred account-window rebuild in the same library",
+    async (outcome) => {
+      const auth = Promise.withResolvers<unknown>();
+      mocks.authPost.mockReturnValueOnce(auth.promise);
+      const rebuilding = Promise.withResolvers<void>();
+      const rebuildWindow = vi.fn(() => rebuilding.promise);
+      const { account, mode } = await accountFixture(rebuildWindow);
+      // Even if the page-level subscription misses retirement, read the
+      // authoritative status rather than accepting an error late.
+      if (outcome === "failure") account.onRetired = () => () => undefined;
+      render(
+        <BackendApiProvider>
+          <span>same library editor</span>
+        </BackendApiProvider>
+      );
+      await waitFor(() => expect(mocks.authPost).toHaveBeenCalledOnce());
+      const signal: AbortSignal = mocks.authPost.mock.calls[0][2].signal;
+      const transition = account.chooseMode("offline");
+      try {
+        await waitFor(() => expect(rebuildWindow).toHaveBeenCalledOnce());
+        expect(mode()).toBe("offline");
+        expect(account.mode).toBe("cloud"); // Baked into the still-mounted old window.
+        if (outcome === "success") expect(signal.aborted).toBe(true);
+        await act(async () => {
+          if (outcome === "success")
+            auth.resolve({ data: { api_key: "retired-key" } });
+          else auth.reject(new Error("retired exchange"));
+        });
+        mocks.unauthorized.mock.calls[0][0]();
+        expect(signal.aborted).toBe(true);
+        expect(mocks.setApiKey).not.toHaveBeenCalled();
+        expect(mocks.rejectKey).not.toHaveBeenCalled();
+        expect(mocks.push).not.toHaveBeenCalled();
+        expect(mocks.authPost).toHaveBeenCalledOnce();
+        expect(screen.getByText("same library editor")).toBeInTheDocument();
+      } finally {
+        rebuilding.resolve();
+        await transition;
+      }
+    }
+  );
+
+  it("waits for the trusted preload and main teardown before persisting an account change", async () => {
+    const drain = Promise.withResolvers<void>();
+    const drainRetired = vi.fn(() => drain.promise);
+    const { account, mode, notifyRenderer, settings } = await accountFixture(
+      undefined,
+      drainRetired
+    );
+    const auth = Promise.withResolvers<unknown>();
+    mocks.authPost.mockReturnValueOnce(auth.promise);
+    render(
+      <BackendApiProvider>
+        <span>same library editor</span>
+      </BackendApiProvider>
+    );
+    await waitFor(() => expect(mocks.authPost).toHaveBeenCalledOnce());
+    desktop.sender.send.mockImplementation(() => undefined);
+    const transition = account.chooseMode("offline");
+    await waitFor(() =>
+      expect(desktop.sender.send).toHaveBeenCalledWith(
+        IPC_CHANNELS.accountRetired
+      )
+    );
+    expect(account.isCurrent()).toBe(false);
+    const acknowledge = desktop.mainListeners.get(
+      IPC_CHANNELS.accountRetiredAck
+    )!;
+    acknowledge(desktop.event(desktop.makeSender()));
+    acknowledge({
+      ...desktop.event(),
+      senderFrame: { ...desktop.sender.mainFrame }
+    });
+    await act(async () =>
+      auth.resolve({ data: { api_key: "retired-before-ack" } })
+    );
+    expect(mocks.setApiKey).not.toHaveBeenCalled();
+    expect(drainRetired).not.toHaveBeenCalled();
+    expect(settings.setAppMode).not.toHaveBeenCalled();
+    notifyRenderer(IPC_CHANNELS.accountRetired);
+    await waitFor(() => expect(drainRetired).toHaveBeenCalledOnce());
+    expect(mode()).toBe("cloud");
+    drain.resolve();
+    await transition;
+    expect(mode()).toBe("offline");
+  });
+
+  it("fails closed without writing if the old preload never acknowledges retirement", async () => {
+    const { account, settings } = await accountFixture();
+    desktop.sender.send.mockImplementation(() => undefined);
+    vi.useFakeTimers();
+    try {
+      const rejected = expect(account.chooseMode("offline")).rejects.toThrow(
+        "Account window retirement timed out"
+      );
+      await vi.advanceTimersByTimeAsync(5000);
+      await rejected;
+      expect(account.isCurrent()).toBe(false);
+      expect(settings.setAppMode).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retires the window while Clerk is pending, and only that window can finish sign-out", async () => {
+    const token = Promise.withResolvers<string>();
+    mocks.getToken.mockReturnValueOnce(token.promise);
+    const { account, settings, mode } = await accountFixture();
+    render(
+      <BackendApiProvider>
+        <span>same library editor</span>
+      </BackendApiProvider>
+    );
+    await waitFor(() => expect(mocks.getToken).toHaveBeenCalledOnce());
+    await expect(account.signOut()).rejects.toThrow("did not begin sign-out");
+    await account.beginSignOut();
+    expect(mode()).toBe("cloud");
+    expect(settings.clearAppMode).not.toHaveBeenCalled();
+    expect(account.isCurrent()).toBe(false);
+    await act(async () => token.resolve("retired-token"));
+    expect(mocks.authPost).not.toHaveBeenCalled();
+    await expect(
+      desktop.handlers.get(IPC_CHANNELS.accountSignOut)!(
+        desktop.event(desktop.makeSender())
+      )
+    ).rejects.toThrow("did not begin sign-out");
+    await account.signOut();
+    expect(mode()).toBeNull();
+    expect(account.isCurrent()).toBe(false);
+  });
+
+  it("serializes account writes and rejects the original window after Cloud → offline → Cloud", async () => {
+    const saving = Promise.withResolvers<void>();
+    const auth = Promise.withResolvers<unknown>();
+    mocks.authPost.mockReturnValueOnce(auth.promise);
+    const rebuildWindow = vi.fn(async () => {});
+    const { account, settings, bindWindow, mode } =
+      await accountFixture(rebuildWindow);
+    const current = desktop.mainListeners.get(IPC_CHANNELS.accountIsCurrent)!;
+    const choose = desktop.handlers.get(IPC_CHANNELS.accountChooseMode)!;
+    const iframe = {
+      ...desktop.event(),
+      senderFrame: { ...desktop.sender.mainFrame }
+    };
+    await expect(choose(iframe, "offline")).rejects.toThrow(
+      "main window frame"
+    );
+    await expect(account.chooseMode("invalid" as "offline")).rejects.toThrow(
+      "Unknown Mago app mode"
+    );
+    expect(account.isCurrent()).toBe(true);
+    render(
+      <BackendApiProvider>
+        <span>same library editor</span>
+      </BackendApiProvider>
+    );
+    await waitFor(() => expect(mocks.authPost).toHaveBeenCalledOnce());
+    const persist = settings.setAppMode.getMockImplementation()!;
+    settings.setAppMode.mockImplementationOnce(async (next) => {
+      await saving.promise;
+      await persist(next);
+    });
+    const first = account.chooseMode("offline");
+    const queued = expect(account.chooseMode("cloud")).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await waitFor(() => expect(settings.setAppMode).toHaveBeenCalledOnce());
+    expect(account.isCurrent()).toBe(false);
+    expect(rebuildWindow).not.toHaveBeenCalled();
+    saving.resolve();
+    await first;
+    await queued;
+    expect(mode()).toBe("offline");
+    const offline = bindWindow();
+    await choose(desktop.event(offline), "cloud");
+    const replacement = desktop.event(bindWindow());
+    current(replacement);
+    expect(mode()).toBe("cloud");
+    expect(replacement.returnValue).toBe(true);
+    expect(account.isCurrent()).toBe(false);
+    await act(async () =>
+      auth.resolve({ data: { api_key: "retired-before-aba" } })
+    );
+    expect(mocks.setApiKey).not.toHaveBeenCalled();
+    expect(mocks.push).not.toHaveBeenCalled();
+    expect(mocks.authPost).toHaveBeenCalledOnce();
+    await expect(account.chooseMode("offline")).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    expect(settings.setAppMode.mock.calls).toEqual([["offline"], ["cloud"]]);
+  });
+
+  it.each(["persistence", "replacement"])(
+    "does not re-authorize the old window after failed %s",
+    async (failure) => {
+      const rebuildWindow = vi.fn(async () => {});
+      const { account, settings, profiles, mode, bindWindow, lifecycle } =
+        await accountFixture(rebuildWindow);
+      const error = new Error("account transition failed");
+      let provisional: AbortSignal | undefined;
+      if (failure === "persistence")
+        settings.setAppMode.mockRejectedValueOnce(error);
+      else
+        rebuildWindow.mockImplementationOnce(async () => {
+          provisional = lifecycle.capture(
+            bindWindow() as unknown as WebContents
+          );
+          expect(provisional.aborted).toBe(false);
+          throw error;
+        });
+      await expect(account.chooseMode("offline")).rejects.toThrow(
+        error.message
+      );
+      expect(mode()).toBe(failure === "persistence" ? "cloud" : "offline");
+      if (failure === "replacement") expect(provisional?.aborted).toBe(true);
+      expect(account.isCurrent()).toBe(false);
+      expect(() => profiles.capture()).toThrow();
+      await expect(account.beginSignOut()).rejects.toMatchObject({
+        name: "AbortError"
+      });
+      if (failure === "persistence")
+        expect(rebuildWindow).not.toHaveBeenCalled();
+    }
+  );
+
+  it("serializes the direct startup fallback write and holds admission until offline window binding", async () => {
+    const { account, bindWindow, lifecycle, mode, profiles, settings } =
+      await accountFixture();
+    const previous = profiles.capture();
+    const saving = Promise.withResolvers<void>();
+    const persist = settings.setAppMode.getMockImplementation()!;
+    settings.setAppMode.mockImplementationOnce(async (next) => {
+      expect(previous.aborted).toBe(true);
+      await saving.promise;
+      await persist(next);
+    });
+    const openOfflineWindow = vi.fn(async () => {
+      expect(mode()).toBe("offline");
+      expect(() => profiles.capture()).toThrow();
+      bindWindow();
+    });
+    const fallback = lifecycle.serialize(() =>
+      lifecycle.replace(() => settings.setAppMode("offline"), openOfflineWindow)
+    );
+    const stale = expect(account.chooseMode("cloud")).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await waitFor(() => expect(settings.setAppMode).toHaveBeenCalledOnce());
+    expect(mode()).toBe("cloud");
+    expect(account.isCurrent()).toBe(false);
+    expect(openOfflineWindow).not.toHaveBeenCalled();
+    saving.resolve();
+    await fallback;
+    await stale;
+    expect(profiles.capture().aborted).toBe(false);
+    expect(account.isCurrent()).toBe(false);
+  });
+
   it("drops a late GA client-id callback after sign-out", async () => {
     setMode("cloud");
     window.gtag = vi.fn();

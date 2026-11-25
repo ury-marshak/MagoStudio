@@ -141,6 +141,7 @@ describe("createProject (desktop)", () => {
     expect(create).not.toHaveBeenCalled();
     expect(putSnapshot).toHaveBeenCalledWith({
       projectId: "cloud-script",
+      intent: "cloud-import",
       project: { id: "cloud-script", type: "script_to_shots" },
       metadataOnly: true
     });

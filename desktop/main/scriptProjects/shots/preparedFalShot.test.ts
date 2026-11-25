@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ExternalRenderJob } from "../../providers/externalRenderJobRepository";
 import type { ExternalRenderJobService } from "../../providers/externalRenderJobService";
 
+import { FAL_OPENING_FRAME_POLICY } from "./falOpeningFrame";
 import { renderPreparedFalShot } from "./falShotRenderer";
 
 vi.mock("../../providers/waitForExternalRender", () => ({
@@ -102,12 +103,112 @@ const job = (prepared: PreparedFalShot): ExternalRenderJob =>
   }) as ExternalRenderJob;
 
 describe("persisted fal shot preparation", () => {
+  it("binds a native opening frame after all nine numbered images and rejects inconsistent records or requests", () => {
+    const input = body();
+    const opener = {
+      asset_id: "opener",
+      predecessor_timeline_id: "previous",
+      predecessor_asset_id: "previous-video",
+      aspect_ratio: "9:16",
+      width: 768,
+      height: 1344,
+      canvas_policy: FAL_OPENING_FRAME_POLICY
+    } as const;
+    const selection = {
+      mode: "last_frame",
+      opening_frame: "pin",
+      prompt_appendix: "Continue."
+    } as const;
+    const continuesFrom = {
+      timeline_id: opener.predecessor_timeline_id,
+      asset_id: opener.predecessor_asset_id,
+      reference_asset_id: opener.asset_id,
+      mode: selection.mode
+    };
+    const renderSpec = {
+      ...input.render_spec,
+      sequential: {
+        prev_asset_id: continuesFrom.asset_id,
+        opening_frame_preparation: FAL_OPENING_FRAME_POLICY,
+        prepared_opening_frame: opener
+      }
+    };
+    const ids = Array.from({ length: 9 }, (_, index) => "ref-" + index);
+    const preparedBody: Omit<PreparedFalShot, "digest"> = {
+      ...input,
+      opening_frame: opener,
+      image_ids: ids,
+      image_slots: ids.map((asset_id) => ({
+        asset_id,
+        members: [asset_id],
+        role: "entity"
+      })),
+      predecessor: {
+        timeline_id: continuesFrom.timeline_id,
+        asset_id: continuesFrom.asset_id,
+        in_run: false,
+        selection
+      },
+      continues_from: continuesFrom,
+      prompt_provenance: {
+        ...input.prompt_provenance,
+        rewrite: "raw",
+        composition: null
+      },
+      media_provenance: {
+        continuity: {
+          selection,
+          continues_from: continuesFrom,
+          opening_frame: opener
+        },
+        grids: null
+      },
+      render_spec: renderSpec,
+      render_fingerprint: fingerprint(renderSpec)
+    };
+    const prepared = createPreparedFalShot(preparedBody);
+    expect(parsePreparedFalShot(JSON.parse(JSON.stringify(prepared)))).toEqual(
+      prepared
+    );
+    expect(() =>
+      createPreparedFalShot({ ...preparedBody, opening_frame: undefined })
+    ).toThrow(/opening-frame/);
+    expect(() =>
+      createPreparedFalShot({
+        ...preparedBody,
+        prompt: "Image 10 opens the shot"
+      })
+    ).toThrow(/opening-frame/);
+    expect(() =>
+      createPreparedFalShot({
+        ...preparedBody,
+        opening_frame: { ...opener, width: 1920 }
+      })
+    ).toThrow(/opening-frame/);
+    expect(() =>
+      parsePreparedFalShot({
+        ...prepared,
+        opening_frame: { ...opener, asset_id: "changed" }
+      })
+    ).toThrow();
+    const saved = job(prepared);
+    saved.inputAssetIds = [...ids, opener.asset_id];
+    delete saved.requestJson.aspect_ratio;
+    saved.requestJson.image_url = "https://v3.fal.media/opener.png";
+    expect(() => assertPreparedShotJob(prepared, saved)).not.toThrow();
+    saved.requestJson.image_url = [saved.requestJson.image_url];
+    expect(() => assertPreparedShotJob(prepared, saved)).toThrow(
+      /does not match/
+    );
+  });
+
   it("round trips all effective inputs, slots, provenance, costs and fingerprint without changing prompt bytes", () => {
     const prepared = createPreparedFalShot(body());
     expect(parsePreparedFalShot(JSON.parse(JSON.stringify(prepared)))).toEqual(
       prepared
     );
     expect(prepared.prompt).toBe(body().prompt);
+    expect(prepared).not.toHaveProperty("opening_frame");
     expect(prepared.cost).toMatchObject({
       output_base_usd: 0.25,
       video_scenario: null

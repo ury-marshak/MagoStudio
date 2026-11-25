@@ -1,9 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ProfileLifetime } from "../providers/profileLifetime";
+
 import {
   type ComfyWebSocket,
   ComfyProgressMonitor
 } from "./ComfyProgressMonitor";
+import {
+  closeAllComfyProgressMonitors,
+  comfyProgressMonitorFor,
+  onAnyComfyPromptSettled
+} from "./comfyProgressMonitors";
 
 type Listener = (event: { data?: unknown }) => void;
 
@@ -58,7 +65,11 @@ const createMonitor = () => {
 
 describe("ComfyProgressMonitor", () => {
   beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    closeAllComfyProgressMonitors();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
 
   it("opens one socket for the process client id only while prompts are watched", () => {
     const { monitor, sockets } = createMonitor();
@@ -221,4 +232,74 @@ describe("ComfyProgressMonitor", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     expect(onTimeout).toHaveBeenCalled();
   });
+});
+
+it("retires socket events, reconnect timers and settle waits across A → B → A", async () => {
+  vi.useFakeTimers();
+  const sockets: FakeComfyWebSocket[] = [];
+  vi.stubGlobal(
+    "WebSocket",
+    class extends FakeComfyWebSocket {
+      constructor(url: string) {
+        super(url);
+        sockets.push(this);
+      }
+    }
+  );
+  const profile = new ProfileLifetime();
+  const endpointA = "http://a.invalid";
+  const originA = profile.capture();
+  const first = comfyProgressMonitorFor(endpointA, originA);
+  const listener = vi.fn();
+  const unsubscribe = onAnyComfyPromptSettled(listener);
+  try {
+    first.watch("same", graph);
+    sockets[0]!.open();
+    sockets[0]!.send("progress", {
+      prompt_id: "same",
+      node: "2",
+      value: 2,
+      max: 8
+    });
+    const waiter = first.waitForSettle("same", 60_000, originA);
+    const rejected = expect(waiter).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    sockets[0]!.emit("error"); // old reconnect is scheduled at rotation
+    expect(sockets[0]!.isClosed).toBe(true);
+    profile.rotate();
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+    const second = comfyProgressMonitorFor(
+      "http://b.invalid",
+      profile.capture()
+    );
+    second.watch("same", graph);
+    profile.rotate();
+    expect(sockets[1]!.isClosed).toBe(true);
+    const currentOrigin = profile.capture();
+    const current = comfyProgressMonitorFor(endpointA, currentOrigin);
+    expect(current).not.toBe(first);
+    expect(current.clientId).not.toBe(first.clientId);
+    expect(comfyProgressMonitorFor(endpointA, currentOrigin)).toBe(current);
+    expect(() => comfyProgressMonitorFor(endpointA, originA)).toThrow();
+    first.watch("stale", graph);
+    first.resetConnection();
+    current.watch("earlier", graph);
+    sockets[2]!.open();
+    current.watch("same", graph);
+    sockets[0]!.send("execution_success", { prompt_id: "same" });
+    sockets[1]!.send("execution_success", { prompt_id: "same" });
+    expect(listener).not.toHaveBeenCalled();
+    expect(current.livePrompt("same")?.phase).toBe("queued");
+    sockets[2]!.send("execution_success", { prompt_id: "same" });
+    expect(listener).toHaveBeenCalledExactlyOnceWith("same", currentOrigin);
+    vi.advanceTimersByTime(60_000);
+    expect(sockets).toHaveLength(3);
+  } finally {
+    profile.suspend();
+    unsubscribe();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  }
 });

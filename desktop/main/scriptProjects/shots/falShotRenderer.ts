@@ -20,7 +20,8 @@ import { waitForExternalRender } from "../../providers/waitForExternalRender";
 import {
   assertPreparedShotJob,
   assertPreparedShotOwner,
-  parsePreparedFalShot
+  parsePreparedFalShot,
+  type PreparedFalShot
 } from "./preparedFalShot";
 
 export { FAL_SHOT_IMAGE_SLOTS } from "../../../shared/falShotModel";
@@ -35,9 +36,11 @@ export const renderFalShot = async (
     duration: number;
     settings?: FalGenerationSettings;
     sourceIds: string[];
+    openingFrame?: PreparedFalShot["opening_frame"];
     videoInputs?: Array<{ assetId: string; provenance: VideoTailProvenance }>;
     recovering?: boolean;
     signal: AbortSignal;
+    profile?: AbortSignal;
     onSubmitted: () => Promise<void>;
   }
 ) => {
@@ -46,7 +49,7 @@ export const renderFalShot = async (
     if (input.recovering)
       throw new Error("Resume the plan to submit its remaining renders");
     const videos = input.videoInputs ?? [];
-    if (!input.sourceIds.length && !videos.length)
+    if (!input.sourceIds.length && !videos.length && !input.openingFrame)
       throw new Error(
         "H3 Max requires at least one image or video reference in Director"
       );
@@ -71,7 +74,7 @@ export const renderFalShot = async (
       input.sourceIds.length + videos.length
     )
       throw new Error("Render references must have distinct asset IDs");
-    const { seed, ...settings } = resolveFalGenerationSettings(
+    const { seed, aspect_ratio, ...settings } = resolveFalGenerationSettings(
       FAL_SHOT_ENGINE,
       input.settings
     );
@@ -84,7 +87,8 @@ export const renderFalShot = async (
         kind: "video",
         inputAssetIds: [
           ...input.sourceIds,
-          ...videos.map((video) => video.assetId)
+          ...videos.map((video) => video.assetId),
+          ...(input.openingFrame ? [input.openingFrame.asset_id] : [])
         ],
         assetInputs: [
           ...(input.sourceIds.length
@@ -104,19 +108,39 @@ export const renderFalShot = async (
                   assetIds: videos.map((video) => video.assetId)
                 }
               ]
+            : []),
+          ...(input.openingFrame
+            ? [
+                {
+                  field: "image_url",
+                  kind: "image" as const,
+                  assetIds: [input.openingFrame.asset_id],
+                  scalar: true as const
+                }
+              ]
             : [])
         ],
         requestJson: {
           prompt: input.prompt,
           duration: input.duration,
           ...settings,
+          // The native start image supplies the canvas; the saved aspect is a compatibility constraint.
+          ...(input.openingFrame ? {} : { aspect_ratio }),
           ...(seed == null ? {} : { seed })
         }
       },
       input.signal
     );
   }
-  return waitForExternalRender(jobs, job, input.signal, input.onSubmitted);
+  return input.profile
+    ? waitForExternalRender(
+        jobs,
+        job,
+        input.signal,
+        input.onSubmitted,
+        input.profile
+      )
+    : waitForExternalRender(jobs, job, input.signal, input.onSubmitted);
 };
 
 /** Submission-only entry point: all composition/media work must already be persisted. */
@@ -130,6 +154,7 @@ export const renderPreparedFalShot = async (
     savedJob: ExternalRenderJob | null;
     recovering?: boolean;
     signal: AbortSignal;
+    profile?: AbortSignal;
     onSubmitted: () => Promise<void>;
   }
 ) => {
@@ -150,12 +175,14 @@ export const renderPreparedFalShot = async (
     duration: prepared.duration,
     settings: prepared.settings,
     sourceIds: prepared.image_ids,
+    openingFrame: prepared.opening_frame,
     videoInputs: prepared.video_inputs.map((video) => ({
       assetId: video.asset_id,
       provenance: video.provenance
     })),
     recovering: input.recovering,
     signal: input.signal,
+    profile: input.profile,
     onSubmitted: input.onSubmitted
   });
 };

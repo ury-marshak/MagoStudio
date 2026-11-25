@@ -4,9 +4,8 @@ import type {
 } from "../../shared/contracts";
 
 import { evaluateScriptSetup } from "./probeScriptSetup";
+import { readSetupInventory } from "./readSetupInventory";
 import { addSetupDestinations } from "./setupDestinations";
-
-const PATH_TIMEOUT_MS = 5000;
 
 export type DownloadableSetupRequirement = ScriptSetupRequirement & {
   downloadUrl: string;
@@ -14,23 +13,17 @@ export type DownloadableSetupRequirement = ScriptSetupRequirement & {
 
 export const resolveSetupRequirements = async (
   settings: ComfySettings,
-  names: string[]
+  names: string[],
+  signal?: AbortSignal
 ): Promise<DownloadableSetupRequirement[]> => {
   const endpoint = settings.endpoint.replace(/\/$/, "");
-  const read = async (route: string) => {
-    try {
-      const response = await fetch(`${endpoint}${route}`, {
-        signal: AbortSignal.timeout(PATH_TIMEOUT_MS)
-      });
-      return response.ok ? await response.json() : null;
-    } catch {
-      return null;
-    }
-  };
+  const read = (route: string) =>
+    readSetupInventory(endpoint + route, signal).catch(() => null);
   const [stats, inventory] = await Promise.all([
     read("/system_stats"),
     read("/experiment/models")
   ]);
+  signal?.throwIfAborted();
   // Resolve URLs from our own catalog; the renderer only supplies a name.
   const setup = addSetupDestinations(
     evaluateScriptSetup({}, settings),

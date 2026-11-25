@@ -23,7 +23,10 @@ export class RenderSubmissionRejected extends Error {}
 
 /** The adapter owns remote requests. The job service owns local state. */
 export interface MediaRenderProvider {
-  prepareSubmission(endpoint: string): Promise<{
+  prepareSubmission(
+    endpoint: string,
+    signal?: AbortSignal
+  ): Promise<{
     keychainAccount: string;
     upload?(file: Blob, name: string, signal?: AbortSignal): Promise<string>;
     submit(
@@ -31,6 +34,11 @@ export interface MediaRenderProvider {
       signal?: AbortSignal
     ): Promise<string>;
   }>;
+  /** Optional local authorization for a saved output URL; must not contact the provider. */
+  assertOutputAccess?(
+    request: MediaRenderRequest,
+    signal: AbortSignal
+  ): Promise<void>;
   refresh(
     request: MediaRenderRequest,
     kind: MediaRenderKind,

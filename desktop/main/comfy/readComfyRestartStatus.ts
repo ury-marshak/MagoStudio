@@ -3,7 +3,7 @@ import type {
   ComfyRestartStatus
 } from "../../shared/contracts";
 
-import { ComfyClient } from "./ComfyClient";
+import { ComfyClient, createProfileComfyClient } from "./ComfyClient";
 import type { ComfyLauncher } from "./ComfyLauncher";
 import { isComfyManagerAvailable } from "./comfyManagerReboot";
 
@@ -12,25 +12,37 @@ const countQueueEntries = (entries: unknown) =>
 
 const resolveComfyRestartMethod = async ({
   launcher,
-  endpoint
+  endpoint,
+  signal
 }: {
   launcher: Pick<ComfyLauncher, "isLaunchedProcessRunning" | "canLaunch">;
   endpoint: string;
+  signal?: AbortSignal;
 }): Promise<ComfyRestartMethod | null> => {
-  if (launcher.isLaunchedProcessRunning()) return "mago-launched-process";
-  if (!(await launcher.canLaunch())) return null;
-  if (await isComfyManagerAvailable(endpoint)) return "comfyui-manager";
+  signal?.throwIfAborted();
+  if (launcher.isLaunchedProcessRunning(endpoint, signal))
+    return "mago-launched-process";
+  const canLaunch = await launcher.canLaunch(endpoint, signal);
+  signal?.throwIfAborted();
+  if (!canLaunch) return null;
+  if (await isComfyManagerAvailable(endpoint, signal)) return "comfyui-manager";
   return "relaunch-from-install-folder";
 };
 
 export const readComfyRestartStatus = async ({
   launcher,
-  endpoint
+  endpoint,
+  signal
 }: {
   launcher: Pick<ComfyLauncher, "isLaunchedProcessRunning" | "canLaunch">;
   endpoint: string;
+  signal?: AbortSignal;
 }): Promise<ComfyRestartStatus> => {
-  const runningOrQueuedRenderCount = await new ComfyClient(endpoint)
+  signal?.throwIfAborted();
+  const client = signal
+    ? createProfileComfyClient(endpoint, signal)
+    : new ComfyClient(endpoint);
+  const runningOrQueuedRenderCount = await client
     .getJson("/queue")
     .then(
       (queue) =>
@@ -38,8 +50,12 @@ export const readComfyRestartStatus = async ({
         countQueueEntries(queue.queue_pending)
     )
     .catch(() => null);
-  return {
-    restartMethod: await resolveComfyRestartMethod({ launcher, endpoint }),
-    runningOrQueuedRenderCount
-  };
+  signal?.throwIfAborted();
+  const restartMethod = await resolveComfyRestartMethod({
+    launcher,
+    endpoint,
+    signal
+  });
+  signal?.throwIfAborted();
+  return { restartMethod, runningOrQueuedRenderCount };
 };

@@ -3418,6 +3418,15 @@
     "sequential_opening_frame_pin": {
       "label": "Börja på föregående bildruta (experimentellt)"
     },
+    "fal_opening_frame_hint": {
+      "label": "För H3 Max (fal) bestämmer föregående klipps sista bildruta bildytan och måste matcha det här klippets bildförhållande. Om båda klippen renderas i samma körning kontrolleras det när föregående klipp är klart."
+    },
+    "shot_blocked_fal_opening_frame_aspect": {
+      "label": "Föregående bildruta matchar inte det här klippets bildförhållande för H3 Max. Ändra bildförhållandet eller välj klipp till ny vinkel eller lös referens."
+    },
+    "shot_blocked_fal_opening_frame_number": {
+      "label": "Öppningsbildrutan har inget nummer. Ta bort dess bildnummer från prompten eller välj klipp till ny vinkel eller lös referens."
+    },
     "sequential_opening_frame_off": {
       "label": "Endast lös referens"
     },

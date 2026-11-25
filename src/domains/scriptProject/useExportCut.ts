@@ -1,3 +1,4 @@
+import { readMediaBlob } from "@domains/asset/utils/readMediaBlob";
 import { useProject } from "@domains/project/useProject";
 import { triggerBlobDownload } from "@hooks/files/utils";
 import { CutShot } from "@schemas/scriptProject";
@@ -5,6 +6,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { fetchRendererMedia } from "@/platform/rendererMediaAccess";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { postProjectCutExport } from "./api/postProjectCutExport";
@@ -31,9 +33,17 @@ export const useExportCut = (
 ) => {
   const queryClient = useQueryClient();
   const { data: project } = useProject(projectId);
-  const [isExportingCut, setIsExportingCut] = useState(false);
-  const [failedExport, setFailedExport] =
-    useState<CutExportRefusalDescription | null>(null);
+  const { work } = useRendererLibraryWork();
+  const [exporting, setExporting] = useState<AbortSignal | null>(null);
+  const [failure, setFailure] = useState<{
+    signal: AbortSignal;
+    description: CutExportRefusalDescription;
+  } | null>(null);
+  const setFailedExport = (description: CutExportRefusalDescription | null) => {
+    if (!work.signal.aborted) {
+      setFailure(description ? { signal: work.signal, description } : null);
+    }
+  };
   const {
     downloadCut: downloadCutAsZip,
     downloadOneShot,
@@ -45,25 +55,24 @@ export const useExportCut = (
   const expectedRefusal = describeCutExportRefusal(exportDryRun?.refused);
 
   const downloadStitchedFile = async (url: string) => {
-    const response = await fetchRendererMedia(url);
-    if (!response.ok) {
-      throw new Error(`Downloading the cut failed with ${response.status}`);
-    }
-    triggerBlobDownload(
-      await response.blob(),
-      buildCutExportFileName(project?.name, "mp4")
-    );
+    await work.ready();
+    work.check();
+    const response = await fetchRendererMedia(url, { signal: work.signal });
+    const blob = await readMediaBlob(response, work.signal);
+    work.check();
+    triggerBlobDownload(blob, buildCutExportFileName(project?.name, "mp4"));
   };
 
   const exportCut = async () => {
-    if (downloadableShotCount === 0) return;
-    setIsExportingCut(true);
+    if (work.signal.aborted || downloadableShotCount === 0) return;
+    setExporting(work.signal);
 
     try {
-      const dispatch = await postProjectCutExport({
-        projectId,
-        isDryRun: false
-      });
+      const dispatch = await postProjectCutExport(
+        { projectId, isDryRun: false },
+        work
+      );
+      work.check();
 
       const refusal = describeCutExportRefusal(dispatch.refused);
       if (refusal) {
@@ -86,8 +95,10 @@ export const useExportCut = (
 
       const stitchedUrl = await waitForCutExportUrl({
         projectId,
-        planId: dispatch.plan_id
+        planId: dispatch.plan_id,
+        work
       });
+      work.check();
       void queryClient.invalidateQueries({
         queryKey: queryKeys.projectCut.byProjectId(projectId)
       });
@@ -107,29 +118,36 @@ export const useExportCut = (
         shotNumbers: []
       });
     } finally {
-      setIsExportingCut(false);
+      if (!work.signal.aborted) setExporting(null);
     }
   };
 
   /* A cut the dry run already refused is not asked to stitch: the answer is known, so the
    * button goes straight to the separate files rather than spending a request to be told no
    * and then opening a dialog about it. */
-  const downloadCut = () =>
-    expectedRefusal ? downloadCutAsZip() : exportCut();
+  const downloadCut = async () => {
+    if (work.signal.aborted) return;
+    return expectedRefusal ? downloadCutAsZip() : exportCut();
+  };
 
   return {
     downloadCut,
     downloadOneShot,
     downloadCutAsZipAndDismiss: async () => {
+      if (work.signal.aborted) return;
       await downloadCutAsZip();
       setFailedExport(null);
     },
-    isExportingCut: isExportingCut || isDownloadingCut,
+    isExportingCut:
+      (!work.signal.aborted && exporting === work.signal) || isDownloadingCut,
     isDownloadingCut,
     downloadableShotCount,
     /** Known from the dry run, before the user presses anything. */
     expectedRefusal,
-    failedExport,
+    failedExport:
+      !work.signal.aborted && failure?.signal === work.signal
+        ? failure.description
+        : null,
     dismissFailedExport: () => setFailedExport(null)
   };
 };

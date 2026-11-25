@@ -8,6 +8,10 @@ import {
   uniqueIndex
 } from "drizzle-orm/sqlite-core";
 
+import type {
+  OrdinaryFalEffectDestination,
+  OrdinaryFalJob
+} from "../../shared/ordinaryFal";
 import type { MediaRenderOutput } from "../providers/mediaRenderProvider";
 
 const timestamps = {
@@ -373,4 +377,51 @@ export const externalRenderJobs = sqliteTable(
       table.requestId
     )
   ]
+);
+
+// The reservation exists before the external job row (and before any paid POST).
+// Destination IDs are intentionally not foreign keys: a deleted shot/track
+// must not discard an accepted provider request or its recoverable output.
+export const ordinaryFalJobs = sqliteTable(
+  "ordinary_fal_jobs",
+  {
+    jobId: text("job_id").primaryKey(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    shotId: text("shot_id").notNull(),
+    model: text("model").$type<OrdinaryFalJob["model"]>().notNull(),
+    kind: text("kind", {
+      enum: ["image-edit", "reference-video", "video-edit", "video-upscale"]
+    }).notNull(),
+    keychainAccount: text("keychain_account").notNull(),
+    inputDigest: text("input_digest").notNull(),
+    destination: text("destination", { mode: "json" })
+      .$type<
+        | {
+            kind: "image-edit";
+            frame: number;
+            canvas: { width: number; height: number };
+          }
+        | {
+            kind: "reference-video";
+            trackId: string;
+            timelineOffsetMs: number;
+            durationSeconds: number;
+          }
+        | OrdinaryFalEffectDestination
+      >()
+      .notNull(),
+    effectiveSettings: text("effective_settings", { mode: "json" })
+      .$type<Record<string, string | number | boolean | null>>()
+      .notNull(),
+    placement: text("placement", {
+      enum: ["PENDING", "ATTACHED", "UNATTACHED"]
+    })
+      .notNull()
+      .default("PENDING"),
+    clipId: text("clip_id"),
+    ...timestamps
+  },
+  (table) => [index("ordinary_fal_jobs_project_idx").on(table.projectId)]
 );

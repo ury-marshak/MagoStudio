@@ -5,10 +5,9 @@ import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { isLocalApp } from "@/platform/localDesktop";
-import {
-  rendererLibrary,
-  type RendererLibraryWork
-} from "@/platform/rendererLibraryWork";
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
+import { type RendererLibraryWork } from "@/platform/rendererLibraryWork";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { FolderOrProject } from "./interface";
@@ -19,6 +18,7 @@ const isFolderDummyProjectCreatedByThisApp =
   isLocalApp && identityMode === "offline";
 
 export const useUpdateProjectFolders = () => {
+  const { work: origin } = useRendererLibraryWork();
   const { data } = useProjectFolders();
   const folderDummyProject = data?.folderDummyProject;
   const { user } = useUser();
@@ -26,13 +26,15 @@ export const useUpdateProjectFolders = () => {
 
   const mutation = useUpdateProject({
     onMutate: async (variables, work) => {
-      await queryClient.cancelQueries({ queryKey: queryKeys.projects.all });
+      await queryClient.cancelQueries({
+        queryKey: libraryQueryKey(queryKeys.projects.all)
+      });
       work.check();
       const { projectId, settings } = variables;
       if (!settings) return;
 
       queryClient.setQueryData(
-        queryKeys.projects.all,
+        libraryQueryKey(queryKeys.projects.all),
         (oldProjects: Project[] | undefined) =>
           replaceProjectSettings(oldProjects, projectId, settings)
       );
@@ -50,7 +52,7 @@ export const useUpdateProjectFolders = () => {
 
   const updateProjectFolders = async (
     projectFolders: FolderOrProject[],
-    work = rendererLibrary.capture()
+    work = origin
   ) => {
     work.check();
     const folderDummyProjectToUpdate =

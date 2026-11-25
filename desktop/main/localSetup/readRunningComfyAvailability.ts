@@ -4,8 +4,7 @@ import { asRecord } from "../comfy/asRecord";
 import { normalizeComfyEndpoint } from "../comfy/normalizeComfyEndpoint";
 
 import type { ModelGroupItem } from "./listModelGroupItems";
-
-const REQUEST_TIMEOUT_MS = 5_000;
+import { readSetupInventory } from "./readSetupInventory";
 
 const NODE_PACK_NODES: Record<string, string[]> = {
   "comfyui-kjnodes": ["MiniMaxChunkFeedForward"],
@@ -49,20 +48,13 @@ export type RunningComfyAvailability = (item: ModelGroupItem) => boolean;
 // Availability belongs to the configured server. Item paths remain installation
 // destinations, and runtime observations must never become managed-install hashes.
 export const readRunningComfyAvailability = async (
-  endpoint: string
+  endpoint: string,
+  signal?: AbortSignal
 ): Promise<RunningComfyAvailability | null> => {
   try {
     const normalized = normalizeComfyEndpoint(endpoint);
-    const getJson = async (route: string): Promise<unknown> => {
-      const response = await fetch(`${normalized}${route}`, {
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-      });
-      if (!response.ok)
-        throw new Error(
-          `ComfyUI inventory request failed (${response.status})`
-        );
-      return response.json();
-    };
+    const getJson = (route: string) =>
+      readSetupInventory(normalized + route, signal);
     const nodeNames = [
       ...new Set([
         ...Object.values(NODE_PACK_NODES).flat(),
@@ -81,6 +73,7 @@ export const readRunningComfyAvailability = async (
       ),
       getJson("/models/clip_gguf").catch(() => [])
     ]);
+    signal?.throwIfAborted();
     const nodes = Object.fromEntries(entries);
     const textModels = new Set(
       Array.isArray(ggufFiles)
@@ -112,6 +105,7 @@ export const readRunningComfyAvailability = async (
       );
     };
   } catch {
+    signal?.throwIfAborted();
     return null;
   }
 };

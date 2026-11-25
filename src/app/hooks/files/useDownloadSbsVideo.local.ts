@@ -19,6 +19,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { isLocalApp } from "@/platform/localDesktop";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 
 import { triggerBlobDownload } from "./utils";
 import { sanitizeDownloadFilename } from "./utils/sanitizeDownloadFilename";
@@ -26,8 +27,12 @@ import { sanitizeDownloadFilename } from "./utils/sanitizeDownloadFilename";
 export const useDownloadSbsVideo = ({ trackId }: { trackId: Layer["id"] }) => {
   const { t } = useTranslation();
   const { showToast } = useToast();
-  const [isDownloading, setIsDownloading] = useState(false);
+  const { work } = useRendererLibraryWork();
+  const [downloadingWork, setDownloadingWork] = useState<typeof work | null>(
+    null
+  );
   const [progress, setProgress] = useState(0);
+  const isDownloading = downloadingWork === work && !work.signal.aborted;
 
   const selectedProjectId = useSelectedProjectId();
   const { selectedShotId } = useSelectedShotId();
@@ -82,6 +87,7 @@ export const useDownloadSbsVideo = ({ trackId }: { trackId: Layer["id"] }) => {
     (!isLocalApp || (!!inputAssetId && !!renderAssetId)) &&
     frameRange.length === 2;
   const downloadSbsVideo = async () => {
+    if (work.signal.aborted) return;
     if (
       !subjectTrack ||
       !frameRange ||
@@ -93,17 +99,23 @@ export const useDownloadSbsVideo = ({ trackId }: { trackId: Layer["id"] }) => {
       return;
     }
 
+    setDownloadingWork(work);
+    setProgress(0);
     try {
-      setIsDownloading(true);
-      setProgress(0);
+      await work.ready();
+      work.check();
 
       if (isLocalApp) {
         const requestId = crypto.randomUUID();
         const unsubscribe = window.mago.files.onSbsExportProgress((event) => {
-          if (event.requestId === requestId) setProgress(event.percentage);
+          if (!work.signal.aborted && event.requestId === requestId) {
+            setProgress(event.percentage);
+          }
         });
+        const stop = () => unsubscribe();
+        work.signal.addEventListener("abort", stop, { once: true });
         try {
-          await window.mago.files.exportSbsVideo({
+          const saved = await window.mago.files.exportSbsVideo({
             requestId,
             inputAssetId: inputAssetId!,
             renderAssetId: renderAssetId!,
@@ -112,14 +124,17 @@ export const useDownloadSbsVideo = ({ trackId }: { trackId: Layer["id"] }) => {
             fps,
             suggestedName: `${sanitizeDownloadFilename(trackName)}_sbs_comparison.mp4`
           });
+          if (!saved) return;
         } finally {
-          unsubscribe();
+          work.signal.removeEventListener("abort", stop);
+          if (!work.signal.aborted) stop();
         }
       } else {
         const [inputVideoResult, renderVideoResult] = await Promise.all([
           inputVideoAssetQuery.refetch(),
           renderVideoAssetQuery.refetch()
         ]);
+        work.check();
         const inputVideoUrl = resolveVideoAssetUrl(inputVideoResult.data);
         const renderVideoUrl = resolveVideoAssetUrl(renderVideoResult.data);
         if (!inputVideoUrl || !renderVideoUrl) {
@@ -135,28 +150,33 @@ export const useDownloadSbsVideo = ({ trackId }: { trackId: Layer["id"] }) => {
           endFrame: frameRange[1],
           fps,
           onProgress: (progressInfo: EncodingProgress) => {
-            setProgress(progressInfo.percentage);
+            if (!work.signal.aborted) setProgress(progressInfo.percentage);
           }
         });
 
+        work.check();
         triggerBlobDownload(
           videoBlob,
           `${sanitizeDownloadFilename(trackName)}_sbs_comparison.mp4`
         );
       }
 
+      work.check();
       trackingUtils.exportActions.downloadSbsVideo({
         trackId,
         videoRatio
       });
     } catch (error) {
+      if (work.signal.aborted) return;
       console.error("Error downloading SBS video:", error);
       showToast({
         message: t("notifications.sbs_video_download_failed.description")
       });
     } finally {
-      setIsDownloading(false);
-      setProgress(0);
+      if (!work.signal.aborted) {
+        setDownloadingWork(null);
+        setProgress(0);
+      }
     }
   };
   return {
@@ -164,6 +184,6 @@ export const useDownloadSbsVideo = ({ trackId }: { trackId: Layer["id"] }) => {
     isDownloading,
     canDownload,
     isCroppedRender,
-    progress
+    progress: isDownloading ? progress : 0
   };
 };

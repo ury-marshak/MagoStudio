@@ -1,13 +1,33 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  writeFile
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   createExternalProviderSettings,
   resolveProviderStartupMode
 } from "./externalProviderSettings";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rename: vi.fn(actual.rename) };
+});
+
+const deferred = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
 
 let directory: string;
 beforeEach(async () => {
@@ -63,6 +83,62 @@ describe("external provider settings", () => {
     });
   });
 
+  it("keeps inference admission closed across queued commits", async () => {
+    const firstCommit = deferred<void>();
+    const secondCommit = deferred<void>();
+    const gates = [firstCommit.promise, secondCommit.promise];
+    let pending: Promise<unknown> = Promise.resolve();
+    const settings = createExternalProviderSettings(() => directory, {
+      serializeWrite: (operation) => {
+        const gate = gates.shift();
+        const write = pending.then(async () => {
+          await gate;
+          return operation();
+        });
+        pending = write.catch(() => {});
+        return write;
+      }
+    });
+    const original = settings.captureInferenceProfile();
+    const first = settings.save("vision", vision);
+    const second = settings.save("text", vision);
+    expect(original.aborted).toBe(true);
+    expect(() => settings.captureInferenceProfile()).toThrow();
+    firstCommit.resolve();
+    await first;
+    expect(() => settings.captureInferenceProfile()).toThrow();
+    secondCommit.resolve();
+    await second;
+    expect(settings.captureInferenceProfile().aborted).toBe(false);
+    expect(original.aborted).toBe(true);
+    await expect(settings.get("vision")).resolves.toMatchObject({
+      model: vision.model
+    });
+    await expect(settings.get("text")).resolves.toMatchObject({
+      model: vision.model
+    });
+  });
+
+  it("reopens the persisted profile on failed rename without leaking a temporary file", async () => {
+    const settings = createExternalProviderSettings(() => directory);
+    await settings.save("vision", vision);
+    const original = settings.captureInferenceProfile();
+    vi.mocked(rename).mockRejectedValueOnce(
+      new Error("Fixture persistence failure")
+    );
+    await expect(
+      settings.save("vision", { ...vision, model: "not persisted" })
+    ).rejects.toThrow("Could not save external provider settings");
+    expect(original.aborted).toBe(true);
+    expect(settings.captureInferenceProfile().aborted).toBe(false);
+    await expect(settings.getForInference("vision")).resolves.toMatchObject({
+      model: vision.model
+    });
+    await expect(readdir(directory)).resolves.toEqual([
+      "external-providers.json"
+    ]);
+  });
+
   it("stores fal defaults and the Keychain account alongside text and vision settings", async () => {
     const settings = createExternalProviderSettings(() => directory);
     const fal = {
@@ -92,7 +168,12 @@ describe("external provider settings", () => {
         generationSettings: { fal_minimax_h3_image: { resolution: "4K" } }
       })
     ).rejects.toThrow("Invalid fal provider settings");
-    await expect(settings.getFal()).resolves.toEqual(fal);
+    const confirmed = await settings.getFal();
+    expect(confirmed).toEqual({ ...fal, revision: expect.any(String) });
+    await expect(settings.getFal()).resolves.toEqual(confirmed);
+    const replacement = await settings.saveFal(fal);
+    expect(replacement?.revision).not.toBe(confirmed?.revision);
+    await expect(settings.getFal()).resolves.toEqual(replacement);
     const persisted = await readFile(
       path.join(directory, "external-providers.json"),
       "utf8"
@@ -110,13 +191,31 @@ describe("external provider settings", () => {
     });
   });
 
+  it("retires the fal revision when the on-disk defaults are edited directly", async () => {
+    const settings = createExternalProviderSettings(() => directory);
+    const fal = { keychainAccount: "fal" };
+    const before = await settings.saveFal(fal);
+    await writeSettings({
+      fal: {
+        ...fal,
+        generationSettings: { minimax_h3_max: { resolution: "480P" } }
+      }
+    });
+    const after = await settings.getFal();
+    expect(after?.keychainAccount).toBe(before?.keychainAccount);
+    expect(after?.revision).not.toBe(before?.revision);
+  });
+
   it("rejects a plaintext credential without altering the saved configuration", async () => {
     const settings = createExternalProviderSettings(() => directory);
     await settings.save("vision", vision);
+    const profile = settings.captureInferenceProfile();
 
     await expect(
       settings.save("vision", { ...vision, apiKey: "test-secret" })
     ).rejects.toThrow("Invalid external vision provider settings");
+    expect(settings.captureInferenceProfile()).toBe(profile);
+    expect(profile.aborted).toBe(false);
     await expect(settings.get("vision")).resolves.toMatchObject({
       model: vision.model
     });

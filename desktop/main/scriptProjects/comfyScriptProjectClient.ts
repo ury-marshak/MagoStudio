@@ -1,5 +1,6 @@
 /* oxlint-disable eslint/no-magic-numbers -- model graph parameters mirror the tested/official Comfy workflows */
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import type { LocalScriptTextModel } from "../../shared/contracts";
 import { asRecord as record } from "../comfy/asRecord";
@@ -88,9 +89,6 @@ export const LOCAL_H3_PRESETS: Record<
 };
 
 export const LOCAL_SCRIPT_VIDEO_CRF = LOCAL_VIDEO_RENDER_CRF;
-
-const sleep = (milliseconds: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const findString = (value: unknown): string | null => {
   if (typeof value === "string" && value.trim()) return value;
@@ -460,14 +458,22 @@ export const withOpeningFrameGuide = (
   };
 };
 
+/** Persisted submission checkpoint for a Director image or video render. */
+export type ScriptComfySubmission = {
+  promptId?: string;
+  beforeSubmit: () => Promise<void>;
+  onSubmitted: (promptId: string) => Promise<void>;
+};
+
 export class ComfyScriptProjectClient {
-  private readonly endpoint: string;
+  readonly endpoint: string;
   private readonly comfy: ComfyClient;
 
   constructor(
     endpoint: string,
     private readonly scriptTextModel: LocalScriptTextModel = "qwen38-27b-q5",
-    comfy?: ComfyClient
+    comfy?: ComfyClient,
+    private readonly signal?: AbortSignal
   ) {
     this.comfy = comfy ?? new ComfyClient(endpoint);
     this.endpoint = this.comfy.endpoint;
@@ -593,6 +599,7 @@ export class ComfyScriptProjectClient {
     height?: number;
     seed?: number;
     isCancelled?: () => boolean;
+    submission?: ScriptComfySubmission;
   }): Promise<Buffer> {
     const width = clampDimension(input.width, 1024);
     const height = clampDimension(input.height, 1024);
@@ -611,7 +618,11 @@ export class ComfyScriptProjectClient {
         height,
         seed: input.seed ?? Math.floor(Math.random() * 2 ** 32)
       });
-      const outputs = await this.submitAndWait(graph, input.isCancelled);
+      const outputs = await this.submitAndWait(
+        graph,
+        input.isCancelled,
+        input.submission
+      );
       return this.downloadOutput(outputs, "37");
     }
     const graph = {
@@ -679,7 +690,11 @@ export class ComfyScriptProjectClient {
       },
       "11": { class_type: "PreviewImage", inputs: { images: ["10", 0] } }
     };
-    const outputs = await this.submitAndWait(graph, input.isCancelled);
+    const outputs = await this.submitAndWait(
+      graph,
+      input.isCancelled,
+      input.submission
+    );
     return this.downloadOutput(outputs, "11");
   }
 
@@ -692,6 +707,7 @@ export class ComfyScriptProjectClient {
     model?: LocalScriptImageModel;
     seed?: number;
     isCancelled?: () => boolean;
+    submission?: ScriptComfySubmission;
   }): Promise<Buffer> {
     const imageModel = resolveLocalScriptImageModel(input.model);
     const client = new ComfyQwenClient(
@@ -700,18 +716,27 @@ export class ComfyScriptProjectClient {
         ? "flux2-klein-4b-q8"
         : imageModel === "flux2_klein_9b_q8_local"
           ? "flux2-klein-9b-q8"
-          : undefined
+          : undefined,
+      this.comfy
     );
-    const promptId = await client.submit({
-      imagePaths: [input.sourcePath, ...(input.referencePaths ?? [])],
-      ...(input.outputSize ? { outputSize: input.outputSize } : {}),
-      prompt: input.prompt,
-      negativePrompt:
-        "different identity, different face, different body proportions, changed composition, duplicate subject, low resolution, low quality",
-      seed: input.seed
-    });
+    // Qwen submits after uploading its references. Checkpoint before entering
+    // that combined operation; without a prompt ID it must fail closed.
+    const promptId = await this.submitOrResume(
+      input.submission,
+      () =>
+        client.submit({
+          imagePaths: [input.sourcePath, ...(input.referencePaths ?? [])],
+          ...(input.outputSize ? { outputSize: input.outputSize } : {}),
+          prompt: input.prompt,
+          negativePrompt:
+            "different identity, different face, different body proportions, changed composition, duplicate subject, low resolution, low quality",
+          seed: input.seed
+        }),
+      input.isCancelled
+    );
     const deadline = Date.now() + RUN_TIMEOUT_MS;
     while (Date.now() < deadline) {
+      this.signal?.throwIfAborted();
       if (input.isCancelled?.()) {
         await client.cancel(promptId).catch(() => undefined);
         throw new Error("Local image edit was cancelled");
@@ -719,8 +744,9 @@ export class ComfyScriptProjectClient {
       const result = await client.poll(promptId);
       if (result.state === "finished") return result.bytes;
       if (result.state === "error") throw new Error(result.message);
-      await sleep(500);
+      await sleep(500, undefined, { signal: this.signal });
     }
+    this.signal?.throwIfAborted();
     await client.cancel(promptId).catch(() => undefined);
     throw new Error("Qwen Image Edit timed out");
   }
@@ -742,7 +768,15 @@ export class ComfyScriptProjectClient {
     videoModel?: LocalH3Model;
     openingFramePath?: string;
     isCancelled?: () => boolean;
+    submission?: ScriptComfySubmission;
   }): Promise<Buffer> {
+    if (input.submission?.promptId) {
+      const outputs = await this.waitForPrompt(
+        input.submission.promptId,
+        input.isCancelled
+      );
+      return this.downloadOutput(outputs, "17");
+    }
     if (!input.referencePaths.length && !input.referenceVideos?.length)
       throw new Error("MiniMax H3 requires at least one reference");
     const uploaded = await Promise.all(
@@ -806,17 +840,20 @@ export class ComfyScriptProjectClient {
     const submittedGraph = openingFrameImage
       ? withOpeningFrameGuide(graph, openingFrameImage)
       : graph;
-    const outputs = await this.submitAndWait(submittedGraph, input.isCancelled);
+    const outputs = await this.submitAndWait(
+      submittedGraph,
+      input.isCancelled,
+      input.submission
+    );
     return this.downloadOutput(outputs, "17");
   }
 
   private async resolveTextEncoderPath(filename: string): Promise<string> {
-    const [folderResponse, filesResponse] = await Promise.all([
-      this.comfy.request("/experiment/models", { method: "GET" }),
-      this.comfy.request("/models/clip_gguf", { method: "GET" })
+    const [folders, files] = await Promise.all([
+      this.comfy.getPayload("/experiment/models"),
+      this.comfy.getPayload("/models/clip_gguf")
     ]);
-    const folders = (await folderResponse.json()) as unknown;
-    const files = (await filesResponse.json()) as unknown;
+    this.signal?.throwIfAborted();
     if (
       !Array.isArray(files) ||
       !files.some(
@@ -844,16 +881,44 @@ export class ComfyScriptProjectClient {
     return `${folder.replace(/[\\/]$/, "")}${separator}${filename}`;
   }
 
+  private async submitOrResume(
+    submission: ScriptComfySubmission | undefined,
+    submit: () => Promise<string>,
+    isCancelled?: () => boolean
+  ): Promise<string> {
+    this.signal?.throwIfAborted();
+    if (submission?.promptId) return submission.promptId;
+    await submission?.beforeSubmit();
+    this.signal?.throwIfAborted();
+    const promptId = await submit();
+    if (!isCancelled?.()) await submission?.onSubmitted(promptId);
+    this.signal?.throwIfAborted();
+    return promptId;
+  }
+
   private async submitAndWait(
     graph: ComfyGraph,
+    isCancelled?: () => boolean,
+    submission?: ScriptComfySubmission
+  ): Promise<Record<string, unknown>> {
+    const promptId = await this.submitOrResume(
+      submission,
+      () => this.comfy.submitGraph(graph),
+      isCancelled
+    );
+    return this.waitForPrompt(promptId, isCancelled);
+  }
+
+  private async waitForPrompt(
+    promptId: string,
     isCancelled?: () => boolean
   ): Promise<Record<string, unknown>> {
-    const promptId = await this.comfy.submitGraph(graph);
     const outcome = await this.comfy.waitForPrompt(promptId, {
       timeoutMs: RUN_TIMEOUT_MS,
       pollIntervalMs: SCRIPT_POLL_INTERVAL_MS,
       isCancelled
     });
+    this.signal?.throwIfAborted();
     if (outcome.kind === "cancelled") {
       await this.comfy.cancel(promptId).catch(() => undefined);
       throw new Error("Local plan cancelled");

@@ -2,6 +2,7 @@ import path from "node:path";
 
 import { copyModelsToRunningComfy } from "./copyModelsToRunningComfy";
 import type { ModelGroupItem } from "./listModelGroupItems";
+import type { SetupAttempt } from "./setupAttempt";
 
 export const MANUAL_COMFY_MODEL_COPY_MESSAGE =
   "The model files are downloaded to the installation folder by default. Your current ComfyUI server folder cannot be accessed, please copy the files there manually.";
@@ -17,6 +18,7 @@ export const confirmAndCopyInstallerModels = async ({
   signal,
   confirmCopy,
   showCopyError,
+  attempt,
   prepareCopy = copyModelsToRunningComfy
 }: {
   endpoint: string;
@@ -25,13 +27,16 @@ export const confirmAndCopyInstallerModels = async ({
   signal: AbortSignal;
   confirmCopy: (bytes: number) => Promise<boolean>;
   showCopyError: () => Promise<void>;
+  attempt?: SetupAttempt;
   prepareCopy?: typeof copyModelsToRunningComfy;
 }): Promise<void> => {
+  signal.throwIfAborted();
   if (items.length === 0) return;
-  const copy = await prepareCopy(endpoint);
+  const copy = await prepareCopy(endpoint, signal);
   signal.throwIfAborted();
   if (!copy) {
     await showCopyError();
+    signal.throwIfAborted();
     return;
   }
   const normalize = (folder: string) =>
@@ -42,17 +47,20 @@ export const confirmAndCopyInstallerModels = async ({
   const uniqueItems = [
     ...new Map(items.map((item) => [item.absolutePath, item])).values()
   ];
-  if (
-    !(await confirmCopy(
-      uniqueItems.reduce((bytes, item) => bytes + item.bytes, 0)
-    ))
-  )
-    return;
+  const approved = await confirmCopy(
+    uniqueItems.reduce((bytes, item) => bytes + item.bytes, 0)
+  );
   signal.throwIfAborted();
+  if (!approved) return;
   try {
-    for (const item of uniqueItems) await copy(item, signal);
+    for (const item of uniqueItems) {
+      signal.throwIfAborted();
+      if (attempt) await attempt.issue(() => copy(item, signal));
+      else await copy(item, signal);
+    }
   } catch (error) {
-    if (signal.aborted) throw error;
+    signal.throwIfAborted();
     await showCopyError();
+    signal.throwIfAborted();
   }
 };

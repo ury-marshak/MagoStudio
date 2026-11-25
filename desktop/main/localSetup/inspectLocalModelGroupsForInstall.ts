@@ -6,6 +6,7 @@ import {
 } from "../../shared/localModelGroups";
 
 import { inspectLocalModelGroups } from "./inspectLocalModelGroups";
+import type { SetupAttempt } from "./setupAttempt";
 
 export type LocalModelGroupsInstallInspection = Awaited<
   ReturnType<typeof inspectLocalModelGroups>
@@ -16,11 +17,16 @@ export type LocalModelGroupsInstallInspection = Awaited<
 
 export const inspectLocalModelGroupsForInstall = async (
   settings: Parameters<typeof inspectLocalModelGroups>[0],
-  readVideoMemoryBytes: () => Promise<number | null>
+  readVideoMemoryBytes: () => Promise<number | null>,
+  attempt?: SetupAttempt
 ): Promise<LocalModelGroupsInstallInspection> => {
   const savedModelGroupVariants =
     await settings.getSelectedModelGroupVariants();
-  const savedInspection = await inspectLocalModelGroups(settings);
+  const savedInspection = await inspectLocalModelGroups(
+    settings,
+    undefined,
+    attempt
+  );
   const notInstalledHardwareVariantGroups = savedInspection.groups
     .filter((group) => group.state === "not-installed")
     .map((group) => findLocalModelGroup(group.groupId))
@@ -31,7 +37,9 @@ export const inspectLocalModelGroupsForInstall = async (
       selectedModelGroupVariantsForInstall: savedModelGroupVariants,
       hardwareVariantGroupIdsPickedForInstall: []
     };
+  attempt?.signal.throwIfAborted();
   const videoMemoryBytes = await readVideoMemoryBytes();
+  attempt?.signal.throwIfAborted();
   const selectedModelGroupVariantsForInstall: SelectedModelGroupVariants = {
     ...savedModelGroupVariants
   };
@@ -50,7 +58,8 @@ export const inspectLocalModelGroupsForInstall = async (
     ? savedInspection
     : await inspectLocalModelGroups(
         settings,
-        selectedModelGroupVariantsForInstall
+        selectedModelGroupVariantsForInstall,
+        attempt
       );
   return {
     ...inspection,

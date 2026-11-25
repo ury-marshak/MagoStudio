@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 
+import { isLocalApp } from "@/platform/localDesktop";
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
 import { queryKeys } from "@/queryKeys";
 
 import { getImageAsset } from "../api/getImageAsset";
@@ -21,25 +23,28 @@ export const useGetImageAsset = ({
   enabled?: boolean;
 }) => {
   useAssetDownloadPriority(assetId, !!assetId && enabled);
+  const scope = useRendererLibraryQueryScope();
+  const queryKey = scope.key(queryKeys.imageAsset.byId(assetId));
   const { data, isLoading, isFetching, isError, error } = useQuery({
-    queryKey: queryKeys.imageAsset.byId(assetId),
-    queryFn: async () => {
-      if (!assetId) throw new Error("Asset ID is required");
-      return getImageAsset(assetId);
-    },
-    enabled: !!assetId && enabled,
+    queryKey,
+    queryFn: () =>
+      scope.run(async () => {
+        if (!assetId) throw new Error("Asset ID is required");
+        return getImageAsset(assetId, scope.work);
+      }),
+    enabled: scope.active && !!assetId && enabled,
     staleTime: (query) => {
       if (!query.state.data?.urlToUse) {
         return 0;
       }
       return Infinity;
     },
-    gcTime: Infinity,
+    gcTime: isLocalApp ? undefined : Infinity,
     refetchInterval: createUnresolvedAssetRefetchInterval<ImageAssetResponse>({
       pollIntervalMs: REFETCH_INTERVAL_MS,
       getPlayableUrl: (imageAsset) => imageAsset?.urlToUse
     }),
-    retry: (failureCount, error) => {
+    retry: scope.retry(queryKey, (failureCount, error) => {
       if (
         error instanceof AxiosError &&
         error.response?.status &&
@@ -48,7 +53,7 @@ export const useGetImageAsset = ({
         return false;
       }
       return failureCount < MAX_RETRY_COUNT;
-    }
+    })
   });
 
   return { data, isLoading, isFetching, isError, error };

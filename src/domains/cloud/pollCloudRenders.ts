@@ -6,6 +6,7 @@ import {
 
 import { CloudApi } from "./mirrorService";
 import { findQueueItemForAsset, toJobStatus } from "./queueStatus";
+import { rendererCloudBackgroundWork } from "./rendererCloudBackgroundWork";
 import {
   CANCELLED_CLOUD_RENDER_MESSAGE,
   CloudRenderSettlement,
@@ -54,8 +55,9 @@ const createUnfilteredQueueLoader = (api: CloudApi) => {
 
 export const pollCloudRenders = async (
   api: CloudApi,
-  work: RendererLibraryWork = rendererLibrary.capture()
+  origin: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<PollOutcome> => {
+  const work = rendererCloudBackgroundWork(origin);
   await work.ready();
   const jobs = (
     await work.boundary(() => bridge().cloud.renders.listActive())

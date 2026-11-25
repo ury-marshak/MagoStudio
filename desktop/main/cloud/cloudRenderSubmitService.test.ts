@@ -154,6 +154,172 @@ afterEach(async () => {
   );
 });
 
+test.each(["register", "registerImage"] as const)(
+  "%s cannot begin a transaction after its account retires during the root read",
+  async (method) => {
+    const { manager, directory } = await openLibrary();
+    const account = new AbortController();
+    const transaction = vi.spyOn(manager, "transaction");
+    const service = new CloudRenderSubmitService(manager, async () => {
+      account.abort(new Error("fixture account retired"));
+      return directory;
+    });
+
+    const pending =
+      method === "register"
+        ? service.register(registration, account.signal)
+        : service.registerImage(imageRegistration, account.signal);
+    await expect(pending).rejects.toThrow("fixture account retired");
+    expect(transaction).not.toHaveBeenCalled();
+    expect(await manager.get().select().from(cloudRenderJobs)).toEqual([]);
+  }
+);
+
+// Retire after SQLite executes the query but before the service receives it.
+const afterQuery = <T extends object>(
+  database: T,
+  method: keyof T,
+  after: () => void
+): T => {
+  const wrap = (query: object): object =>
+    new Proxy(query, {
+      get(target, key) {
+        const value: unknown = Reflect.get(target, key, target);
+        if (typeof value !== "function") return value;
+        if (key === "then") {
+          return (...args: unknown[]) => {
+            const pending = Promise.resolve(
+              target as PromiseLike<unknown>
+            ).then((result) => {
+              after();
+              return result;
+            });
+            return Reflect.apply(pending.then, pending, args);
+          };
+        }
+        return (...args: unknown[]) =>
+          wrap(Reflect.apply(value, target, args) as object);
+      }
+    });
+  return new Proxy(database, {
+    get(target, key, receiver) {
+      const value: unknown = Reflect.get(target, key, receiver);
+      if (key !== method || typeof value !== "function") return value;
+      return (...args: unknown[]) =>
+        wrap(Reflect.apply(value, target, args) as object);
+    }
+  });
+};
+
+test.each(["register", "registerImage"] as const)(
+  "%s cannot mutate after a database read retires its account",
+  async (method) => {
+    const { service, manager } = await openLibrary();
+    const account = new AbortController();
+    const db = manager.get();
+    const retireAfterSecondRead = vi.fn(() => {
+      if (retireAfterSecondRead.mock.calls.length === 2)
+        account.abort(new Error("fixture account retired"));
+    });
+    const transaction = manager.transaction.bind(manager);
+    const begin = vi.spyOn(manager, "transaction");
+    if (method === "register") {
+      vi.spyOn(manager, "get").mockReturnValue(
+        afterQuery(db, "select", retireAfterSecondRead)
+      );
+    } else {
+      begin.mockImplementation((operation) =>
+        transaction((database) =>
+          operation(afterQuery(database, "select", retireAfterSecondRead))
+        )
+      );
+    }
+
+    const pending =
+      method === "register"
+        ? service.register(registration, account.signal)
+        : service.registerImage(imageRegistration, account.signal);
+    await expect(pending).rejects.toThrow("fixture account retired");
+    if (method === "register") expect(begin).not.toHaveBeenCalled();
+    expect(await db.select().from(cloudRenderJobs)).toEqual([]);
+    expect(await db.select().from(tracks)).toMatchObject([
+      { id: "output-track" }
+    ]);
+  }
+);
+
+test.each(["register", "registerImage"] as const)(
+  "%s finishes already-issued bookkeeping without losing accepted IDs",
+  async (method) => {
+    const { service, manager } = await openLibrary();
+    const account = new AbortController();
+    const transaction = manager.transaction.bind(manager);
+    vi.spyOn(manager, "transaction").mockImplementation((operation) =>
+      transaction((database) =>
+        operation(
+          afterQuery(database, "insert", () => {
+            account.abort(new Error("fixture account retired"));
+          })
+        )
+      )
+    );
+    const video = { ...registration, cloudClipId: "accepted-clip" };
+    const input = method === "register" ? video : imageRegistration;
+    const pending =
+      method === "register"
+        ? service.register(video, account.signal)
+        : service.registerImage(imageRegistration, account.signal);
+    await expect(pending).rejects.toThrow("fixture account retired");
+    const db = manager.get();
+    expect(await db.select().from(cloudRenderJobs)).toMatchObject([
+      {
+        status: "PENDING",
+        cloudAssetId: input.cloudAssetId,
+        cloudClipId: input.cloudClipId
+      }
+    ]);
+    expect(await db.select().from(clips)).toHaveLength(1);
+    expect(await db.select().from(projectAssets)).toHaveLength(1);
+  }
+);
+
+test("video completion does not update the accepted job after retirement during the probe", async () => {
+  const { service, manager, directory } = await openLibrary();
+  const registered = await service.register({
+    ...registration,
+    cloudClipId: "accepted-clip"
+  });
+  const account = new AbortController();
+  let probeSignal: AbortSignal | undefined;
+  const completion = new CloudRenderSubmitService(
+    manager,
+    async () => directory,
+    undefined,
+    async (_file, signal) => {
+      probeSignal = signal;
+      account.abort(new Error("fixture account retired"));
+      return null;
+    }
+  );
+
+  await expect(
+    completion.complete(
+      { jobId: registered.jobId, relativePath: "fixture.mp4", sizeBytes: 1 },
+      undefined,
+      account.signal
+    )
+  ).rejects.toThrow("fixture account retired");
+  expect(probeSignal?.aborted).toBe(true);
+  expect(await manager.get().select().from(cloudRenderJobs)).toMatchObject([
+    {
+      id: registered.jobId,
+      status: "PENDING",
+      cloudAssetId: registration.cloudAssetId,
+      cloudClipId: "accepted-clip"
+    }
+  ]);
+});
+
 describe("CloudRenderSubmitService.register", () => {
   test("creates the local rows so the editor shows the job at once", async () => {
     const { service, manager } = await openLibrary();

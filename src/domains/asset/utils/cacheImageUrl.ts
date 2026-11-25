@@ -1,5 +1,9 @@
-import { rendererLibrary } from "@/platform/rendererLibraryWork";
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 import { readableDesktopStorageUrl } from "@/platform/rendererMediaAccess";
+import { createRendererObjectUrl } from "@/platform/rendererObjectUrl";
 
 import { cacheGet } from "./cacheStorage";
 import { downloadImageBlob } from "./downloadImageBlob";
@@ -15,9 +19,9 @@ const isFetchableAssetUrl = (url: string): boolean =>
  * behind it, and storing that blank would outlive the render. */
 export const cacheImageUrl = async (
   url: string,
-  cacheKey: string
+  cacheKey: string,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<{ urlToUse: string; isCached: boolean }> => {
-  const work = rendererLibrary.capture();
   work.check();
   if (!isFetchableAssetUrl(url)) {
     return { urlToUse: readableDesktopStorageUrl(url), isCached: false };
@@ -27,7 +31,10 @@ export const cacheImageUrl = async (
     const cachedBlob = await cacheGet("image", cacheKey, work);
     work.check();
     if (cachedBlob?.size) {
-      return { urlToUse: URL.createObjectURL(cachedBlob), isCached: true };
+      return {
+        urlToUse: createRendererObjectUrl(cachedBlob, work),
+        isCached: true
+      };
     }
 
     const blob = await downloadImageBlob(url, cacheKey, work);
@@ -36,7 +43,7 @@ export const cacheImageUrl = async (
       return { urlToUse: readableDesktopStorageUrl(url), isCached: false };
     }
 
-    return { urlToUse: URL.createObjectURL(blob), isCached: true };
+    return { urlToUse: createRendererObjectUrl(blob, work), isCached: true };
   } catch (error) {
     work.check();
     console.warn("Error downloading/caching image, using direct URL:", error);

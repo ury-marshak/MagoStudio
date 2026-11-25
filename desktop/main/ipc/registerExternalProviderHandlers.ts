@@ -1,4 +1,4 @@
-import { ipcMain } from "electron";
+import { ipcMain, type WebContents } from "electron";
 
 import {
   IPC_CHANNELS,
@@ -9,6 +9,7 @@ import {
   readExternalProviderKey
 } from "../providers/externalProviderSettings";
 import { probeOpenAiCompatible } from "../providers/openAiCompatible";
+import { waitForInference } from "../providers/sharedInference";
 
 import { requireTrustedSender } from "./trustedSender";
 
@@ -18,7 +19,10 @@ const capabilityFrom = (value: unknown): ExternalModelCapability => {
 };
 
 export const registerExternalProviderHandlers = (
-  settings: ReturnType<typeof createExternalProviderSettings>
+  settings: ReturnType<typeof createExternalProviderSettings>,
+  {
+    captureAccountProfile
+  }: { captureAccountProfile?: (sender: WebContents) => AbortSignal } = {}
 ): void => {
   ipcMain.handle(IPC_CHANNELS.externalProvidersGet, (event, capability) => {
     requireTrustedSender(event);
@@ -28,27 +32,42 @@ export const registerExternalProviderHandlers = (
   });
   ipcMain.handle(
     IPC_CHANNELS.externalProvidersSave,
-    (event, capability, config) => {
+    async (event, capability, config) => {
       requireTrustedSender(event);
-      return capability === "fal"
-        ? settings.saveFal(config)
-        : settings.save(capabilityFrom(capability), config);
+      const origin = captureAccountProfile?.(event.sender);
+      const result = await (capability === "fal"
+        ? settings.saveFal(config, origin)
+        : settings.save(capabilityFrom(capability), config, origin));
+      origin?.throwIfAborted();
+      return result;
     }
   );
   ipcMain.handle(IPC_CHANNELS.externalProvidersCheck, async (event, value) => {
     requireTrustedSender(event);
-    if (value === "fal") {
-      const config = await settings.getFal();
+    const account = captureAccountProfile?.(event.sender);
+    const capability = value === "fal" ? null : capabilityFrom(value);
+    const profile = settings.captureInferenceProfile();
+    const signal = account ? AbortSignal.any([account, profile]) : profile;
+    signal.throwIfAborted();
+    const task = Promise.resolve().then(async () => {
+      signal.throwIfAborted();
+      if (!capability) {
+        const config = await settings.getFal();
+        signal.throwIfAborted();
+        if (!config)
+          throw new Error("Save the fal Keychain account before checking it");
+        await readExternalProviderKey(config.keychainAccount, signal);
+        return;
+      }
+      const config = await settings.get(capability);
+      signal.throwIfAborted();
       if (!config)
-        throw new Error("Save the fal Keychain account before checking it");
-      await readExternalProviderKey(config.keychainAccount);
-      return;
-    }
-    const capability = capabilityFrom(value);
-    const config = await settings.get(capability);
-    if (!config)
-      throw new Error("Save an external provider before checking it");
-    const key = await readExternalProviderKey(config.keychainAccount);
-    await probeOpenAiCompatible(config, key, capability);
+        throw new Error("Save an external provider before checking it");
+      const key = await readExternalProviderKey(config.keychainAccount, signal);
+      signal.throwIfAborted();
+      await probeOpenAiCompatible(config, key, capability, signal);
+    });
+    await waitForInference(task, signal);
+    signal.throwIfAborted();
   });
 };

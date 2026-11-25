@@ -60,7 +60,7 @@ describe("getProjectState (desktop)", () => {
       getProjectCut("script-1", { preferCache: false })
     ).resolves.toMatchObject({ export: { url: cut.export.url } });
     expect(put).toHaveBeenCalledWith(
-      expect.objectContaining({ metadataOnly: true })
+      expect.objectContaining({ intent: "cloud-import", metadataOnly: true })
     );
     expect(cacheMedia).not.toHaveBeenCalled();
   });
@@ -99,7 +99,9 @@ describe("getProjectState (desktop)", () => {
     await expect(
       getProjectState("script-1", { preferCache: false })
     ).resolves.toMatchObject({ project_id: "script-1" });
-    expect(get).toHaveBeenCalledWith("/projects/script-1/state");
+    expect(get).toHaveBeenCalledWith("/projects/script-1/state", {
+      signal: expect.anything()
+    });
   });
 
   it("keeps every local snapshot section authoritative during a forced refetch", async () => {

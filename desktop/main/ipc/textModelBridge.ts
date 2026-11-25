@@ -24,10 +24,19 @@ export class TextModelBridge {
     }
   >();
 
+  constructor(
+    private readonly captureProfile?: (sender: WebContents) => AbortSignal
+  ) {}
+
   register(): void {
     ipcMain.on(IPC_CHANNELS.textModelReady, (event) => {
       requireTrustedSender(event);
-      this.renderer = event.sender;
+      try {
+        this.captureProfile?.(event.sender);
+        this.renderer = event.sender;
+      } catch {
+        // A retired account renderer cannot reclaim the bridge.
+      }
     });
     ipcMain.on(
       IPC_CHANNELS.textModelResponse,
@@ -40,7 +49,8 @@ export class TextModelBridge {
     );
   }
 
-  run: RunCloudTextModel = (operation, body, isCancelled) => {
+  run: RunCloudTextModel = (operation, body, isCancelled, caller) => {
+    if (caller?.aborted) return Promise.reject(caller.reason);
     if (isCancelled?.())
       return Promise.reject(new Error("Text model request cancelled"));
     const renderer = this.renderer;
@@ -50,6 +60,18 @@ export class TextModelBridge {
           "Text model connection is unavailable; reopen the app and retry"
         )
       );
+    let profile: AbortSignal | undefined;
+    try {
+      const window = this.captureProfile?.(renderer);
+      profile =
+        caller && window
+          ? AbortSignal.any([caller, window])
+          : (caller ?? window);
+    } catch {
+      return Promise.reject(
+        new DOMException("The text profile changed", "AbortError")
+      );
+    }
     const id = randomUUID();
     return new Promise((resolve, reject) => {
       const finish = (response: TextModelResponse) => {
@@ -57,6 +79,11 @@ export class TextModelBridge {
         clearInterval(cancellation);
         this.pending.delete(id);
         renderer.removeListener("destroyed", destroyed);
+        profile?.removeEventListener("abort", retire);
+        if (profile?.aborted) {
+          reject(profile.reason);
+          return;
+        }
         if (response.error) reject(new Error(response.error));
         else if (
           response.result === null ||
@@ -68,10 +95,14 @@ export class TextModelBridge {
         else reject(new Error("Invalid text model response"));
       };
       const stop = (error: string) => {
-        if (!renderer.isDestroyed())
-          renderer.send(IPC_CHANNELS.textModelCancel, id);
-        finish({ id, error });
+        try {
+          if (!renderer.isDestroyed())
+            renderer.send(IPC_CHANNELS.textModelCancel, id);
+        } finally {
+          finish({ id, error });
+        }
       };
+      const retire = () => stop("The text profile changed");
       const destroyed = () =>
         stop("Text model connection closed before the reply finished");
       const timeout = setTimeout(
@@ -83,7 +114,13 @@ export class TextModelBridge {
       }, CANCELLATION_INTERVAL_MS);
       this.pending.set(id, { sender: renderer, finish });
       renderer.once("destroyed", destroyed);
-      renderer.send(IPC_CHANNELS.textModelRequest, { id, operation, body });
+      profile?.addEventListener("abort", retire, { once: true });
+      try {
+        profile?.throwIfAborted();
+        renderer.send(IPC_CHANNELS.textModelRequest, { id, operation, body });
+      } catch {
+        finish({ id, error: "Text model connection closed before dispatch" });
+      }
     });
   };
 }

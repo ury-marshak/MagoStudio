@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { ProjectRepository } from "../database/projectRepository";
+import { ProfileLifetime } from "../providers/profileLifetime";
 import { extractMetricsFrameGrid } from "../scriptProjects/localScriptMedia";
 
 import { extractVideoCaptionFrames } from "./videoFrames";
@@ -231,5 +232,63 @@ describe("VlmService", () => {
     ).rejects.toThrow();
     expect(generate).toHaveBeenCalledTimes(1);
     expect(generate.mock.calls[0]![0].signal?.aborted).toBe(true);
+  });
+  it("releases the replacement queue and does not repair or write an old caption", async () => {
+    vi.mocked(extractVideoCaptionFrames).mockResolvedValue({
+      firstFrame: Buffer.from("frame"),
+      grids: []
+    });
+    const repository = {
+      getAsset: vi.fn(async () => ({
+        type: "VIDEO",
+        data: { total_frames: 24 }
+      })),
+      assetSourcePath: vi.fn(async () => "video.mp4"),
+      setAssetPrompt: vi.fn()
+    };
+    let finish!: (value: { text: string; model: string }) => void;
+    const generate = vi
+      .fn<VisionGenerator>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          })
+      )
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          positive: {
+            content: "replacement",
+            setting: "studio",
+            style: "film",
+            references: ""
+          },
+          negative: ""
+        }),
+        model: "B"
+      });
+    const profiles = new ProfileLifetime();
+    const service = new VlmService(
+      repository as unknown as ProjectRepository,
+      generate,
+      vi.fn(),
+      generate,
+      () => profiles.capture()
+    );
+    const library = service.libraryWork.capture();
+    const old = expect(service.captionAsset("video")).rejects.toMatchObject({
+      name: "AbortError"
+    });
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    profiles.rotate();
+    await old;
+    expect(service.libraryWork.capture()).toBe(library);
+    await expect(service.captionAsset("video")).resolves.toMatchObject({
+      prompt: { positive: { content: "replacement" } }
+    });
+    finish({ text: "malformed old output", model: "A" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(repository.setAssetPrompt).toHaveBeenCalledOnce();
   });
 });

@@ -115,6 +115,27 @@ describe("findSequentialBlockedLabelKey", () => {
     expect(findSequentialBlockedLabelKey(dryRun, shot)).toBeNull();
   });
 
+  it.each([
+    [
+      "fal_opening_frame_aspect_mismatch",
+      "shot_blocked_fal_opening_frame_aspect"
+    ],
+    [
+      "fal_opening_frame_numbered_reference",
+      "shot_blocked_fal_opening_frame_number"
+    ]
+  ] as const)(
+    "shows an actionable opening-frame refusal for %s",
+    (reason_code, label) => {
+      const dryRun = buildDryRun([
+        { sequence_id: 1, timeline_id: "t1", missing: [], reason_code }
+      ]);
+      expect(findSequentialBlockedLabelKey(dryRun, shot)).toBe(
+        "script_project." + label + ".label"
+      );
+    }
+  );
+
   it("keeps the fal previous-video-input label", () => {
     const dryRun = buildDryRun([
       {

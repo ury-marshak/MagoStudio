@@ -5,6 +5,8 @@ import { useMountEffect } from "@hooks/useMountEffect";
 import { useUser } from "@platform/identity";
 import { useEffect } from "react";
 
+import { captureRendererCloudAccountScope } from "@/platform/rendererCloudAccountScope";
+
 import { enrichUnsafeMetadata } from "./utils/enrichUnsafeMetadata";
 
 const REFERRAL_ID_STORAGE_KEY = "referral_id_pending";
@@ -13,16 +15,29 @@ export function ReferralTracking(): null {
   const { user, isLoaded } = useUser();
 
   useMountEffect(() => {
+    const account = captureRendererCloudAccountScope();
+    if (!account.isActive()) return;
+    let disposed = false;
     window.rewardful?.("ready", function () {
+      if (disposed || !account.isActive()) return;
       const referral = window.Rewardful?.referral;
       if (referral) {
         localStorage.setItem(REFERRAL_ID_STORAGE_KEY, referral);
       }
     });
+    return () => {
+      disposed = true;
+    };
   });
 
   useEffect(() => {
-    if (typeof window === "undefined" || !isLoaded || !user) {
+    const account = captureRendererCloudAccountScope();
+    if (
+      !account.isActive() ||
+      typeof window === "undefined" ||
+      !isLoaded ||
+      !user
+    ) {
       return;
     }
 
@@ -43,9 +58,11 @@ export function ReferralTracking(): null {
 
     enrichUnsafeMetadata(user, { referral_id: pendingReferralId })
       .then(() => {
+        if (!account.isActive()) return;
         localStorage.removeItem(REFERRAL_ID_STORAGE_KEY);
       })
       .catch((error) => {
+        if (!account.isActive()) return;
         console.error("Failed to update referral_id in unsafeMetadata:", error);
       });
   }, [isLoaded, user]);

@@ -4,6 +4,7 @@ import { mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { and, asc, desc, eq, gte, inArray, sql, type SQL } from "drizzle-orm";
+import { nativeImage } from "electron";
 
 import type {
   LocalAsset,
@@ -79,6 +80,8 @@ const parseAssetData = (
     ? { ...data, error: { message: data.error } }
     : data;
 };
+
+const maxPreparedImageDataUrlLength = 28_000_000;
 
 const mediaUrl = (assetId: string): string => `mago-media://asset/${assetId}`;
 const thumbnailUrl = (assetId: string): string =>
@@ -522,34 +525,60 @@ export class ProjectRepository {
   }
 
   async importImage(input: LocalImageImport): Promise<LocalAsset> {
-    const sourceStats = await stat(input.sourcePath);
-    if (!sourceStats.isFile()) throw new Error("Image source is not a file");
+    const prepared = input.dataUrl !== undefined;
+    const sourceStats =
+      input.sourcePath === undefined ? null : await stat(input.sourcePath);
+    if (sourceStats && !sourceStats.isFile())
+      throw new Error("Image source is not a file");
+    if (
+      prepared &&
+      (input.dataUrl.length > maxPreparedImageDataUrlLength ||
+        (input.thumbnailDataUrl?.length ?? 0) > maxPreparedImageDataUrlLength)
+    )
+      throw new Error("Prepared image is too large");
+    const bytes = prepared ? this.decodeThumbnail(input.dataUrl) : null;
+    const dimensions = bytes
+      ? nativeImage.createFromBuffer(bytes.bytes).getSize()
+      : { width: input.width, height: input.height };
+    if (dimensions.width <= 0 || dimensions.height <= 0)
+      throw new Error("Could not decode the prepared image");
     const libraryRoot = await this.getLibraryRoot();
     if (!libraryRoot) throw new Error("Choose a Mago library folder first");
     const assetId = randomUUID();
-    const thumbnail = this.decodeThumbnail(input.thumbnailDataUrl);
+    const thumbnail =
+      input.thumbnailDataUrl === undefined && bytes
+        ? bytes
+        : this.decodeThumbnail(input.thumbnailDataUrl ?? "");
+    const relativeSourcePath = bytes
+      ? path.join("assets", "prepared", `${assetId}.${bytes.extension}`)
+      : null;
+    const sourcePath = relativeSourcePath
+      ? path.join(libraryRoot, relativeSourcePath)
+      : path.resolve(input.sourcePath ?? "");
     const thumbnailRelativePath = path.join(
       "thumbnails",
       "assets",
       `${assetId}.${thumbnail.extension}`
     );
-    await atomicWriteFile(
-      path.join(libraryRoot, thumbnailRelativePath),
-      thumbnail.bytes
-    );
+    const thumbnailPath = path.join(libraryRoot, thumbnailRelativePath);
     const now = new Date();
     try {
+      if (bytes) {
+        await mkdir(path.dirname(sourcePath), { recursive: true });
+        await atomicWriteFile(sourcePath, bytes.bytes);
+      }
+      await atomicWriteFile(thumbnailPath, thumbnail.bytes);
       await this.manager.transaction(async (database) => {
         await database.insert(assets).values({
           id: assetId,
           name: input.name,
           type: "image",
           origin: "uploaded",
-          sourcePath: path.resolve(input.sourcePath),
-          sizeBytes: sourceStats.size,
-          modifiedAtImport: sourceStats.mtime,
-          width: input.width,
-          height: input.height,
+          sourcePath,
+          relativeSourcePath,
+          sizeBytes: sourceStats?.size ?? bytes!.bytes.length,
+          modifiedAtImport: sourceStats?.mtime ?? null,
+          ...dimensions,
           thumbnailRelativePath,
           dataJson: JSON.stringify({
             status: "ingested",
@@ -563,7 +592,10 @@ export class ProjectRepository {
           .values({ projectId: input.projectId, assetId, createdAt: now });
       });
     } catch (error) {
-      await rm(path.join(libraryRoot, thumbnailRelativePath), { force: true });
+      await Promise.allSettled([
+        rm(thumbnailPath, { force: true }),
+        ...(bytes ? [rm(sourcePath, { force: true })] : [])
+      ]);
       throw error;
     }
     const asset = await this.getAsset(assetId);

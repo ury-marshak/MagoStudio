@@ -1,10 +1,13 @@
 import { IMAGE_SEQUENCE_EXPORT } from "@models/video/types";
 import { AssetStatus } from "@schemas/asset";
 import { Layer } from "@schemas/layer";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 import {
   areFramesDownloadable,
+  downloadFile,
   areVideoAndFramesDownloadable,
   isEXRDownloadable
 } from "./utils";
@@ -47,6 +50,9 @@ const setAccountMode = (mode: "cloud" | "offline") => {
 };
 
 afterEach(() => {
+  rendererLibrary.reset();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   Reflect.deleteProperty(window, "mago");
 });
 
@@ -94,5 +100,22 @@ describe("frame and EXR downloads in Mago Studio", () => {
         })
       )
     ).toBe(false);
+  });
+
+  it("does not click an HTML download link when a fetch fails after the library changes", async () => {
+    setAccountMode("offline");
+    const response = Promise.withResolvers<Response>();
+    const fetchMedia = vi.fn().mockReturnValue(response.promise);
+    vi.stubGlobal("fetch", fetchMedia);
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    const download = downloadFile("mago-media://asset/reused-id", "render.mp4");
+    await vi.waitFor(() => expect(fetchMedia).toHaveBeenCalledOnce());
+    await rendererLibrary.suspend();
+    rendererLibrary.reset();
+    response.reject(new Error("old media request failed"));
+    await download;
+    expect(click).not.toHaveBeenCalled();
   });
 });

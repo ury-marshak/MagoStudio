@@ -1,6 +1,7 @@
 "use client";
 
 import { Icon } from "@components/Icon";
+import { VideoEffectsHistoryButton } from "@components/VideoEffects/VideoEffectsHistoryButton";
 import { ROUTES } from "@config/constants";
 import { useSelectedProjectId } from "@domains/project/useSelectedProjectId";
 import { useAddVideo } from "@hooks/useAddVideo";
@@ -33,7 +34,7 @@ export const NavbarProjectActions: React.FC<Props> = ({
   return (
     <div
       className={cn(
-        "flex items-center shrink-0 h-full px-3",
+        "flex items-center shrink-0 h-full gap-2 px-3",
         showBorder &&
           "-mr-px border-l border-r border-b border-glyph-invert-main"
       )}
@@ -46,6 +47,7 @@ export const NavbarProjectActions: React.FC<Props> = ({
       >
         <Icon iconSet="16" iconName="upload" className="h-4 w-4" />
       </AriaButton>
+      <VideoEffectsHistoryButton projectId={selectedProjectId} />
     </div>
   );
 };

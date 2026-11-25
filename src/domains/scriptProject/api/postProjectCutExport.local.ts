@@ -6,6 +6,11 @@ import { isAxiosError } from "axios";
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import {
+  rendererLibrary,
+  runRendererLibraryRequest,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 
 import { isLocalScriptProject } from "../projectOrigin";
 
@@ -17,20 +22,33 @@ export type ExportProjectCutRequest = {
 const CONFLICT_STATUS = 409;
 
 export const postProjectCutExport = async (
-  request: ExportProjectCutRequest
+  request: ExportProjectCutRequest,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<CutExportDispatch> => {
-  if (await isLocalScriptProject(request.projectId)) {
-    return CutExportDispatchSchema.parse(
-      await getLocalDesktopApi().scriptProjects.exportCut(request)
+  const isLocal = await work.boundary(() =>
+    isLocalScriptProject(request.projectId)
+  );
+  if (isLocal) {
+    // The IPC resolves when submission bookkeeping is done, not when the
+    // main-owned export finishes. Only drain the former here.
+    const dispatch = await work.boundary(() =>
+      getLocalDesktopApi().scriptProjects.exportCut(request)
     );
+    work.check();
+    return CutExportDispatchSchema.parse(dispatch);
   }
   try {
-    const response = await backendApiClient.post(
-      `/projects/${request.projectId}/cut/export`,
-      { dry_run: request.isDryRun }
+    const response = await runRendererLibraryRequest(work, (signal) =>
+      backendApiClient.post(
+        `/projects/${request.projectId}/cut/export`,
+        { dry_run: request.isDryRun },
+        { signal }
+      )
     );
+    work.check();
     return CutExportDispatchSchema.parse(response.data);
   } catch (error) {
+    work.check();
     if (isAxiosError(error) && error.response?.status === CONFLICT_STATUS) {
       return CutExportDispatchSchema.parse(error.response.data);
     }

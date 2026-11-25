@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -11,6 +11,7 @@ import type {
   ExternalModelCapability,
   ExternalModelConfig,
   FalProviderConfig,
+  FalProviderMetadata,
   MagoAppMode
 } from "../../shared/contracts";
 import { falGenerationDefaultsSchema } from "../../shared/falGenerationSettings";
@@ -18,6 +19,7 @@ import { FAL_SHEET_MODELS } from "../../shared/falSheetModel";
 import { FAL_SHOT_PROVIDER } from "../../shared/falShotModel";
 
 import { InferenceUnavailableError } from "./inferenceUnavailableError";
+import { ProfileLifetime } from "./profileLifetime";
 
 export type {
   ExternalModelCapability,
@@ -112,9 +114,42 @@ const readSettings = async (file: string): Promise<Record<string, unknown>> => {
 
 type ProviderEntry = ExternalModelCapability | "fal";
 
-export const createExternalProviderSettings = (userData: () => string) => {
+type SerializeWrite = <T>(operation: () => Promise<T>) => Promise<T>;
+
+export const createExternalProviderSettings = (
+  userData: () => string,
+  {
+    serializeWrite,
+    drainRetiredInference
+  }: {
+    serializeWrite?: SerializeWrite;
+    drainRetiredInference?: () => Promise<void>;
+  } = {}
+) => {
   const settingsPath = () => path.join(userData(), "external-providers.json");
   let pendingWrite: Promise<unknown> = Promise.resolve();
+  const enqueue: SerializeWrite =
+    serializeWrite ??
+    ((operation) => {
+      const write = pendingWrite.then(operation);
+      pendingWrite = write.catch(() => {});
+      return write;
+    });
+  const inferenceProfile = new ProfileLifetime();
+  let queuedWrites = 0;
+  let falSaveEpoch = randomUUID();
+  // A same-value save retires consent; a direct edit of the metadata file does
+  // too when it changes the effective configuration. Neither requires Keychain.
+  const falMetadata = (
+    config: FalProviderConfig | null,
+    saveEpoch: string
+  ): FalProviderMetadata | null =>
+    config && {
+      ...config,
+      revision: createHash("sha256")
+        .update(JSON.stringify([saveEpoch, config]))
+        .digest("hex")
+    };
 
   const get = async <Config>(
     entry: ProviderEntry,
@@ -124,37 +159,54 @@ export const createExternalProviderSettings = (userData: () => string) => {
     return Object.hasOwn(settings, entry) ? parse(settings[entry]) : null;
   };
 
-  const save = <Config>(
+  const save = async <Config>(
     entry: ProviderEntry,
     value: unknown,
-    parse: (value: unknown) => Config
+    parse: (value: unknown) => Config,
+    origin?: AbortSignal,
+    onPersisted?: () => void
   ): Promise<Config | null> => {
-    const write = pendingWrite.then(async () => {
-      const config = value === null ? null : parse(value);
-      const file = settingsPath();
-      const settings = await readSettings(file);
-      if (config === null) delete settings[entry];
-      else settings[entry] = config;
-      const temporary = `${file}.${randomUUID()}.tmp`;
-      try {
-        await mkdir(path.dirname(file), { recursive: true });
-        await writeFile(temporary, JSON.stringify(settings, null, 2) + "\n", {
-          flag: "wx",
-          mode: 0o600
-        });
-        await rename(temporary, file);
-      } catch {
-        throw new Error("Could not save external provider settings");
-      } finally {
-        await rm(temporary, { force: true }).catch(() => {});
-      }
-      return config;
-    });
-    pendingWrite = write.catch(() => {});
-    return write;
+    origin?.throwIfAborted();
+    const config = value === null ? null : parse(value);
+    // Mutating any entry can change whether legacy text/vision is permitted.
+    // Close admission synchronously and keep it closed across queued saves.
+    queuedWrites += 1;
+    inferenceProfile.suspend();
+    try {
+      return await enqueue(async () => {
+        await drainRetiredInference?.();
+        origin?.throwIfAborted();
+        const file = settingsPath();
+        const settings = await readSettings(file);
+        origin?.throwIfAborted();
+        if (config === null) delete settings[entry];
+        else settings[entry] = config;
+        const temporary = `${file}.${randomUUID()}.tmp`;
+        try {
+          await mkdir(path.dirname(file), { recursive: true });
+          await writeFile(temporary, JSON.stringify(settings, null, 2) + "\n", {
+            flag: "wx",
+            mode: 0o600
+          });
+          origin?.throwIfAborted();
+          await rename(temporary, file);
+          onPersisted?.();
+        } catch {
+          origin?.throwIfAborted();
+          throw new Error("Could not save external provider settings");
+        } finally {
+          await rm(temporary, { force: true }).catch(() => {});
+        }
+        return config;
+      });
+    } finally {
+      queuedWrites -= 1;
+      if (queuedWrites === 0) inferenceProfile.resume();
+    }
   };
 
   return {
+    captureInferenceProfile: () => inferenceProfile.capture(),
     get: (capability: ExternalModelCapability) =>
       get(capability, (value) => parseConfig(capability, value)),
     /** A partial external profile is not permission to use legacy inference.
@@ -170,16 +222,38 @@ export const createExternalProviderSettings = (userData: () => string) => {
         );
       return null;
     },
-    assertLegacyInferenceAvailable: async () => {
-      if (Object.keys(await readSettings(settingsPath())).length > 0)
-        throw new InferenceUnavailableError(
-          "Local inference, supporting effects and model setup are unavailable while external providers are configured. No external adapter is integrated for this operation."
-        );
-    },
-    save: (capability: ExternalModelCapability, value: unknown) =>
-      save(capability, value, (entry) => parseConfig(capability, entry)),
-    getFal: () => get("fal", parseFalConfig),
-    saveFal: (value: unknown) => save("fal", value, parseFalConfig)
+    assertLegacyInferenceAvailable: () =>
+      inferenceProfile.run(async (signal) => {
+        const settings = await readSettings(settingsPath());
+        signal.throwIfAborted();
+        if (Object.keys(settings).length > 0)
+          throw new InferenceUnavailableError(
+            "Local inference, supporting effects and model setup are unavailable while external providers are configured. No external adapter is integrated for this operation."
+          );
+      }),
+    save: (
+      capability: ExternalModelCapability,
+      value: unknown,
+      origin?: AbortSignal
+    ) =>
+      save(
+        capability,
+        value,
+        (entry) => parseConfig(capability, entry),
+        origin
+      ),
+    getFal: () =>
+      inferenceProfile.run(async () => {
+        const config = await get("fal", parseFalConfig);
+        return falMetadata(config, falSaveEpoch);
+      }),
+    saveFal: async (value: unknown, origin?: AbortSignal) => {
+      const saveEpoch = randomUUID();
+      const config = await save("fal", value, parseFalConfig, origin, () => {
+        falSaveEpoch = saveEpoch;
+      });
+      return falMetadata(config, saveEpoch);
+    }
   };
 };
 
@@ -203,8 +277,10 @@ export const resolveProviderStartupMode = async (
 };
 
 export const readExternalProviderKey = async (
-  account: string
+  account: string,
+  signal?: AbortSignal
 ): Promise<string> => {
+  signal?.throwIfAborted();
   if (process.platform !== "darwin")
     throw new Error(
       "External provider credentials currently require macOS Keychain"
@@ -214,14 +290,16 @@ export const readExternalProviderKey = async (
     const { stdout } = await run(
       "/usr/bin/security",
       ["find-generic-password", "-s", keychainService, "-a", account, "-w"],
-      { encoding: "utf8", timeout: 30_000 }
+      { encoding: "utf8", timeout: 30_000, signal }
     );
     password = stdout.trim();
   } catch {
+    signal?.throwIfAborted();
     throw new Error(
       "Could not read the external provider credential from macOS Keychain"
     );
   }
+  signal?.throwIfAborted();
   if (!/^[!-~]+$/.test(password))
     throw new Error("The external provider credential is empty or invalid");
   return password;

@@ -5,13 +5,16 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 
 import { backendApiClient } from "@/lib/backend-api-client";
+import { isCloudAccountActive } from "@/platform/cloudAccount";
 import { isLocalApp } from "@/platform/localDesktop";
+import { runRendererLibraryRequest } from "@/platform/rendererLibraryWork";
 import { isCloudRenderAvailable } from "@/platform/renderTarget";
 import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { pollCloudImageRenders } from "./pollCloudImageRenders";
 import { pollCloudRenders } from "./pollCloudRenders";
+import { rendererCloudBackgroundWork } from "./rendererCloudBackgroundWork";
 
 /**
  * Keeps cloud renders moving while the app is open.
@@ -31,28 +34,29 @@ const POLL_INTERVAL_MS = 5000;
 
 export const useCloudRenderWatcher = (): void => {
   const queryClient = useQueryClient();
-  const { work } = useRendererLibraryWork();
+  const { work: origin } = useRendererLibraryWork();
 
   useEffect(() => {
-    if (!isLocalApp || !isCloudRenderAvailable() || work.signal.aborted) return;
+    if (!isLocalApp || !isCloudRenderAvailable() || !isCloudAccountActive())
+      return;
+    const work = rendererCloudBackgroundWork(origin);
+    if (work.signal.aborted) return;
 
     // Each interval retains its origin; reset creates a separate interval/pass.
     const cloudApi = {
       post: async <T>(url: string, body?: unknown): Promise<T> => {
-        await work.ready();
-        const response = await backendApiClient.post<T>(url, body ?? {}, {
-          signal: work.signal
-        });
-        work.check();
-        return response.data;
+        return runRendererLibraryRequest(
+          work,
+          async (signal) =>
+            (await backendApiClient.post<T>(url, body ?? {}, { signal })).data
+        );
       },
       get: async <T>(url: string): Promise<T> => {
-        await work.ready();
-        const response = await backendApiClient.get<T>(url, {
-          signal: work.signal
-        });
-        work.check();
-        return response.data;
+        return runRendererLibraryRequest(
+          work,
+          async (signal) =>
+            (await backendApiClient.get<T>(url, { signal })).data
+        );
       }
     };
     let cancelled = false;
@@ -68,7 +72,8 @@ export const useCloudRenderWatcher = (): void => {
         running ||
         cancelled ||
         work.signal.aborted ||
-        !isCloudRenderAvailable()
+        !isCloudRenderAvailable() ||
+        !isCloudAccountActive()
       )
         return;
       running = true;
@@ -101,11 +106,14 @@ export const useCloudRenderWatcher = (): void => {
       }
     };
 
-    void tick();
     const timer = setInterval(() => void tick(), POLL_INTERVAL_MS);
-    return () => {
+    const stop = () => {
       cancelled = true;
       clearInterval(timer);
+      work.signal.removeEventListener("abort", stop);
     };
-  }, [queryClient, work]);
+    work.signal.addEventListener("abort", stop, { once: true });
+    void tick();
+    return stop;
+  }, [queryClient, origin]);
 };

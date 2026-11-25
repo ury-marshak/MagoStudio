@@ -1,5 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { isLocalApp } from "@/platform/localDesktop";
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
 import { queryKeys } from "@/queryKeys";
 
 import { getImageAsset } from "../api/getImageAsset";
@@ -20,41 +22,44 @@ export const useGetImageAssets = <
   selectAll
 }: UseGetImageAssetsParams<TSelected>) => {
   const queryClient = useQueryClient();
+  const scope = useRendererLibraryQueryScope();
+  const assetKey = (id: string) => scope.key(queryKeys.imageAsset.byId(id));
   const validAssetIds = assetIds.filter((id) => !!id);
   const uncachedIds = validAssetIds.filter(
-    (id) => !queryClient.getQueryData(queryKeys.imageAsset.byId(id))
+    (id) => !queryClient.getQueryData(assetKey(id))
   );
   const sortedUncachedIds = [...uncachedIds].sort();
+  const queryKey = scope.key(
+    queryKeys.imageAssetBatch.forIds(sortedUncachedIds)
+  );
   const batchQuery = useQuery({
-    queryKey: queryKeys.imageAssetBatch.forIds(sortedUncachedIds),
-    queryFn: async () => {
-      const settled = await Promise.allSettled(
-        uncachedIds.map((id) => getImageAsset(id))
-      );
+    queryKey,
+    retry: scope.retry(queryKey),
+    queryFn: () =>
+      scope.run(async () => {
+        const settled = await Promise.allSettled(
+          sortedUncachedIds.map((id) => getImageAsset(id, scope.work))
+        );
 
-      const results = resolveSettledAssetResults(settled);
+        scope.work.check();
+        const results = resolveSettledAssetResults(settled);
 
-      uncachedIds.forEach((id, index) => {
-        if (results[index]) {
-          queryClient.setQueryData(
-            queryKeys.imageAsset.byId(id),
-            results[index]
-          );
-        }
-      });
+        sortedUncachedIds.forEach((id, index) => {
+          if (results[index]) {
+            queryClient.setQueryData(assetKey(id), results[index]);
+          }
+        });
 
-      return results;
-    },
-    enabled: enabled && uncachedIds.length > 0,
+        return results;
+      }),
+    enabled: scope.active && enabled && uncachedIds.length > 0,
     staleTime: Infinity,
-    gcTime: Infinity
+    gcTime: isLocalApp ? undefined : Infinity
   });
   const allData = (() => {
     void batchQuery.data;
     return validAssetIds.map((id) =>
-      queryClient.getQueryData<ImageAssetResponse>(
-        queryKeys.imageAsset.byId(id)
-      )
+      queryClient.getQueryData<ImageAssetResponse>(assetKey(id))
     );
   })();
   const transformedData = selectAll

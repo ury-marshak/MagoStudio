@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, stat, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -19,6 +19,7 @@ import {
 } from "../cloudStorage/openCloudStorageDownload";
 import { parseAllowedCloudStorageUrl } from "../cloudStorage/parseAllowedCloudStorageUrl";
 import { LibraryWorkSession } from "../libraryWorkSession";
+import type { ProfileIoDrain } from "../providers/profileIoDrain";
 import { publishFile } from "../storage/atomicFile";
 
 import { DatabaseManager } from "./databaseManager";
@@ -151,11 +152,23 @@ type CachedFile = { absolutePath: string; relativePath: string; size: number };
 export class CloudProjectMirrorRepository {
   readonly libraryWork = new LibraryWorkSession(() => ({
     downloads: new Map<string, Promise<CachedFile>>(),
+    profileDownloads: new WeakMap<
+      AbortSignal,
+      Map<string, Promise<CachedFile>>
+    >(),
     assetSyncs: new Map<string, Set<AbortController>>(),
     assetProjects: new Map<string, string>()
   }));
   private get downloads() {
     return this.libraryWork.state.downloads;
+  }
+  private getProfileDownloads(profile: AbortSignal) {
+    const profiles = this.libraryWork.state.profileDownloads;
+    const existing = profiles.get(profile);
+    if (existing) return existing;
+    const downloads = new Map<string, Promise<CachedFile>>();
+    profiles.set(profile, downloads);
+    return downloads;
   }
   private get assetSyncs() {
     return this.libraryWork.state.assetSyncs;
@@ -169,7 +182,8 @@ export class CloudProjectMirrorRepository {
     private readonly getLibraryRoot: () => Promise<string>,
     private readonly cloudStorage: CloudStorageAccess = {
       allowedHosts: resolveCloudConfig().cloudStorageHosts
-    }
+    },
+    private readonly profileIo?: Pick<ProfileIoDrain, "run">
   ) {
     // Drain whole repository methods, including their internal multi-await
     // writes. Detached callbacks retain this session and its private maps.
@@ -185,10 +199,41 @@ export class CloudProjectMirrorRepository {
     this.cancelAsset = owned.cancelAsset;
   }
 
-  async put(input: LocalCloudProjectMirrorInput): Promise<boolean> {
+  private runProfileIo<T>(
+    profile: AbortSignal | undefined,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    profile?.throwIfAborted();
+    return this.profileIo?.run(profile, operation) ?? operation();
+  }
+
+  private runMirrorTransaction(
+    profile: AbortSignal | undefined,
+    write: (database: MirrorDatabase) => Promise<void>
+  ): Promise<void> {
+    this.libraryWork.capture();
+    return this.runProfileIo(profile, () =>
+      this.manager.transaction((database) => {
+        profile?.throwIfAborted();
+        this.libraryWork.capture();
+        // Once admitted, finish or roll back this atomic write as a unit.
+        // Retirement drains it and prevents admission of the next phase.
+        return write(database);
+      })
+    );
+  }
+
+  async put(
+    input: LocalCloudProjectMirrorInput,
+    profile?: AbortSignal
+  ): Promise<boolean> {
+    profile?.throwIfAborted();
     const projectId = stringValue(input.project.id);
     if (!projectId) throw new Error("Cloud project id is required");
-    if (await this.isLocalProjectCloudCopy(projectId)) return false;
+    const isLocalCopy = await this.isLocalProjectCloudCopy(projectId);
+    profile?.throwIfAborted();
+    this.libraryWork.capture();
+    if (isLocalCopy) return false;
 
     const database = this.manager.get();
     const [existing] = await database
@@ -196,32 +241,43 @@ export class CloudProjectMirrorRepository {
       .from(projects)
       .where(eq(projects.id, projectId))
       .limit(1);
+    profile?.throwIfAborted();
     const existingSettings = parseJson(existing?.settingsJson);
     if (existing && existingSettings.origin !== "cloud") return false;
 
-    await this.putMetadata(input.project, existing);
+    await this.runMirrorTransaction(profile, (database) =>
+      this.putMetadata(database, input.project, existing)
+    );
+    profile?.throwIfAborted();
+    this.libraryWork.capture();
     if (!input.includeContent) return true;
 
     const timelines = arrayValue(input.project.timelines);
     if (!Array.isArray(input.project.timelines)) return true;
-    await this.replaceContent(projectId, timelines);
+    await this.replaceContent(projectId, timelines, profile);
+    profile?.throwIfAborted();
     return true;
   }
 
   /** Downloads one asset's files and marks it available the moment they land,
    * so the renderer can show media one asset at a time instead of waiting for
    * a whole project. The asset row already exists from the metadata pass. */
-  async cacheAsset(input: {
-    projectId: string;
-    assetId: string;
-    isImage: boolean;
-    urls: { sourceUrl?: string; thumbnailUrl?: string };
-  }): Promise<boolean> {
+  async cacheAsset(
+    input: {
+      projectId: string;
+      assetId: string;
+      isImage: boolean;
+      urls: { sourceUrl?: string; thumbnailUrl?: string };
+    },
+    profile?: AbortSignal
+  ): Promise<boolean> {
+    profile?.throwIfAborted();
     const key = JSON.stringify([input.projectId, input.assetId]);
     const controller = new AbortController();
     const signal = AbortSignal.any([
       controller.signal,
-      this.libraryWork.signal
+      this.libraryWork.signal,
+      ...(profile ? [profile] : [])
     ]);
     const controllers = this.assetSyncs.get(key) ?? new Set<AbortController>();
     controllers.add(controller);
@@ -233,10 +289,11 @@ export class CloudProjectMirrorRepository {
         input.assetId,
         { type: input.isImage ? "IMAGE" : "VIDEO" },
         input.urls,
-        signal
+        signal,
+        profile
       );
+      await this.persistPreparedAsset(input.assetId, prepared, signal, profile);
       signal.throwIfAborted();
-      await this.persistPreparedAsset(input.assetId, prepared);
       return !!prepared.source;
     } finally {
       controllers.delete(controller);
@@ -280,6 +337,7 @@ export class CloudProjectMirrorRepository {
   }
 
   private async putMetadata(
+    database: MirrorDatabase,
     project: Record<string, unknown>,
     existing: typeof projects.$inferSelect | undefined
   ): Promise<void> {
@@ -327,8 +385,7 @@ export class CloudProjectMirrorRepository {
       createdAt,
       updatedAt: createdAt
     };
-    await this.manager
-      .get()
+    await database
       .insert(projects)
       .values(values)
       .onConflictDoUpdate({
@@ -342,8 +399,7 @@ export class CloudProjectMirrorRepository {
           updatedAt: values.updatedAt
         }
       });
-    await this.manager
-      .get()
+    await database
       .insert(cloudLinks)
       .values({
         kind: "project",
@@ -367,7 +423,8 @@ export class CloudProjectMirrorRepository {
 
   private async replaceContent(
     projectId: string,
-    timelines: Record<string, unknown>[]
+    timelines: Record<string, unknown>[],
+    profile?: AbortSignal
   ): Promise<void> {
     const cloudAssets = new Map<string, Record<string, unknown>>();
     const cloudLayerIdByAssetId = new Map<string, string>();
@@ -407,7 +464,7 @@ export class CloudProjectMirrorRepository {
     const existingAssets = new Map(
       existingAssetRows.map((asset) => [asset.id, asset])
     );
-    await this.manager.transaction(async (database) => {
+    await this.runMirrorTransaction(profile, async (database) => {
       await this.removeMirroredContentKeepingLocalContent(
         database,
         projectId,
@@ -852,7 +909,8 @@ export class CloudProjectMirrorRepository {
     assetId: string,
     asset: Record<string, unknown>,
     urls: { sourceUrl?: string; thumbnailUrl?: string } | undefined,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    profile?: AbortSignal
   ): Promise<{ source: CachedFile | null; thumbnail: CachedFile | null }> {
     const isImage = asset.type === "IMAGE" || asset.type === "IMAGE_LIST";
     const cachedThumbnail = urls?.thumbnailUrl
@@ -862,7 +920,8 @@ export class CloudProjectMirrorRepository {
           assetId,
           isImage ? "thumbnail" : "first-frame",
           "jpg",
-          signal
+          signal,
+          profile
         ).catch((error) => {
           if (signal?.aborted) throw error;
           console.warn(`Failed to cache cloud thumbnail ${assetId}`, error);
@@ -871,10 +930,13 @@ export class CloudProjectMirrorRepository {
       : null;
     signal?.throwIfAborted();
     if (cachedThumbnail) {
-      await this.persistPreparedAsset(assetId, {
-        source: null,
-        thumbnail: cachedThumbnail
-      });
+      await this.persistPreparedAsset(
+        assetId,
+        { source: null, thumbnail: cachedThumbnail },
+        signal,
+        profile
+      );
+      signal?.throwIfAborted();
     }
     const source = urls?.sourceUrl
       ? await this.cacheRemoteFile(
@@ -883,7 +945,8 @@ export class CloudProjectMirrorRepository {
           assetId,
           "source",
           isImage ? "jpg" : "mp4",
-          signal
+          signal,
+          profile
         ).catch((error) => {
           if (signal?.aborted) throw error;
           console.warn(`Failed to cache cloud asset ${assetId}`, error);
@@ -896,26 +959,31 @@ export class CloudProjectMirrorRepository {
 
   private async persistPreparedAsset(
     assetId: string,
-    prepared: { source: CachedFile | null; thumbnail: CachedFile | null }
+    prepared: { source: CachedFile | null; thumbnail: CachedFile | null },
+    signal?: AbortSignal,
+    profile?: AbortSignal
   ): Promise<void> {
+    signal?.throwIfAborted();
     if (!prepared.source && !prepared.thumbnail) return;
-    await this.manager
-      .get()
-      .update(assets)
-      .set({
-        ...(prepared.source
-          ? {
-              sourcePath: prepared.source.absolutePath,
-              relativeSourcePath: prepared.source.relativePath,
-              sizeBytes: prepared.source.size,
-              status: "available" as const
-            }
-          : {}),
-        ...(prepared.thumbnail
-          ? { thumbnailRelativePath: prepared.thumbnail.relativePath }
-          : {})
-      })
-      .where(eq(assets.id, assetId));
+    await this.runProfileIo(profile, async () => {
+      await this.manager
+        .get()
+        .update(assets)
+        .set({
+          ...(prepared.source
+            ? {
+                sourcePath: prepared.source.absolutePath,
+                relativeSourcePath: prepared.source.relativePath,
+                sizeBytes: prepared.source.size,
+                status: "available" as const
+              }
+            : {}),
+          ...(prepared.thumbnail
+            ? { thumbnailRelativePath: prepared.thumbnail.relativePath }
+            : {})
+        })
+        .where(eq(assets.id, assetId));
+    });
   }
 
   private cacheRemoteFile(
@@ -924,7 +992,8 @@ export class CloudProjectMirrorRepository {
     assetId: string,
     kind: "source" | "thumbnail" | "first-frame",
     fallbackExtension: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    profile?: AbortSignal
   ): Promise<CachedFile> {
     let url: URL;
     try {
@@ -946,13 +1015,16 @@ export class CloudProjectMirrorRepository {
       projectHash,
       `${assetHash}-${kind}.${extension}`
     );
-    const existing = this.downloads.get(relativePath);
+    const downloads = profile
+      ? this.getProfileDownloads(profile)
+      : this.downloads;
+    const existing = downloads.get(relativePath);
     if (existing) return existing;
-    const operation = this.downloadFile(url, relativePath, signal);
-    this.downloads.set(relativePath, operation);
+    const operation = this.downloadFile(url, relativePath, signal, profile);
+    downloads.set(relativePath, operation);
     const removeDownload = () => {
-      if (this.downloads.get(relativePath) === operation) {
-        this.downloads.delete(relativePath);
+      if (downloads.get(relativePath) === operation) {
+        downloads.delete(relativePath);
       }
     };
     void operation.then(removeDownload, removeDownload);
@@ -962,7 +1034,8 @@ export class CloudProjectMirrorRepository {
   private async downloadFile(
     url: URL,
     relativePath: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    profile?: AbortSignal
   ): Promise<CachedFile> {
     if (signal?.aborted) throw signal.reason;
     const libraryRoot = await this.getLibraryRoot();
@@ -973,10 +1046,23 @@ export class CloudProjectMirrorRepository {
     if (existing?.isFile() && existing.size > 0) {
       return { absolutePath, relativePath, size: existing.size };
     }
-    const temporaryPath = `${absolutePath}.partial`;
+    // Account retirement need not wait for root/stat preflight, but must
+    // drain issued filesystem writes and actual response-body cleanup.
+    return this.runProfileIo(profile, () =>
+      this.downloadToCache(url, relativePath, absolutePath, signal)
+    );
+  }
+
+  private async downloadToCache(
+    url: URL,
+    relativePath: string,
+    absolutePath: string,
+    signal?: AbortSignal
+  ): Promise<CachedFile> {
+    signal?.throwIfAborted();
+    const temporaryPath = `${absolutePath}.${randomUUID()}.partial`;
     await mkdir(path.dirname(absolutePath), { recursive: true });
     signal?.throwIfAborted();
-    await unlink(temporaryPath).catch(() => {});
     return withCloudStorageDownload(
       {
         ...this.cloudStorage,
@@ -993,7 +1079,7 @@ export class CloudProjectMirrorRepository {
           signal?.throwIfAborted();
           if (downloaded.size <= 0)
             throw new Error("Cloud project asset was empty");
-          await publishFile(temporaryPath, absolutePath);
+          await publishFile(temporaryPath, absolutePath, signal);
           signal?.throwIfAborted();
           return { absolutePath, relativePath, size: downloaded.size };
         } catch (error) {

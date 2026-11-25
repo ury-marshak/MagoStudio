@@ -6,14 +6,21 @@ import {
   LOCAL_MODEL_BUNDLES,
   requiredBundles
 } from "../../shared/localModelManifest";
+import { ComfyClient } from "../comfy/ComfyClient";
 import { ComfyQwenClient } from "../imageRenders/comfyQwenClient";
 import { resolveAppFolder } from "../resolveAppFolder";
 
-export const detectPriorSetup = async (settings: {
-  localModelsRoot?: string;
-  comfyEndpoint?: string;
-  inferredComfyInstall?: { endpoint: string; directory: string };
-}): Promise<boolean> => {
+export const detectPriorSetup = async (
+  settings: {
+    localModelsRoot?: string;
+    comfyEndpoint?: string;
+    inferredComfyInstall?: { endpoint: string; directory: string };
+  },
+  {
+    allowNetwork = true,
+    signal
+  }: { allowNetwork?: boolean; signal?: AbortSignal } = {}
+): Promise<boolean> => {
   if (settings.localModelsRoot) {
     const base = resolveAppFolder(settings.localModelsRoot);
     const engine = path.join(base, "ComfyUI_windows_portable");
@@ -49,14 +56,22 @@ export const detectPriorSetup = async (settings: {
       /* Missing or incomplete installer files. */
     }
   }
+  signal?.throwIfAborted();
+  if (!allowNetwork) return false;
   // Only check a previously configured endpoint, not the default on fresh installs.
   const endpoint =
     settings.comfyEndpoint ?? settings.inferredComfyInstall?.endpoint;
   if (endpoint) {
     try {
-      await new ComfyQwenClient(endpoint).validate();
+      await new ComfyQwenClient(
+        endpoint,
+        undefined,
+        new ComfyClient(endpoint, undefined, signal)
+      ).validate();
+      signal?.throwIfAborted();
       return true;
     } catch {
+      signal?.throwIfAborted();
       /* Existing endpoint is unavailable. */
     }
   }

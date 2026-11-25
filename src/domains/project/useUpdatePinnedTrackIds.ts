@@ -1,24 +1,27 @@
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { useProject } from "./useProject";
 import { useUpdateProject } from "./useUpdateProject";
 
 export const useUpdatePinnedTrackIds = (projectId: string | undefined) => {
+  const { work } = useRendererLibraryWork();
   const { data: project } = useProject(projectId);
   const queryClient = useQueryClient();
 
   const mutation = useUpdateProject({
     onMutate: async (updatedProject, work) => {
       await queryClient.cancelQueries({
-        queryKey: queryKeys.project.byId(projectId)
+        queryKey: libraryQueryKey(queryKeys.project.byId(projectId))
       });
       work.check();
 
       queryClient.setQueryData(
-        queryKeys.project.byId(projectId),
+        libraryQueryKey(queryKeys.project.byId(projectId)),
         (oldProject: Project | undefined) => {
           if (!oldProject) return oldProject;
           return {
@@ -31,21 +34,24 @@ export const useUpdatePinnedTrackIds = (projectId: string | undefined) => {
   });
 
   const updatePinnedTrackIds = async (newPinned: Record<string, string>) => {
-    if (!project) return;
+    if (!project || work.signal.aborted) return;
 
-    await mutation.mutateAsync({
-      projectId: project.id,
-      projectName: project.name,
-      projectDescription: project.description,
-      settings: {
-        ...project.settings,
-        pinnedTrackIds: newPinned
+    await mutation.mutateAsync(
+      {
+        projectId: project.id,
+        projectName: project.name,
+        projectDescription: project.description,
+        settings: {
+          ...project.settings,
+          pinnedTrackIds: newPinned
+        },
+        settingsPatch: { pinnedTrackIds: newPinned },
+        settingsMergeBase: {
+          pinnedTrackIds: project.settings.pinnedTrackIds ?? {}
+        }
       },
-      settingsPatch: { pinnedTrackIds: newPinned },
-      settingsMergeBase: {
-        pinnedTrackIds: project.settings.pinnedTrackIds ?? {}
-      }
-    });
+      work
+    );
   };
 
   const pinTrack = async (shotId: string, layerId: string) => {

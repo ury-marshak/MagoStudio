@@ -1,6 +1,13 @@
 import path from "node:path";
 
-import { app, BrowserWindow, dialog, session, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  session,
+  shell,
+  type WebContents
+} from "electron";
 
 import {
   inWindowNavigationHosts,
@@ -13,6 +20,10 @@ import { CloudRenderJobRepository } from "./cloud/cloudRenderJobRepository";
 import { CloudRenderSubmitService } from "./cloud/cloudRenderSubmitService";
 import { requireCloudAccount } from "./cloud/requireCloudAccount";
 import { UploadService } from "./cloud/uploadService";
+import {
+  createProfileComfyClient,
+  drainComfyProfile
+} from "./comfy/ComfyClient";
 import { closeAllComfyProgressMonitors } from "./comfy/comfyProgressMonitors";
 import { CloudProjectMirrorRepository } from "./database/cloudProjectMirrorRepository";
 import { DatabaseManager } from "./database/databaseManager";
@@ -25,7 +36,10 @@ import {
   registerDeepLinkScheme
 } from "./deepLink";
 import { ImageRenderService } from "./imageRenders/imageRenderService";
-import { registerAccountHandlers } from "./ipc/registerAccountHandlers";
+import {
+  createAccountLifecycle,
+  registerAccountHandlers
+} from "./ipc/registerAccountHandlers";
 import { registerCloudHandlers } from "./ipc/registerCloudHandlers";
 import { registerCloudStorageHandlers } from "./ipc/registerCloudStorageHandlers";
 import { registerComfyHandlers } from "./ipc/registerComfyHandlers";
@@ -34,6 +48,7 @@ import { registerImageRenderHandlers } from "./ipc/registerImageRenderHandlers";
 import { registerLibraryHandlers } from "./ipc/registerLibraryHandlers";
 import { registerLocalSetupHandlers } from "./ipc/registerLocalSetupHandlers";
 import { registerMediaHandlers } from "./ipc/registerMediaHandlers";
+import { registerOrdinaryFalHandlers } from "./ipc/registerOrdinaryFalHandlers";
 import { registerProjectHandlers } from "./ipc/registerProjectHandlers";
 import { registerScriptProjectHandlers } from "./ipc/registerScriptProjectHandlers";
 import { registerVlmHandlers } from "./ipc/registerVlmHandlers";
@@ -42,6 +57,7 @@ import { runBackgroundTask } from "./libraryHealth";
 import { LibrarySettings } from "./librarySettings";
 import { VideoFrameService } from "./media/videoFrameService";
 import { openStartupLibrary } from "./openStartupLibrary";
+import { OrdinaryFalService } from "./ordinaryFal/ordinaryFalService";
 import { createExternalInferenceRouting } from "./providers/externalInferenceRouting";
 import {
   createExternalProviderSettings,
@@ -51,6 +67,8 @@ import { ExternalRenderAssets } from "./providers/externalRenderAssets";
 import { ExternalRenderJobRepository } from "./providers/externalRenderJobRepository";
 import { ExternalRenderJobService } from "./providers/externalRenderJobService";
 import { FalRenderProvider } from "./providers/falRenderProvider";
+import { ProfileIoDrain } from "./providers/profileIoDrain";
+import { ProfileLifetime } from "./providers/profileLifetime";
 import { installOfflineRenderer } from "./renderer/offlineRenderer";
 import {
   ensureRendererCertificate,
@@ -80,6 +98,15 @@ import { VlmService } from "./vlm/vlmService";
 
 const databaseManager = new DatabaseManager();
 const librarySettings = new LibrarySettings();
+export const accountProfiles = new ProfileLifetime();
+const accountIo = new ProfileIoDrain();
+const falIo = new ProfileIoDrain();
+const accountLifecycle = createAccountLifecycle(accountProfiles, {
+  drainRetired: drainRetiredProfiles
+});
+const captureAccountProfile = (sender: WebContents): AbortSignal =>
+  accountLifecycle.capture(sender);
+const serializeProfileWrite = accountLifecycle.serialize;
 const cloudStorageAccess = {
   allowedHosts: resolveCloudConfig().cloudStorageHosts,
   assertAccess: () => requireCloudAccount(librarySettings)
@@ -90,16 +117,90 @@ const projectRepository = new ProjectRepository(databaseManager, () =>
 const cloudProjectMirrorRepository = new CloudProjectMirrorRepository(
   databaseManager,
   () => librarySettings.getLibraryRoot(),
-  cloudStorageAccess
+  cloudStorageAccess,
+  accountIo
 );
 const scriptProjectSnapshotRepository = new ScriptProjectSnapshotRepository(
   databaseManager,
   () => librarySettings.getLibraryRoot(),
-  cloudStorageAccess
+  cloudStorageAccess,
+  accountIo
 );
-const externalProviders = createExternalProviderSettings(() =>
-  app.getPath("userData")
+const externalProviders = createExternalProviderSettings(
+  () => app.getPath("userData"),
+  {
+    serializeWrite: serializeProfileWrite,
+    drainRetiredInference: drainRetiredProfiles
+  }
 );
+const comfyConfiguration = new ProfileLifetime();
+let inferenceOrigin:
+  | {
+      account: AbortSignal;
+      provider: AbortSignal;
+      comfy: AbortSignal;
+      signal: AbortSignal;
+    }
+  | undefined;
+const retiredInference = new Set<AbortSignal>();
+let drainSetup = async () => {};
+let drainLauncher: (profile: AbortSignal) => Promise<void> = async () => {};
+async function drainRetiredProfiles() {
+  const retired = [...retiredInference];
+  await Promise.all([
+    drainSetup(),
+    accountIo.drainRetired(),
+    falIo.drainRetired(),
+    ...retired.flatMap((profile) => [
+      drainComfyProfile(profile),
+      drainLauncher(profile),
+      localScriptProjectService.drainInferenceProfile(profile),
+      imageRenderService.drainInferenceProfile(profile)
+    ])
+  ]);
+  for (const profile of retired) retiredInference.delete(profile);
+}
+const captureInferenceProfile = (sender?: WebContents): AbortSignal => {
+  const account = sender
+    ? captureAccountProfile(sender)
+    : accountProfiles.capture();
+  const provider = externalProviders.captureInferenceProfile();
+  const comfy = comfyConfiguration.capture();
+  if (
+    !inferenceOrigin ||
+    inferenceOrigin.account !== account ||
+    inferenceOrigin.provider !== provider ||
+    inferenceOrigin.comfy !== comfy
+  ) {
+    const signal = AbortSignal.any([account, provider, comfy]);
+    signal.addEventListener(
+      "abort",
+      () => {
+        retiredInference.add(signal);
+      },
+      { once: true }
+    );
+    inferenceOrigin = { account, provider, comfy, signal };
+  }
+  return inferenceOrigin.signal;
+};
+const commitComfyConfiguration = (
+  sender: WebContents,
+  origin: AbortSignal,
+  write: () => Promise<void>
+) =>
+  serializeProfileWrite(async () => {
+    origin.throwIfAborted();
+    captureAccountProfile(sender);
+    comfyConfiguration.suspend();
+    try {
+      await drainRetiredProfiles();
+      await write();
+    } finally {
+      comfyConfiguration.resume();
+    }
+    return captureInferenceProfile(sender);
+  });
 const externalRenderJobRepository = new ExternalRenderJobRepository(
   databaseManager
 );
@@ -111,31 +212,59 @@ const externalRenderJobService = new ExternalRenderJobService(
     () => librarySettings.getLibraryRoot(),
     (assetId, projectId) =>
       scriptProjectSnapshotRepository.resolveMediaPath(assetId, projectId)
-  )
+  ),
+  falIo
 );
+const ordinaryFalService = new OrdinaryFalService({
+  databaseManager,
+  getLibraryRoot: () => librarySettings.getLibraryRoot(),
+  getFal: externalProviders.getFal,
+  captureProfile: () =>
+    AbortSignal.any([
+      accountProfiles.capture(),
+      externalProviders.captureInferenceProfile()
+    ]),
+  profileIo: falIo
+});
 const inference = createExternalInferenceRouting(
   externalProviders,
-  generateComfyVision(librarySettings),
-  (signal) => probeComfyVision(librarySettings, signal)
+  generateComfyVision(librarySettings, captureInferenceProfile),
+  (signal) =>
+    probeComfyVision(librarySettings, signal, captureInferenceProfile())
 );
 const getExternalGenerator = inference.getGenerator;
 const vlmService = new VlmService(
   projectRepository,
   inference.generateVision,
   inference.probeVision,
-  inference.generateEnhancement
+  inference.generateEnhancement,
+  captureInferenceProfile
 );
 const assertLegacyInferenceAvailable =
   externalProviders.assertLegacyInferenceAvailable;
-const getLegacyComfyEndpoint = async () => {
+const getLegacyComfyEndpoint = async (origin = captureInferenceProfile()) => {
+  origin.throwIfAborted();
   await assertLegacyInferenceAvailable();
-  return librarySettings.getComfyEndpoint();
+  origin.throwIfAborted();
+  const endpoint = await librarySettings.getComfyEndpoint();
+  origin.throwIfAborted();
+  return endpoint;
 };
-const getComfyScriptClient = async () =>
-  new ComfyScriptProjectClient(
-    await getLegacyComfyEndpoint(),
-    await librarySettings.getScriptTextModel()
+const getComfyScriptClient = async (
+  caller?: AbortSignal,
+  origin = captureInferenceProfile()
+) => {
+  caller?.throwIfAborted();
+  const endpoint = await getLegacyComfyEndpoint(origin);
+  const textModel = await librarySettings.getScriptTextModel();
+  origin.throwIfAborted();
+  caller?.throwIfAborted();
+  return new ComfyScriptProjectClient(
+    endpoint,
+    textModel,
+    createProfileComfyClient(endpoint, origin, caller)
   );
+};
 const PROMPT_ADAPTATION_MAX_TOKENS = 4600;
 const SCRIPT_CHAT_MAX_TOKENS = 16_000;
 const runExternalScriptText = async (
@@ -174,28 +303,43 @@ const i2vPromptAdapter = new LocalI2vPromptAdapter({
       signal
     );
     if (external) return external.text;
-    const client = await getComfyScriptClient();
+    const client = await getComfyScriptClient(signal);
     signal?.throwIfAborted();
     return client.runPromptAdaptation(prompt, () => signal?.aborted === true);
   }
 });
-const textModelBridge = new TextModelBridge();
-const runLegacyTextModel: typeof textModelBridge.run = async (...args) => {
+const textModelBridge = new TextModelBridge(captureInferenceProfile);
+const runLegacyTextModel: typeof textModelBridge.run = async (
+  operation,
+  body,
+  isCancelled,
+  caller
+) => {
+  caller?.throwIfAborted();
+  const profile = captureInferenceProfile();
+  const signal = caller ? AbortSignal.any([caller, profile]) : profile;
   await assertLegacyInferenceAvailable();
-  return textModelBridge.run(...args);
+  signal.throwIfAborted();
+  return textModelBridge.run(operation, body, isCancelled, signal);
 };
 const localScriptProjectService = new LocalScriptProjectService(
   projectRepository,
   scriptProjectSnapshotRepository,
   getLegacyComfyEndpoint,
   () => librarySettings.getScriptTextModel(),
-  (sourcePath, kind, signal) =>
-    vlmService.describeEntityImage(sourcePath, kind, undefined, signal),
+  (sourcePath, kind, signal, profile) =>
+    vlmService.describeEntityImage(
+      sourcePath,
+      kind,
+      undefined,
+      signal,
+      profile
+    ),
   runLegacyTextModel,
   (input, signal) => vlmService.evaluateShotVideo(input, signal),
-  () => getExternalGenerator("text"),
+  (signal) => getExternalGenerator("text", signal),
   externalRenderJobService,
-  async (sourcePath, kind, signal) => {
+  async (sourcePath, kind, signal, profile) => {
     signal?.throwIfAborted();
     const generate = await getExternalGenerator("vision", signal);
     signal?.throwIfAborted();
@@ -203,9 +347,17 @@ const localScriptProjectService = new LocalScriptProjectService(
       throw new Error(
         "Configure an external vision provider to describe fal images"
       );
-    return vlmService.describeEntityImage(sourcePath, kind, generate, signal);
+    return vlmService.describeEntityImage(
+      sourcePath,
+      kind,
+      generate,
+      signal,
+      profile
+    );
   },
-  async () => (await externalProviders.getFal())?.generationSettings
+  async () => (await externalProviders.getFal())?.generationSettings,
+  captureInferenceProfile,
+  accountIo
 );
 const localScriptChatService = new LocalScriptChatService(
   new ScriptChatMessageRepository(databaseManager),
@@ -221,18 +373,22 @@ const localScriptChatService = new LocalScriptChatService(
     const cloud = await runLegacyTextModel(
       "chat",
       { prompt },
-      () => signal?.aborted === true
+      undefined,
+      signal
     );
     if (cloud) return { content: String(cloud.content), model: "cloud" };
     signal?.throwIfAborted();
-    return (await getComfyScriptClient()).runScriptChat(
+    return (await getComfyScriptClient(signal)).runScriptChat(
       prompt,
       () => signal?.aborted === true
     );
   }
 );
 const cloudLinkRepository = new CloudLinkRepository(databaseManager);
-const uploadService = new UploadService(() => librarySettings.getLibraryRoot());
+const uploadService = new UploadService(
+  () => librarySettings.getLibraryRoot(),
+  accountIo
+);
 const cloudRenderJobRepository = new CloudRenderJobRepository(databaseManager);
 const cloudRenderSubmitService = new CloudRenderSubmitService(
   databaseManager,
@@ -247,7 +403,8 @@ const imageRenderService = new ImageRenderService(
   getLegacyComfyEndpoint,
   describeImageLater,
   assertLegacyInferenceAvailable,
-  captureImageDescriptionSession
+  captureImageDescriptionSession,
+  captureInferenceProfile
 );
 const videoFrameService = new VideoFrameService(projectRepository);
 const usesPackagedRenderer =
@@ -305,6 +462,12 @@ const deliverDeepLink = (link: DeepLink): void => {
     pendingDeepLinks.push(link);
     return;
   }
+  try {
+    captureAccountProfile(deepLinkTarget.webContents);
+  } catch {
+    // Do not forward an auth callback during account replacement.
+    return;
+  }
   deepLinkTarget.webContents.send(IPC_CHANNELS.accountDeepLink, link);
   if (deepLinkTarget.isMinimized()) deepLinkTarget.restore();
   deepLinkTarget.focus();
@@ -355,6 +518,7 @@ const createWindowOnce = async (
       additionalArguments: [`--mago-app-mode=${appMode}`]
     }
   });
+  accountLifecycle.bindWindow(window.webContents);
 
   window.webContents.setWindowOpenHandler(({ url }) => {
     try {
@@ -432,6 +596,7 @@ const createWindowOnce = async (
       })
     ]);
   } catch (error) {
+    accountLifecycle.retire();
     window.destroy();
     throw error;
   } finally {
@@ -447,6 +612,7 @@ const createWindowOnce = async (
 };
 
 const createWindow = async (): Promise<BrowserWindow> => {
+  // The caller holds the profile write queue, including the fallback dialog.
   windowsBeingCreated += 1;
   try {
     const appMode = await resolveProviderStartupMode(
@@ -456,6 +622,7 @@ const createWindow = async (): Promise<BrowserWindow> => {
     try {
       return await createWindowOnce(appMode);
     } catch (error) {
+      accountLifecycle.retire();
       if (!usesPackagedRenderer || appMode === "offline") throw error;
       logStartup(`Cloud renderer startup failed: ${String(error)}`);
       pauseStartupTimeout();
@@ -470,9 +637,13 @@ const createWindow = async (): Promise<BrowserWindow> => {
         cancelId: 1
       });
       if (response !== 0) throw error;
-      await librarySettings.setAppMode("offline");
-      resumeStartupTimeout();
-      return await createWindowOnce("offline");
+      return await accountLifecycle.replace(
+        () => librarySettings.setAppMode("offline"),
+        () => {
+          resumeStartupTimeout();
+          return createWindowOnce("offline");
+        }
+      );
     }
   } finally {
     windowsBeingCreated -= 1;
@@ -487,10 +658,22 @@ void app
       projectRepository,
       scriptProjectSnapshotRepository,
       librarySettings,
-      videoFrameService.libraryWork
+      videoFrameService.libraryWork,
+      () => accountProfiles.capture(),
+      accountIo
     );
-    registerComfyHandlers(librarySettings, assertLegacyInferenceAvailable);
-    registerExternalProviderHandlers(externalProviders);
+    ({ drainLaunchCleanup: drainLauncher } = registerComfyHandlers(
+      librarySettings,
+      assertLegacyInferenceAvailable,
+      {
+        captureInferenceProfile,
+        commitComfyConfiguration,
+        serializeProfileWrite
+      }
+    ));
+    registerExternalProviderHandlers(externalProviders, {
+      captureAccountProfile
+    });
     textModelBridge.register();
     registerCloudHandlers({
       links: cloudLinkRepository,
@@ -501,30 +684,39 @@ void app
       databaseManager,
       getLibraryRoot: () => librarySettings.getLibraryRoot(),
       settings: librarySettings,
-      captureImageDescriptionSession
+      captureImageDescriptionSession,
+      captureAccountProfile,
+      profileIoDrain: accountIo
     });
-    registerImageRenderHandlers(imageRenderService, cloudRenderJobRepository);
+    registerImageRenderHandlers(
+      imageRenderService,
+      cloudRenderJobRepository,
+      captureInferenceProfile
+    );
     registerMediaHandlers(videoFrameService);
-    registerCloudStorageHandlers(librarySettings);
     stopVlmRequests = registerVlmHandlers(
       vlmService,
       i2vPromptAdapter,
-      async () => !!(await externalProviders.get("text"))
+      async () => !!(await externalProviders.get("text")),
+      captureInferenceProfile
     );
 
-    registerLocalSetupHandlers({
+    ({ drainRetired: drainSetup } = registerLocalSetupHandlers({
       settings: librarySettings,
-      assertInferenceAvailable: assertLegacyInferenceAvailable
-    });
+      assertInferenceAvailable: assertLegacyInferenceAvailable,
+      captureProfile: captureInferenceProfile
+    }));
 
-    registerLibraryHandlers({
+    const libraryLifecycle = registerLibraryHandlers({
       settings: librarySettings,
       databaseManager,
       repository: projectRepository,
+      mediaWork: videoFrameService.libraryWork,
       beforeLibraryChange: async () => {
         await Promise.all([
           localScriptProjectService.suspendPlans(),
           externalRenderJobService.suspend(),
+          ordinaryFalService.suspend(),
           localScriptChatService.suspend(),
           localScriptProjectService.suspendMetrics(),
           localScriptProjectService.suspendDescriptions(),
@@ -541,6 +733,7 @@ void app
       },
       afterLibraryChange: () => {
         externalRenderJobService.reset();
+        ordinaryFalService.reset();
         localScriptProjectService.resetPlans();
         localScriptChatService.reset();
         localScriptProjectService.resetMetrics();
@@ -556,6 +749,12 @@ void app
         imageRenderService.reset();
       }
     });
+    registerCloudStorageHandlers(librarySettings, {
+      libraryWork: videoFrameService.libraryWork,
+      assertLibraryAvailable: () => libraryLifecycle.assertAvailable(),
+      captureAccountProfile,
+      profileIoDrain: accountIo
+    });
     registerProjectHandlers(
       projectRepository,
       cloudProjectMirrorRepository,
@@ -563,16 +762,23 @@ void app
       librarySettings,
       describeImageLater,
       vlmService.libraryWork,
-      videoFrameService.libraryWork
+      videoFrameService.libraryWork,
+      captureAccountProfile,
+      () => libraryLifecycle.assertAvailable(),
+      accountIo
     );
     registerScriptProjectHandlers({
       service: localScriptProjectService,
       chat: localScriptChatService,
       databaseManager,
+      captureAccountProfile,
+      captureInferenceProfile,
+      profileIo: accountIo,
       settings: librarySettings
     });
     registerAccountHandlers({
       settings: librarySettings,
+      lifecycle: accountLifecycle,
       rebuildWindow: async () => {
         const existing = BrowserWindow.getAllWindows();
         const replacement = await createWindow();
@@ -593,12 +799,16 @@ void app
     await runBackgroundTask("External render plan recovery", () =>
       localScriptProjectService.recoverExternalRenderPlans()
     );
-    await createWindow();
+    registerOrdinaryFalHandlers(ordinaryFalService, captureAccountProfile);
+    await serializeProfileWrite(createWindow);
+    ordinaryFalService.start();
     imageRenderService.startWithRecovery();
 
     app.on("activate", () => {
-      if (BrowserWindow.getAllWindows().length === 0)
-        void createWindow().catch(failStartup);
+      if (BrowserWindow.getAllWindows().length > 0) return;
+      void serializeProfileWrite(async () => {
+        if (BrowserWindow.getAllWindows().length === 0) await createWindow();
+      }).catch(failStartup);
     });
   })
   .catch(failStartup);
@@ -606,12 +816,15 @@ void app
 app.on("window-all-closed", () => {
   // A failed cloud window is destroyed before its offline replacement opens.
   if (windowsBeingCreated > 0) return;
+  accountLifecycle.retire();
   if (process.platform !== "darwin") app.quit();
 });
 
 app.on("before-quit", () => {
+  accountLifecycle.retire();
   localScriptProjectService.stopPlans();
   externalRenderJobService.stop();
+  ordinaryFalService.stop();
   stopVlmRequests();
   vlmService.stop();
   videoFrameService.libraryWork.stop();

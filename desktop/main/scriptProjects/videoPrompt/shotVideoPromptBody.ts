@@ -95,6 +95,7 @@ export const buildShotVideoPromptBody = (input: {
     continuation?: Continuation | null;
   } | null;
   continuityVideo: { id: string; description: string } | null;
+  openingFrameDescription?: string;
   durationSeconds: number;
   outputSize?: unknown;
   visualStyle?: string;
@@ -180,5 +181,14 @@ export const buildShotVideoPromptBody = (input: {
   if (input.visualStyle) shot.style = input.visualStyle;
   const camera = cameraText(input.shot.camera);
   if (camera) shot.camera = camera;
-  return { ...payload, shot, references };
+  return {
+    ...payload,
+    shot,
+    references,
+    ...(input.openingFrameDescription === undefined
+      ? {}
+      : {
+          opening_frame: { description: input.openingFrameDescription }
+        })
+  };
 };

@@ -28,10 +28,12 @@ const versionNumberOf = (text: string): string | null =>
 export const findComfyPython = async ({
   comfyDirectory,
   reportedPythonVersion,
+  signal,
   runPython = runPythonProcess
 }: {
   comfyDirectory: string;
   reportedPythonVersion: string | null;
+  signal?: AbortSignal;
   runPython?: PythonProcessRunner;
 }): Promise<string | null> => {
   const comfyPythonVersion = versionNumberOf(reportedPythonVersion ?? "");
@@ -40,10 +42,16 @@ export const findComfyPython = async ({
     const isFile = await stat(candidate)
       .then((info) => info.isFile())
       .catch(() => false);
+    signal?.throwIfAborted();
     if (!isFile) continue;
-    const { exitCode, output } = await runPython(candidate, [
-      "--version"
-    ]).catch(() => ({ exitCode: null, output: "" }));
+    const version = signal
+      ? runPython(candidate, ["--version"], signal)
+      : runPython(candidate, ["--version"]);
+    const { exitCode, output } = await version.catch(() => ({
+      exitCode: null,
+      output: ""
+    }));
+    signal?.throwIfAborted();
     if (exitCode === 0 && versionNumberOf(output) === comfyPythonVersion)
       return candidate;
   }

@@ -2,6 +2,10 @@ import { z } from "zod";
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
+import {
   type PaginatedResponse,
   paginatedResponseSchema
 } from "@/schemas/pagination";
@@ -32,14 +36,18 @@ type TimelineListParams = {
   sortOrder?: "asc" | "desc";
 };
 
-export const fetchTimelineList = async ({
-  projectId,
-  page = 1,
-  perPage = DEFAULT_PER_PAGE,
-  sortBy = "updated_at",
-  sortOrder = "desc"
-}: TimelineListParams): Promise<PaginatedResponse<TimelineListItem>> => {
-  if (!window.mago) {
+export const fetchTimelineList = async (
+  {
+    projectId,
+    page = 1,
+    perPage = DEFAULT_PER_PAGE,
+    sortBy = "updated_at",
+    sortOrder = "desc"
+  }: TimelineListParams,
+  work?: RendererLibraryWork
+): Promise<PaginatedResponse<TimelineListItem>> => {
+  const desktop = window.mago;
+  if (!desktop) {
     const response = await backendApiClient.get(
       `/projects/${projectId}/timelines/list`,
       {
@@ -53,8 +61,9 @@ export const fetchTimelineList = async ({
     );
     return timelineListResponseSchema.parse(response.data);
   }
+  const origin = work ?? rendererLibrary.capture();
   const items = timelineListResponseSchema.shape.items
-    .parse(await window.mago.projects.listShots(projectId))
+    .parse(await origin.boundary(() => desktop.projects.listShots(projectId)))
     .sort((left, right) => {
       const direction = sortOrder === "asc" ? 1 : -1;
       return (

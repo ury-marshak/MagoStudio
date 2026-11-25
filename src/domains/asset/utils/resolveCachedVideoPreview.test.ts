@@ -62,11 +62,14 @@ describe("resolveCachedVideoPreview", () => {
         firstFrameUrl: FIRST_FRAME_DATA_URL,
         isVideoAvailable: true
       });
-      expect(extractFrameMock).toHaveBeenCalledWith({
-        videoSource: videoUrl,
-        frameNumber: 0,
-        fps: FPS
-      });
+      expect(extractFrameMock).toHaveBeenCalledWith(
+        {
+          videoSource: videoUrl,
+          frameNumber: 0,
+          fps: FPS
+        },
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
       expect(getCachedVideoBlobMock).not.toHaveBeenCalled();
       expect(URL.createObjectURL).not.toHaveBeenCalled();
     }
@@ -203,11 +206,14 @@ describe("resolveCachedVideoPreview", () => {
       fps: FPS
     });
 
-    expect(extractFrameMock).toHaveBeenCalledWith({
-      videoSource: videoBlob,
-      frameNumber: 0,
-      fps: FPS
-    });
+    expect(extractFrameMock).toHaveBeenCalledWith(
+      {
+        videoSource: videoBlob,
+        frameNumber: 0,
+        fps: FPS
+      },
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(saveFrameToCacheMock).toHaveBeenCalledWith(
       ASSET_ID,
       0,

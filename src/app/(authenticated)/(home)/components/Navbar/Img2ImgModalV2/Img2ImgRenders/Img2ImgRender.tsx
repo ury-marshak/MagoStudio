@@ -22,6 +22,7 @@ export const Img2ImgRender: React.FC<Props> = ({
   disableIterate = false
 }) => {
   const {
+    currentClip,
     assetId,
     clipId,
     clipStatus,
@@ -36,11 +37,23 @@ export const Img2ImgRender: React.FC<Props> = ({
     onNavigateNext
   } = useClipNavigation({ index, generationIndex, allClips });
 
-  const renderModel = allClips[index]?.data?.settings?.render_model as
-    | string
-    | undefined;
-
-  const imageCrop = getImg2ImgClipCrop(allClips[index]);
+  const external = currentClip?.data.externalRender;
+  const fal =
+    external &&
+    typeof external === "object" &&
+    "provider" in external &&
+    external.provider === "fal";
+  const renderModel = fal
+    ? "model" in external && typeof external.model === "string"
+      ? `${external.model} (fal)`
+      : "fal (direct)"
+    : (allClips[index]?.data?.settings?.render_model as string | undefined);
+  const inputStillId =
+    fal && typeof currentClip?.data.source === "string"
+      ? currentClip.data.source
+      : inputImageId;
+  const outputFilename = fal ? filename.replace(/\.jpg$/, ".png") : filename;
+  const imageCrop = fal ? undefined : getImg2ImgClipCrop(allClips[index]);
 
   const isFirstSuccessfulRender =
     allClips.findIndex((clip) => clip.data.status === "success") === index;
@@ -58,12 +71,12 @@ export const Img2ImgRender: React.FC<Props> = ({
       <Img2ImgRenderImage
         assetId={assetId}
         clipStatus={clipStatus}
-        filename={filename}
+        filename={outputFilename}
         canNavigatePrev={canNavigatePrev}
         canNavigateNext={canNavigateNext}
         onNavigatePrev={onNavigatePrev}
         onNavigateNext={onNavigateNext}
-        inputImageId={inputImageId}
+        inputImageId={inputStillId}
         inputImageUrl={inputImageUrl}
         sourceFrame={sourceFrame}
         drawnMaskImageId={drawnMaskImageId}
@@ -77,7 +90,8 @@ export const Img2ImgRender: React.FC<Props> = ({
         clipId={clipId}
         clipStatus={clipStatus}
         sourceFrame={sourceFrame}
-        filename={filename}
+        filename={outputFilename}
+        directFal={!!fal}
         isFirstSuccessfulRender={isFirstSuccessfulRender}
         imageCrop={imageCrop}
       />

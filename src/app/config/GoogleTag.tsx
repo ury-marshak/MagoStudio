@@ -6,7 +6,7 @@ import { useUser } from "@platform/identity";
 import { useEffect, useRef } from "react";
 import ReactGA from "react-ga4";
 
-import { isCloudAccountActive } from "@/platform/cloudAccount";
+import { captureRendererCloudAccountScope } from "@/platform/rendererCloudAccountScope";
 
 import { enrichUnsafeMetadata } from "./utils/enrichUnsafeMetadata";
 
@@ -29,17 +29,23 @@ export function GoogleTag(): React.ReactNode {
   const hasSavedClientId = useRef(false);
 
   useMountEffect(() => {
-    if (!isCloudAccountActive() || !GOOGLE_TAG_ID || hasInitialized.current) {
+    const account = captureRendererCloudAccountScope();
+    if (!account.isActive() || !GOOGLE_TAG_ID || hasInitialized.current) {
       return;
     }
 
+    const disable = () => {
+      Object.assign(window, { [`ga-disable-${GOOGLE_TAG_ID}`]: true });
+    };
+    account.signal?.addEventListener("abort", disable, { once: true });
     ReactGA.initialize(GOOGLE_TAG_ID);
     hasInitialized.current = true;
   });
 
   useEffect(() => {
+    const account = captureRendererCloudAccountScope();
     if (
-      !isCloudAccountActive() ||
+      !account.isActive() ||
       typeof window === "undefined" ||
       !isLoaded ||
       !user
@@ -65,10 +71,12 @@ export function GoogleTag(): React.ReactNode {
 
     enrichUnsafeMetadata(user, { google_analytics_user_id: pendingClientId })
       .then(() => {
+        if (!account.isActive()) return;
         localStorage.removeItem(GA_CLIENT_ID_STORAGE_KEY);
         hasSavedClientId.current = true;
       })
       .catch((error) => {
+        if (!account.isActive()) return;
         console.error(
           "Failed to update google_analytics_user_id in unsafeMetadata:",
           error
@@ -77,8 +85,9 @@ export function GoogleTag(): React.ReactNode {
   }, [isLoaded, user]);
 
   useEffect(() => {
+    const account = captureRendererCloudAccountScope();
     if (
-      !isCloudAccountActive() ||
+      !account.isActive() ||
       !GOOGLE_TAG_ID ||
       !hasInitialized.current ||
       hasLoggedClientId.current
@@ -87,9 +96,10 @@ export function GoogleTag(): React.ReactNode {
     }
 
     let disposed = false;
+    const isActive = () => !disposed && account.isActive();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tryGetClientId = () => {
-      if (disposed || !isCloudAccountActive()) return;
+      if (!isActive()) return;
       if (typeof window.gtag !== "function") {
         clientIdAttempts.current += 1;
         if (clientIdAttempts.current < MAX_CLIENT_ID_ATTEMPTS) {
@@ -100,8 +110,7 @@ export function GoogleTag(): React.ReactNode {
 
       ReactGA.gtag("get", GOOGLE_TAG_ID, "client_id", (clientId: string) => {
         if (
-          disposed ||
-          !isCloudAccountActive() ||
+          !isActive() ||
           !clientId ||
           clientId.trim() === "" ||
           hasSavedClientId.current
@@ -112,10 +121,12 @@ export function GoogleTag(): React.ReactNode {
         if (isLoaded && user) {
           enrichUnsafeMetadata(user, { google_analytics_user_id: clientId })
             .then(() => {
+              if (!account.isActive()) return;
               localStorage.removeItem(GA_CLIENT_ID_STORAGE_KEY);
               hasSavedClientId.current = true;
             })
             .catch((error) => {
+              if (!account.isActive()) return;
               console.error(
                 "Failed to update google_analytics_user_id in unsafeMetadata:",
                 error
@@ -128,11 +139,14 @@ export function GoogleTag(): React.ReactNode {
       hasLoggedClientId.current = true;
     };
 
-    tryGetClientId();
-    return () => {
+    const stop = () => {
       disposed = true;
       clearTimeout(timer);
+      account.signal?.removeEventListener("abort", stop);
     };
+    account.signal?.addEventListener("abort", stop, { once: true });
+    tryGetClientId();
+    return stop;
   }, [isLoaded, user]);
 
   return null;

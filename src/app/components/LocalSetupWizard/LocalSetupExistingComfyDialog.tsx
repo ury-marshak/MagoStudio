@@ -41,9 +41,10 @@ const RequirementDownload = ({
 }) => {
   const { t } = useTranslation();
   const download = useMutation({
-    mutationFn: (replaceExistingNodePackIn?: string) =>
+    mutationFn: (approval?: { folder: string; token?: string }) =>
       window.mago.localSetup.downloadRequirement(item.name, {
-        replaceExistingNodePackIn
+        replaceExistingNodePackIn: approval?.folder,
+        ...(approval?.token ? { approvalToken: approval.token } : {})
       }),
     onSuccess: (result) => {
       const isNodePackLoadableAfterRestart =
@@ -135,9 +136,13 @@ const RequirementDownload = ({
         }
         backupsFolder={nodePackUpdateAwaitingConfirmation?.backupsFolder ?? ""}
         onCancel={() => download.reset()}
-        onConfirm={() =>
-          download.mutate(nodePackUpdateAwaitingConfirmation?.customNodesFolder)
-        }
+        onConfirm={() => {
+          if (!nodePackUpdateAwaitingConfirmation) return;
+          download.mutate({
+            folder: nodePackUpdateAwaitingConfirmation.customNodesFolder,
+            token: nodePackUpdateAwaitingConfirmation.approvalToken
+          });
+        }}
       />
     </div>
   );

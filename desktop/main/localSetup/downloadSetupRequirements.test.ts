@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCAL_SCRIPT_MODEL_FILES } from "../scriptProjects/comfyScriptProjectClient";
 
 import { downloadSetupRequirements } from "./downloadSetupRequirements";
+import { deferred } from "./setupTestUtils";
 
 const { picker } = vi.hoisted(() => ({ picker: vi.fn() }));
 vi.mock("electron", () => ({ dialog: { showOpenDialog: picker } }));
@@ -83,6 +84,47 @@ describe("downloadSetupRequirements", () => {
     expect(await readFile(path.join(directory, remainingName), "utf8")).toBe(
       "model bytes"
     );
+  });
+
+  it("retires the batch while the first model body is still open", async () => {
+    const profile = new AbortController();
+    const cancellation = vi.fn();
+    let transfers = 0;
+    const entered = deferred<void>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.endsWith("/system_stats") || url.endsWith("/experiment/models"))
+          return Response.json([]);
+        transfers++;
+        return new Response(
+          new ReadableStream({
+            pull() {
+              entered.resolve();
+            },
+            cancel: cancellation
+          })
+        );
+      })
+    );
+    const result = expect(
+      downloadSetupRequirements(
+        window,
+        settings,
+        [LOCAL_SCRIPT_MODEL_FILES.videoVae, LOCAL_SCRIPT_MODEL_FILES.audioVae],
+        profile.signal
+      )
+    ).rejects.toThrow();
+    await entered.promise;
+    profile.abort();
+    await result;
+    expect(transfers).toBe(1);
+    expect(cancellation).toHaveBeenCalledOnce();
+    await expect(
+      readFile(
+        path.join(directory, LOCAL_SCRIPT_MODEL_FILES.audioVae + ".mago-part")
+      )
+    ).rejects.toThrow();
   });
 
   it("downloads nothing more when the folder picker is canceled", async () => {

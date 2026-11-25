@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { RendererLibrarySession } from "@/platform/rendererLibraryWork";
+
 vi.mock("../api/getProjectCut", () => ({ getProjectCut: vi.fn() }));
 
 import { getProjectCut } from "../api/getProjectCut";
@@ -93,5 +95,45 @@ describe("waitForCutExportUrl", () => {
         sleep: noSleep
       })
     ).resolves.toBeNull();
+  });
+
+  it("does not read the replacement cut when a poll sleep ignores abort", async () => {
+    const library = new RendererLibrarySession();
+    const work = library.capture();
+    const sleep = Promise.withResolvers<void>();
+    const poll = waitForCutExportUrl({
+      projectId: PROJECT_ID,
+      planId: PLAN_ID,
+      work,
+      sleep: () => sleep.promise
+    });
+    const stopped = expect(poll).rejects.toMatchObject({ name: "AbortError" });
+    await library.suspend();
+    library.reset();
+    sleep.resolve();
+    await stopped;
+    expect(getProjectCutMock).not.toHaveBeenCalled();
+  });
+
+  it("clears the default poll timer on retirement", async () => {
+    vi.useFakeTimers();
+    try {
+      const library = new RendererLibrarySession();
+      const poll = waitForCutExportUrl({
+        projectId: PROJECT_ID,
+        planId: PLAN_ID,
+        work: library.capture()
+      });
+      const stopped = expect(poll).rejects.toMatchObject({
+        name: "AbortError"
+      });
+      expect(vi.getTimerCount()).toBe(1);
+      await library.suspend();
+      await stopped;
+      expect(vi.getTimerCount()).toBe(0);
+      expect(getProjectCutMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

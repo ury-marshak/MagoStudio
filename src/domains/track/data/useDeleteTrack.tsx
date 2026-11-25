@@ -3,6 +3,7 @@ import { Project } from "@schemas/project";
 import { Shot } from "@schemas/shot";
 import { useQueryClient } from "@tanstack/react-query";
 
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
 import { useRendererLibraryMutation } from "@/platform/useRendererLibraryMutation";
 import { queryKeys } from "@/queryKeys";
 
@@ -23,7 +24,7 @@ export const useDeleteTrack = () => {
     }
 
     queryClient.setQueryData<Project>(
-      queryKeys.project.byId(params.projectId),
+      libraryQueryKey(queryKeys.project.byId(params.projectId)),
       (project) =>
         buildUpdatedProjectAfterTrackDelete(
           project,

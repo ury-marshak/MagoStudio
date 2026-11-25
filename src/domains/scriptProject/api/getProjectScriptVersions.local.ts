@@ -1,3 +1,4 @@
+import { rendererCloudBackgroundWork } from "@domains/cloud/rendererCloudBackgroundWork";
 import {
   ScriptVersionList,
   ScriptVersionListSchema
@@ -5,6 +6,7 @@ import {
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi } from "@/platform/localDesktop";
+import { rendererLibrary } from "@/platform/rendererLibraryWork";
 
 import { isLocalScriptProject } from "../projectOrigin";
 import {
@@ -26,11 +28,20 @@ export const getProjectScriptVersions = async (
   }
   if (!isLocal && desktop.account.mode === "cloud") {
     try {
+      const work = rendererCloudBackgroundWork(rendererLibrary.capture());
+      work.check();
       const response = await backendApiClient.get(
-        `/projects/${projectId}/script`
+        `/projects/${projectId}/script`,
+        {
+          signal: work.signal
+        }
       );
+      work.check();
       const scriptVersions = ScriptVersionListSchema.parse(response.data);
-      void writeScriptProjectSnapshot({ projectId, scriptVersions });
+      await writeScriptProjectSnapshot(
+        { projectId, intent: "cloud-import", scriptVersions },
+        work
+      );
       return scriptVersions;
     } catch (error) {
       if (cached) return ScriptVersionListSchema.parse(cached);

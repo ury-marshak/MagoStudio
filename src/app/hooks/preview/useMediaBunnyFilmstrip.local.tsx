@@ -7,6 +7,7 @@ import {
 } from "@domains/asset/utils/filmstripCache";
 import { useQuery } from "@tanstack/react-query";
 
+import { releaseRendererObjectUrl } from "@/platform/rendererObjectUrl";
 import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 
 interface UseMediaBunnyFilmstripProps {
@@ -101,21 +102,25 @@ export function useMediaBunnyFilmstrip({
       work.check();
       const generateRemoteFilmstrip = async () => {
         const downloadedVideo = directVideoUrl
-          ? await cacheVideoUrl(directVideoUrl, assetId)
+          ? await cacheVideoUrl(directVideoUrl, assetId, work)
           : null;
         if (downloadedVideo && !downloadedVideo.isCached) {
           throw new Error("Shot video is not downloadable yet");
         }
-        work.check();
         const sourceUrl = downloadedVideo?.urlToUse ?? videoUrl!;
         try {
-          return await generateFilmstrip(sourceUrl, {
-            fps,
-            width,
-            frameHeight: 65
-          });
+          work.check();
+          return await generateFilmstrip(
+            sourceUrl,
+            {
+              fps,
+              width,
+              frameHeight: 65
+            },
+            work
+          );
         } finally {
-          if (downloadedVideo) URL.revokeObjectURL(sourceUrl);
+          if (downloadedVideo) releaseRendererObjectUrl(sourceUrl);
         }
       };
       const filmstrip = videoUrl?.startsWith("mago-media:")

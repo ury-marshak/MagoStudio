@@ -3,54 +3,35 @@ import {
   RenderSnapshot,
   toRenderSnapshots
 } from "@domains/queue/utils/findRendersThatJustEnded";
-import { QueryClient, useQueryClient } from "@tanstack/react-query";
-import { MutableRefObject, useEffect, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 
-import { QueueItem } from "./interface";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
+
 import { invalidateCachesForEndedRenders } from "./invalidateCachesForEndedRenders";
 import { useQueue } from "./useQueue";
-
-const refreshCachesForRendersThatEndedSinceLastPoll = ({
-  queueItems,
-  rendersAtPreviousPollRef,
-  queryClient
-}: {
-  queueItems: QueueItem[];
-  rendersAtPreviousPollRef: MutableRefObject<
-    Map<string, RenderSnapshot> | undefined
-  >;
-  queryClient: QueryClient;
-}) => {
-  const rendersAtThisPoll = toRenderSnapshots(queueItems);
-  const rendersAtPreviousPoll = rendersAtPreviousPollRef.current;
-  rendersAtPreviousPollRef.current = rendersAtThisPoll;
-
-  const isFirstPoll = rendersAtPreviousPoll === undefined;
-  if (isFirstPoll) return;
-
-  const endedRenders = findRendersThatJustEnded({
-    previousRenders: rendersAtPreviousPoll,
-    currentRenders: rendersAtThisPoll
-  });
-  if (endedRenders.length === 0) return;
-
-  invalidateCachesForEndedRenders({ queryClient, endedRenders });
-};
 
 export const useInvalidateCachesWhenRendersEnd = () => {
   const queryClient = useQueryClient();
   const { data: queueItems } = useQueue();
-  const rendersAtPreviousPollRef = useRef<
-    Map<string, RenderSnapshot> | undefined
-  >(undefined);
+  const { work } = useRendererLibraryWork();
+  const previous = useRef<{
+    signal: AbortSignal;
+    renders: Map<string, RenderSnapshot>;
+  }>(undefined);
 
   // oxlint-disable-next-line custom-react/no-use-effect -- reacts to each queue poll, whose arrival React only exposes as changed data
   useEffect(() => {
-    if (!queueItems) return;
-    refreshCachesForRendersThatEndedSinceLastPoll({
-      queueItems,
-      rendersAtPreviousPollRef,
-      queryClient
+    if (!queueItems || work.signal.aborted) return;
+    const baseline = previous.current;
+    const currentRenders = toRenderSnapshots(queueItems);
+    previous.current = { signal: work.signal, renders: currentRenders };
+    if (baseline?.signal !== work.signal) return;
+    const endedRenders = findRendersThatJustEnded({
+      previousRenders: baseline.renders,
+      currentRenders
     });
-  }, [queueItems, queryClient]);
+    if (endedRenders.length)
+      invalidateCachesForEndedRenders({ queryClient, endedRenders });
+  }, [queueItems, queryClient, work]);
 };

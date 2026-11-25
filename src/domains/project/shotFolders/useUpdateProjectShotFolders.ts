@@ -1,7 +1,8 @@
 import { Project } from "@schemas/project";
 import { useQueryClient } from "@tanstack/react-query";
 
-import { rendererLibrary } from "@/platform/rendererLibraryWork";
+import { libraryQueryKey } from "@/platform/rendererLibraryQuery";
+import { useRendererLibraryWork } from "@/platform/useRendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { useUpdateProject } from "../useUpdateProject";
@@ -10,6 +11,7 @@ import { ShotFolderOrShot } from "./interface";
 import { useProjectShotFolders } from "./useProjectShotFolders";
 
 export const useUpdateProjectShotFolders = (projectId: string | undefined) => {
+  const { work: origin } = useRendererLibraryWork();
   const { data } = useProjectShotFolders(projectId);
   const project = data?.project;
   const queryClient = useQueryClient();
@@ -17,12 +19,12 @@ export const useUpdateProjectShotFolders = (projectId: string | undefined) => {
   const mutation = useUpdateProject({
     onMutate: async (updatedProject, work) => {
       await queryClient.cancelQueries({
-        queryKey: queryKeys.project.byId(projectId)
+        queryKey: libraryQueryKey(queryKeys.project.byId(projectId))
       });
       work.check();
 
       queryClient.setQueryData(
-        queryKeys.project.byId(projectId),
+        libraryQueryKey(queryKeys.project.byId(projectId)),
         (oldProject: Project | undefined) => {
           if (!oldProject) return oldProject;
           return {
@@ -36,12 +38,13 @@ export const useUpdateProjectShotFolders = (projectId: string | undefined) => {
 
   const updateShotFolders = async (
     shotFolders: ShotFolderOrShot[],
-    work = rendererLibrary.capture()
+    work = origin
   ) => {
     work.check();
     const current =
-      queryClient.getQueryData<Project>(queryKeys.project.byId(projectId)) ??
-      project;
+      queryClient.getQueryData<Project>(
+        libraryQueryKey(queryKeys.project.byId(projectId))
+      ) ?? project;
     if (!current) return;
 
     await mutation.mutateAsync(

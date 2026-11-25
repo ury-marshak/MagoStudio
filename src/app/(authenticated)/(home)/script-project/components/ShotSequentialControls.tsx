@@ -153,6 +153,12 @@ export const ShotSequentialControls: React.FC<Props> = ({
             />
           )}
 
+          {showsOpeningFrame && sequential.opening_frame === "pin" && (
+            <Text variant="xs" color="glyph-tertiary">
+              {t("script_project.fal_opening_frame_hint.label")}
+            </Text>
+          )}
+
           <label className="flex flex-col gap-1">
             <Text variant="xs" color="glyph-secondary">
               {t("script_project.sequential_prompt_appendix_input.label")}

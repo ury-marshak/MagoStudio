@@ -20,19 +20,26 @@ const readAppMode = (): "cloud" | "offline" | "unchosen" => {
 const libraryStops = new Set<() => Promise<void>>();
 const libraryResets = new Set<() => void>();
 let librarySuspended = false;
-ipcRenderer.on("library:will-change", async (_event, id: string | null) => {
-  librarySuspended = true;
-  const results = await Promise.allSettled(
-    [...libraryStops].map(async (stop) => stop())
-  );
-  if (id !== null)
-    await ipcRenderer.invoke(
-      "library:drained",
-      id,
-      results.some((result) => result.status === "rejected")
+const libraryDocument = globalThis.crypto.randomUUID();
+ipcRenderer.on(
+  "library:will-change",
+  async (_event, id: string | null, document: string) => {
+    if (document !== libraryDocument) return;
+    librarySuspended = true;
+    const results = await Promise.allSettled(
+      [...libraryStops].map(async (stop) => stop())
     );
-});
-ipcRenderer.on("library:did-change", () => {
+    if (id !== null)
+      await ipcRenderer.invoke(
+        "library:drained",
+        id,
+        results.some((result) => result.status === "rejected"),
+        libraryDocument
+      );
+  }
+);
+ipcRenderer.on("library:did-change", (_event, document: string) => {
+  if (document !== libraryDocument) return;
   librarySuspended = false;
   libraryResets.forEach((reset) => reset());
 });
@@ -46,6 +53,13 @@ const ipcChannels = {
   accountChooseMode: "account:choose-mode",
   accountSignOut: "account:sign-out",
   accountDeepLink: "account:deep-link",
+  accountBeginSignOut: "account:begin-sign-out",
+  accountIsCurrent: "account:is-current",
+  accountRetired: "account:retired",
+  accountRetiredAck: "account:retired-ack",
+  ordinaryFalSubmit: "ordinary-fal:submit",
+  ordinaryFalGet: "ordinary-fal:get",
+  ordinaryFalList: "ordinary-fal:list",
   cloudLinkGet: "cloud:link-get",
   cloudLinkPut: "cloud:link-put",
   cloudLinkPatch: "cloud:link-patch",
@@ -154,6 +168,12 @@ const ipcChannels = {
   localSetupModelGroupsStatus: "local-setup:model-groups-status"
 } as const;
 
+const accountLifetime = new AbortController();
+ipcRenderer.on(ipcChannels.accountRetired, () => {
+  accountLifetime.abort();
+  ipcRenderer.send(ipcChannels.accountRetiredAck);
+});
+
 const api: MagoDesktopApi = {
   textModel: {
     onRequest: (listener) => {
@@ -183,13 +203,28 @@ const api: MagoDesktopApi = {
     chooseMode: (mode) =>
       ipcRenderer.invoke(ipcChannels.accountChooseMode, mode),
     signOut: () => ipcRenderer.invoke(ipcChannels.accountSignOut),
+    beginSignOut: () => ipcRenderer.invoke(ipcChannels.accountBeginSignOut),
+    isCurrent: () =>
+      !accountLifetime.signal.aborted &&
+      ipcRenderer.sendSync(ipcChannels.accountIsCurrent) === true,
+    onRetired: (listener) => {
+      const notify = () => listener();
+      if (accountLifetime.signal.aborted) notify();
+      else
+        accountLifetime.signal.addEventListener("abort", notify, {
+          once: true
+        });
+      return () => accountLifetime.signal.removeEventListener("abort", notify);
+    },
     onDeepLink: (listener) => {
       // The event object stays in the preload; only the validated payload
       // crosses into the page.
       const subscription = (
         _event: unknown,
         link: { action: string; params: Record<string, string> }
-      ) => listener(link);
+      ) => {
+        if (!accountLifetime.signal.aborted) listener(link);
+      };
       ipcRenderer.on(ipcChannels.accountDeepLink, subscription);
       return () =>
         ipcRenderer.removeListener(ipcChannels.accountDeepLink, subscription);
@@ -241,7 +276,7 @@ const api: MagoDesktopApi = {
     restoreBackup: () => ipcRenderer.invoke(ipcChannels.libraryRestoreBackup),
     onWillChange: async (listener) => {
       libraryStops.add(listener);
-      await ipcRenderer.invoke("library:watch");
+      await ipcRenderer.invoke("library:watch", libraryDocument);
       if (librarySuspended) {
         librarySuspended = true;
         // Do not await this drain: it may itself be waiting for registration.
@@ -283,6 +318,12 @@ const api: MagoDesktopApi = {
       ipcRenderer.invoke(ipcChannels.assetsExtractVideoFrame, input),
     generateVideoFilmstrip: (input) =>
       ipcRenderer.invoke(ipcChannels.assetsGenerateVideoFilmstrip, input)
+  },
+  ordinaryFal: {
+    submit: (input) => ipcRenderer.invoke(ipcChannels.ordinaryFalSubmit, input),
+    get: (input) => ipcRenderer.invoke(ipcChannels.ordinaryFalGet, input),
+    list: (input) =>
+      ipcRenderer.invoke(ipcChannels.ordinaryFalList, input ?? {})
   },
   cloud: {
     links: {

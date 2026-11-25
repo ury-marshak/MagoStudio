@@ -82,6 +82,24 @@ const queue = (status: string) => [
     progress: 50
   }
 ];
+const installAccount = () => {
+  let current = true;
+  const lifetime = new AbortController();
+  const account = {
+    mode: "cloud",
+    isCurrent: () => current,
+    onRetired: (listener: () => void) => {
+      lifetime.signal.addEventListener("abort", listener, { once: true });
+      return () => lifetime.signal.removeEventListener("abort", listener);
+    },
+    signOut: vi.fn()
+  };
+  vi.stubGlobal("mago", { account });
+  return () => {
+    current = false;
+    lifetime.abort();
+  };
+};
 const aborts = (promise: Promise<unknown>) =>
   expect(promise).rejects.toMatchObject({ name: "AbortError" });
 
@@ -101,6 +119,7 @@ afterEach(async () => {
     rendererLibrary.reset();
   });
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 describe("origin-owned cloud render polling", () => {
@@ -226,18 +245,17 @@ describe("origin-owned cloud render polling", () => {
     }
   );
 
-  it.each(["status", "fail", "finish"] as const)(
-    "drains an issued %s IPC before acknowledgement and suppresses subsequent jobs",
+  it.each(["status", "fail"] as const)(
+    "drains issued %s IPC after account retirement and suppresses subsequent jobs",
     async (method) => {
+      const retire = installAccount();
       fixture.list.mockResolvedValue([
         job("img2img"),
         { ...job("img2img"), id: "second" }
       ]);
       const body = deferred<void>();
       fixture[method].mockReturnValueOnce(body.promise);
-      const status = { status: "running", fail: "failed", finish: "success" }[
-        method
-      ];
+      const status = { status: "running", fail: "failed" }[method];
       const remote = api(
         vi.fn().mockResolvedValue({
           render_status: status,
@@ -249,6 +267,7 @@ describe("origin-owned cloud render polling", () => {
       const rejected = aborts(request);
       await flush();
       expect(fixture[method]).toHaveBeenCalledOnce();
+      retire();
       let stopped = false;
       const stop = fixture.stop!().then(() => {
         stopped = true;
@@ -262,6 +281,55 @@ describe("origin-owned cloud render polling", () => {
       expect(remote.get).toHaveBeenCalledOnce();
     }
   );
+
+  it("does not wait for a main-owned finish IPC before library acknowledgement", async () => {
+    const retire = installAccount();
+    fixture.list.mockResolvedValue([job("img2img")]);
+    const transfer = deferred<void>();
+    fixture.finish.mockReturnValueOnce(transfer.promise);
+    const pass = pollCloudImageRenders(
+      api(
+        vi.fn().mockResolvedValue({
+          render_status: "success",
+          output_url: "https://output.invalid/image"
+        })
+      )
+    );
+    const rejected = aborts(pass);
+    await flush();
+    expect(fixture.finish).toHaveBeenCalledOnce();
+    retire();
+    await fixture.stop!();
+    transfer.resolve();
+    await rejected;
+  });
+
+  it("stops the live interval and ignores old responses even though boot mode stays cloud", async () => {
+    vi.useFakeTimers();
+    const retire = installAccount();
+    const response = deferred<{ data: unknown }>();
+    fixture.backend.mockReturnValueOnce(response.promise);
+    const client = new QueryClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    renderHook(() => useCloudRenderWatcher(), { wrapper });
+    await act(flush);
+    expect(fixture.backend).toHaveBeenCalledOnce();
+    const signal = fixture.backend.mock.calls[0][1].signal as AbortSignal;
+    retire();
+    expect(signal.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    await act(async () => {
+      response.resolve({ data: queue("FAILED") });
+      await vi.advanceTimersByTimeAsync(15000);
+    });
+    expect(fixture.backend).toHaveBeenCalledOnce();
+    expect(fixture.fail).not.toHaveBeenCalled();
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(window.mago.account.signOut).not.toHaveBeenCalled();
+  });
 
   it("restarts the mounted watcher only on reset and rejects old invalidation/interval callbacks", async () => {
     vi.useFakeTimers();

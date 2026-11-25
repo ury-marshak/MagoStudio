@@ -1,6 +1,8 @@
 import { Project } from "@schemas/project";
 import { useQuery } from "@tanstack/react-query";
 
+import { isLocalApp } from "@/platform/localDesktop";
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
 import { queryKeys } from "@/queryKeys";
 
 import { fetchProject } from "./api/fetchProject";
@@ -23,12 +25,16 @@ function useProject<TSelected = Project>(
   select?: (data: Project) => TSelected,
   disabled?: boolean
 ) {
+  const scope = useRendererLibraryQueryScope();
+  const queryKey = scope.key(queryKeys.project.byId(projectId));
   return useQuery({
-    queryKey: queryKeys.project.byId(projectId),
-    queryFn: () => fetchProject(projectId),
-    enabled: !!projectId && projectId !== "undefined" && !disabled,
+    queryKey,
+    queryFn: () => scope.run(() => fetchProject(projectId, scope.work)),
+    retry: scope.retry(queryKey),
+    enabled:
+      scope.active && !!projectId && projectId !== "undefined" && !disabled,
     staleTime: Infinity,
-    gcTime: Infinity,
+    gcTime: isLocalApp ? undefined : Infinity,
     refetchOnMount: false,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,

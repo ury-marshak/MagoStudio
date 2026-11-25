@@ -1,37 +1,43 @@
+import { readMediaBlob } from "@domains/asset/utils/readMediaBlob";
+
+import {
+  rendererLibrary,
+  type RendererLibraryWork
+} from "@/platform/rendererLibraryWork";
 import {
   fetchRendererMedia,
   readableRendererMediaUrl
 } from "@/platform/rendererMediaAccess";
 
 import { getMediabunny } from "./lazyLoad";
-
-type Mediabunny = Awaited<ReturnType<typeof getMediabunny>>;
-
-const isObjectUrl = (videoSrc: string) => videoSrc.startsWith("blob:");
-
-const sourceFor = async (
-  videoSrc: string,
-  { UrlSource, BlobSource }: Mediabunny
-) => {
-  videoSrc = readableRendererMediaUrl(videoSrc);
-  if (!isObjectUrl(videoSrc)) return new UrlSource(videoSrc);
-
-  const response = await fetchRendererMedia(videoSrc);
-  return new BlobSource(await response.blob());
-};
+import { withRendererMediaInput } from "./withRendererMediaInput";
 
 export const detectVideoHasAudioTrack = async (
-  videoSrc: string
+  videoSrc: string,
+  work: RendererLibraryWork = rendererLibrary.capture()
 ): Promise<boolean> => {
-  const mediabunny = await getMediabunny();
-  const { Input, ALL_FORMATS } = mediabunny;
+  await work.ready();
+  work.check();
+  const { Input, ALL_FORMATS, UrlSource, BlobSource } = await getMediabunny();
+  work.check();
+  videoSrc = readableRendererMediaUrl(videoSrc);
 
+  // Mediabunny needs a BlobSource for blob URLs. Keep the body owned too.
+  let blob: Blob | undefined;
+  if (videoSrc.startsWith("blob:")) {
+    const response = await fetchRendererMedia(videoSrc, {
+      signal: work.signal
+    });
+    blob = await readMediaBlob(response, work.signal);
+  }
+  work.check();
   const input = new Input({
-    source: await sourceFor(videoSrc, mediabunny),
+    source: blob ? new BlobSource(blob) : new UrlSource(videoSrc),
     formats: ALL_FORMATS
   });
-
-  const audioTrack = await input.getPrimaryAudioTrack();
-
-  return !!audioTrack;
+  return withRendererMediaInput(
+    input,
+    work,
+    async () => !!(await input.getPrimaryAudioTrack())
+  );
 };

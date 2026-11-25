@@ -9,11 +9,14 @@ import {
 
 import { backendApiClient } from "@/lib/backend-api-client";
 import { getLocalDesktopApi, isLocalApp } from "@/platform/localDesktop";
-import { isCloudRenderAvailable } from "@/platform/renderTarget";
+import { captureRendererCloudAccountScope } from "@/platform/rendererCloudAccountScope";
+import { useRendererLibraryQueryScope } from "@/platform/rendererLibraryQuery";
+import type { RendererLibraryWork } from "@/platform/rendererLibraryWork";
 import { queryKeys } from "@/queryKeys";
 
 import { QueueItem } from "./interface";
 import { attachCloudQueueRow } from "./utils/attachCloudQueueRow";
+import { countQueueItemsByStatus } from "./utils/countQueueItemsByStatus";
 import { findCloudQueueRowForAsset } from "./utils/findCloudQueueRowForAsset";
 import { isCloudQueueItemCancelable } from "./utils/isCloudQueueItemCancelable";
 
@@ -32,13 +35,23 @@ async function fetchFilteredQueue(): Promise<QueueItem[]> {
  * because the desktop queue only knows about renders running on this machine.
  * The cloud queue has all of it; the ids just need swapping for local ones.
  */
-async function fetchCloudQueue(): Promise<QueueItem[]> {
+async function fetchCloudQueue(
+  work: RendererLibraryWork,
+  cloud: ReturnType<typeof captureRendererCloudAccountScope>
+): Promise<QueueItem[]> {
+  work.check();
   const localHistory = (
     (await getLocalDesktopApi().cloud.renders.listQueue()) as unknown as QueueItem[]
   ).map((item) => ({ ...item, local_cloud_render_job_id: item.id }));
-  if (!isCloudRenderAvailable()) return localHistory;
+  work.check();
+  if (!cloud.isActive()) return localHistory;
   try {
-    const response = await backendApiClient.get<unknown>(`/queue`);
+    const signal = cloud.signal
+      ? AbortSignal.any([work.signal, cloud.signal])
+      : work.signal;
+    const response = await backendApiClient.get<unknown>(`/queue`, { signal });
+    work.check();
+    if (!cloud.isActive()) return localHistory;
     const remoteRows = Array.isArray(response.data)
       ? response.data
       : Array.isArray((response.data as { items?: unknown })?.items)
@@ -73,6 +86,7 @@ async function fetchCloudQueue(): Promise<QueueItem[]> {
     );
     return [...localHistoryWithCloudQueueRows, ...backendOnlyQueue];
   } catch {
+    work.check();
     // Persisted mirrored jobs remain visible even when cloud is temporarily
     // unreachable. Backend-only script-shot jobs return on the next refresh.
     return localHistory;
@@ -118,57 +132,71 @@ const select = (data: QueueItem[]) => {
   }));
 };
 
-const queueCountCache = { errorCount: 0, finishedCount: 0 };
-
 export function useQueue(props?: { enabled?: boolean }): UseQueueResult {
   const enabled = props?.enabled ?? true;
   const queryClient = useQueryClient();
+  const scope = useRendererLibraryQueryScope();
+  const queryKey = scope.key(queryKeys.queue.all);
 
   const query = useQuery({
-    queryKey: queryKeys.queue.all,
-    queryFn: async () => {
-      const data = isLocalApp
-        ? [
-            ...((await getLocalDesktopApi().imageRenders.listQueue()) as unknown as QueueItem[]),
-            ...(await fetchCloudQueue())
-          ]
-        : await fetchFilteredQueue();
-      const currentErrorCount = data.filter(
-        (item: QueueItem) => item.status === AssetStatus.ERROR
-      ).length;
-      const currentFinishedCount = data.filter(
-        (item: QueueItem) => item.status === AssetStatus.FINISHED
-      ).length;
+    queryKey,
+    retry: scope.retry(queryKey),
+    queryFn: () =>
+      scope.run(async () => {
+        let data: QueueItem[];
+        if (isLocalApp) {
+          const cloud = captureRendererCloudAccountScope();
+          const local =
+            (await getLocalDesktopApi().imageRenders.listQueue()) as unknown as QueueItem[];
+          scope.work.check();
+          data = [...local, ...(await fetchCloudQueue(scope.work, cloud))];
+        } else {
+          data = await fetchFilteredQueue();
+        }
+        scope.work.check();
+        // The previous successful poll for this client and library is the
+        // baseline. The initial snapshot is not a completion event.
+        const previous = queryClient.getQueryData<QueueItem[]>(queryKey);
+        const before = previous && countQueueItemsByStatus(previous);
+        const after = countQueueItemsByStatus(data);
+        if (
+          before &&
+          ((after.error ?? 0) > (before.error ?? 0) ||
+            (after.done ?? 0) > (before.done ?? 0))
+        ) {
+          void queryClient.invalidateQueries({
+            queryKey: queryKeys.balance.all
+          });
+          void queryClient.invalidateQueries({
+            queryKey: queryKeys.project.all
+          });
+          void queryClient.invalidateQueries({
+            queryKey: queryKeys.timelineList.all
+          });
+          void queryClient.invalidateQueries({
+            queryKey: queryKeys.videoAsset.all
+          });
+        }
 
-      if (
-        currentErrorCount > queueCountCache.errorCount ||
-        currentFinishedCount > queueCountCache.finishedCount
-      ) {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.balance.all });
-        void queryClient.invalidateQueries({ queryKey: queryKeys.project.all });
-        void queryClient.invalidateQueries({
-          queryKey: queryKeys.timelineList.all
-        });
-        void queryClient.invalidateQueries({
-          queryKey: queryKeys.videoAsset.all
-        });
-      }
-
-      // eslint-disable-next-line react-compiler/react-compiler
-      queueCountCache.errorCount = currentErrorCount;
-
-      queueCountCache.finishedCount = currentFinishedCount;
-      return data;
-    },
+        return data;
+      }),
     refetchInterval: (queryState: Query<QueueItem[], Error>) =>
       queueRefetchInterval(queryState),
     refetchIntervalInBackground: true,
-    enabled,
+    enabled: enabled && scope.active,
     select
   });
 
   return {
     ...query,
-    triggerRefetch: () => query.refetch()
+    refetch: async (options) => {
+      scope.work.check();
+      const result = await query.refetch(options);
+      scope.work.check();
+      return result;
+    },
+    triggerRefetch: () => {
+      if (!scope.work.signal.aborted) void query.refetch();
+    }
   };
 }
