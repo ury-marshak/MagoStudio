@@ -72,7 +72,9 @@ import { runLibraryFfmpeg } from "../media/runLibraryFfmpeg";
 import { ProfileLifetime } from "../providers/profileLifetime";
 import { atomicWriteFile } from "../storage/atomicFile";
 
+import * as comfyModelValidation from "./comfyModelValidation";
 import { ComfyQwenClient } from "./comfyQwenClient";
+import { ComfyWanAnimateClient } from "./comfyWanAnimateClient";
 import { ImageRenderService } from "./imageRenderService";
 
 const deferred = <T = void>() => {
@@ -284,6 +286,138 @@ const fixture = async (captureProfile?: () => AbortSignal) => {
     assertReplacement
   };
 };
+
+it.each([
+  ["wan_animate_2_2", "mix"],
+  ["wan_animate_2_2", "move"],
+  ["wan_vace_2_1", "mix"]
+] as const)(
+  "does not dispatch a saved %s (%s) model workflow at startup or on a later queue pass",
+  async (model, mode) => {
+    const profile = new ProfileLifetime();
+    const f = await fixture(() => profile.capture());
+    const root = f.pair[0]!;
+    await rm(path.join(root, "saved.png"));
+    await writeFile(path.join(root, "input.mp4"), "prepared fixture video");
+    const referencePath = path.join(root, "reference.png");
+    await writeFile(referencePath, "reference fixture image");
+    await f.manager.get().insert(assets).values({
+      id: "reference",
+      type: "image",
+      name: "Reference",
+      sourcePath: referencePath
+    });
+    const [accepted] = await f.manager.get().select().from(imageRenderJobs);
+    const pending = {
+      ...accepted!,
+      id: "pending-wan",
+      model,
+      status: "PENDING" as const,
+      providerRequestId: null,
+      requestJson: JSON.stringify({
+        ...registration,
+        model,
+        kind: "video",
+        name: "Saved Wan render",
+        settings: { wan_mode: mode },
+        inputRelativePath: "input.mp4",
+        referenceImageIds: ["reference"],
+        sourcePath: path.join(root, "input.mp4"),
+        comfyEndpoint: "http://fixture.invalid",
+        comfySubmissionStarted: false
+      })
+    };
+    await f.manager.get().insert(imageRenderJobs).values(pending);
+    const fetcher = vi.fn((url: string, _init: RequestInit) => {
+      if (url.endsWith("/upload/image"))
+        return Promise.resolve(Response.json({ name: "uploaded" }));
+      if (url.endsWith("/prompt"))
+        return Promise.resolve(Response.json({ prompt_id: "unexpected" }));
+      throw new Error(`Unexpected network request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const kick = vi.spyOn(f.local, "kick");
+    f.local.startWithRecovery();
+    await vi.waitFor(() => expect(kick).toHaveResolvedWith(undefined));
+    expect(ComfyQwenClient.prototype.poll).toHaveBeenCalledExactlyOnceWith(
+      "accepted"
+    );
+    await f.local.kick();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(
+      (await f.manager.get().select().from(imageRenderJobs)).find(
+        ({ id }) => id === pending.id
+      )
+    ).toEqual(pending);
+    expect(
+      (await f.local.listQueue()).find(({ id }) => id === pending.id)
+    ).toMatchObject({
+      active: false,
+      error: { error_type: "setup_requires_render_action" }
+    });
+    expect(listLibraryIssues()).toEqual([]);
+  }
+);
+
+it("can still submit Wan Animate when a user starts a new render", async () => {
+  const profile = new ProfileLifetime();
+  const f = await fixture(() => profile.capture());
+  const sourcePath = path.join(f.pair[0]!, "video.mp4");
+  await writeFile(sourcePath, "fixture video");
+  const database = f.manager.get();
+  await database.insert(tracks).values({
+    id: "video-track",
+    projectId: "p",
+    shotId: "s",
+    type: "video",
+    name: "Video"
+  });
+  await database.insert(assets).values({
+    id: "source",
+    name: "Source",
+    type: "video",
+    sourcePath,
+    width: 720,
+    height: 720
+  });
+  await database.insert(clips).values({
+    id: "video-clip",
+    name: "Video",
+    trackId: "video-track",
+    assetId: "source"
+  });
+  vi.spyOn(
+    comfyModelValidation,
+    "assertComfyRenderModelReady"
+  ).mockResolvedValue();
+  vi.mocked(runLibraryFfmpeg).mockResolvedValueOnce();
+  const submit = vi
+    .spyOn(ComfyWanAnimateClient.prototype, "submit")
+    .mockResolvedValue("new-prompt");
+  vi.spyOn(ComfyWanAnimateClient.prototype, "poll").mockResolvedValue({
+    state: "queued"
+  });
+  const { jobId } = await f.local.submitVideo({
+    model: "wan_animate_2_2",
+    outputTrackId: "t",
+    inputTrackId: "video-track",
+    referenceImageIds: ["a"],
+    settings: { wan_mode: "mix" },
+    frameRange: [0, 23],
+    fps: 24,
+    estimatedCostUsd: 0
+  });
+  await vi.waitFor(async () => {
+    const [job] = await database
+      .select()
+      .from(imageRenderJobs)
+      .where(eq(imageRenderJobs.id, jobId));
+    expect(job?.providerRequestId).toBe("new-prompt");
+  });
+  expect(submit).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ mode: "mix" })
+  );
+});
 
 describe("legacy render library ownership", () => {
   it.each(["kick", "reconcileInterruptedRenders", "submit"] as const)(

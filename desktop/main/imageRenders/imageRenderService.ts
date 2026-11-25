@@ -410,7 +410,10 @@ export class ImageRenderService {
     kick: undefined as RenderKick | undefined,
     pollingProfile: undefined as AbortSignal | undefined,
     previousDrain: undefined as Promise<void> | undefined,
-    pendingProfiles: new Map<string, AbortSignal>(),
+    pendingProfiles: new Map<
+      string,
+      { profile: AbortSignal | undefined; explicitlyQueued: boolean }
+    >(),
     stopListeningForComfySettles: null as (() => void) | null,
     comfyStatusCheckedAtByJobId: new Map<string, number>()
   }));
@@ -626,17 +629,39 @@ export class ImageRenderService {
     return this.libraryWork.guard(client, false);
   }
 
-  private rememberPendingProfile(jobId: string): void {
-    const profile = this.inferenceProfile.getStore();
+  private rememberPendingProfile(
+    jobId: string,
+    explicitlyQueued = false
+  ): void {
     const pending = this.libraryWork.state.pendingProfiles;
-    if (profile && !pending.has(jobId)) pending.set(jobId, profile);
+    if (!pending.has(jobId))
+      pending.set(jobId, {
+        profile: this.inferenceProfile.getStore(),
+        explicitlyQueued
+      });
   }
 
   private isRetiredPending(job: typeof imageRenderJobs.$inferSelect): boolean {
     return (
       job.status === "PENDING" &&
       !job.providerRequestId &&
-      this.libraryWork.state.pendingProfiles.get(job.id)?.aborted === true
+      this.libraryWork.state.pendingProfiles.get(job.id)?.profile?.aborted ===
+        true
+    );
+  }
+
+  private modelDownloadNeedsRenderAction(
+    job: typeof imageRenderJobs.$inferSelect
+  ): boolean {
+    // Wan Animate and VACE use custom nodes that can download SAM2, pose
+    // or depth models. Do not dispatch an unsent saved job without a new
+    // render action in this library session.
+    return (
+      (job.model === "wan_animate_2_2" || job.model === "wan_vace_2_1") &&
+      job.status === "PENDING" &&
+      !job.providerRequestId &&
+      !this.libraryWork.state.pendingProfiles.get(job.id)?.explicitlyQueued &&
+      !hasUnknownComfySubmission(job)
     );
   }
 
@@ -941,7 +966,7 @@ export class ImageRenderService {
       inputRelativePath
     };
 
-    this.rememberPendingProfile(jobId);
+    this.rememberPendingProfile(jobId, true);
     await this.transaction(async (database) => {
       const [shot] = await database
         .select()
@@ -1186,7 +1211,7 @@ export class ImageRenderService {
         : undefined
     };
 
-    this.rememberPendingProfile(jobId);
+    this.rememberPendingProfile(jobId, true);
     await this.transaction(async (transaction) => {
       await transaction.insert(assets).values({
         id: assetId,
@@ -1266,7 +1291,11 @@ export class ImageRenderService {
     const unfinishedPositions = getUnfinishedQueuePositions(
       jobs.filter((job) => {
         try {
-          return !hasUnknownComfySubmission(job) && !this.isRetiredPending(job);
+          return (
+            !hasUnknownComfySubmission(job) &&
+            !this.isRetiredPending(job) &&
+            !this.modelDownloadNeedsRenderAction(job)
+          );
         } catch {
           return true;
         }
@@ -1336,6 +1365,10 @@ export class ImageRenderService {
         ACTIVE_STATUSES.includes(job.status) &&
         hasUnknownComfySubmission(job);
       const retiredPending = !submissionUnknown && this.isRetiredPending(job);
+      const modelDownloadPaused =
+        !requestError &&
+        !retiredPending &&
+        this.modelDownloadNeedsRenderAction(job);
       const liveComfyPrompt = requestError
         ? null
         : this.liveComfyPrompt(job, profile);
@@ -1360,9 +1393,13 @@ export class ImageRenderService {
           !requestError &&
           !submissionUnknown &&
           !retiredPending &&
+          !modelDownloadPaused &&
           ACTIVE_STATUSES.includes(job.status),
         status:
-          requestError || submissionUnknown || retiredPending
+          requestError ||
+          submissionUnknown ||
+          retiredPending ||
+          modelDownloadPaused
             ? "ERROR"
             : job.status,
         progress: eta.progress ?? job.progress,
@@ -1413,18 +1450,24 @@ export class ImageRenderService {
                   error_message:
                     "The profile changed before this render was submitted. Start a new render to continue."
                 }
-              : job.error
+              : modelDownloadPaused
                 ? {
-                    error_type:
-                      isComfyRenderModel(job.model) &&
-                      isComfyOutOfMemoryError(job.error)
-                        ? "OutOfMemoryError"
-                        : "provider_error",
-                    error_message: isComfyRenderModel(job.model)
-                      ? job.error
-                      : job.error
+                    error_type: "setup_requires_render_action",
+                    error_message:
+                      "This render could download ComfyUI models. It will not start automatically; start a new render if you want to continue."
                   }
-                : undefined
+                : job.error
+                  ? {
+                      error_type:
+                        isComfyRenderModel(job.model) &&
+                        isComfyOutOfMemoryError(job.error)
+                          ? "OutOfMemoryError"
+                          : "provider_error",
+                      error_message: isComfyRenderModel(job.model)
+                        ? job.error
+                        : job.error
+                    }
+                  : undefined
       };
     });
   }
@@ -1565,6 +1608,7 @@ export class ImageRenderService {
         // A changed profile pauses the queue without marking saved jobs failed.
         if (!(await this.canProcessInference())) return;
         try {
+          if (this.modelDownloadNeedsRenderAction(job)) continue;
           await this.process(job, descriptionSession);
           this.assertWork();
           if (kick.submittingJobId === job.id)
